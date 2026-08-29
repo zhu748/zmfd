@@ -1,0 +1,16 @@
+{
+  "name": "zai-happydom-captcha",
+  "version": "1.0.0",
+  "description": "Node happy-dom Aliyun captcha solver for the chat.z.ai GLM proxy case (local-only dependency; do not commit node_modules)",
+  "main": "index.js",
+  "scripts": {
+    "test": "node tests/check_web.mjs"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "happy-dom": "^20.11.12"
+  }
+}

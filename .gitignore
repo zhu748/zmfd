@@ -1,0 +1,32 @@
+# Local credentials and captures must never be versioned.
+profiles.local.json
+apikey.local.json
+*.har
+
+# Python runtime artifacts.
+__pycache__/
+*.py[cod]
+
+# Local diagnostics.
+*.log
+settings.local.json
+history.local.json
+history.local.json.d/
+*.bak*
+*.tmp
+*.temp
+
+# Local test/build state.
+.coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# happy-dom captcha solver (local-only).
+node_modules/
+
+# Rotated runtime logs.
+logs/
+
+# Captured third-party frontend bundle used only for local protocol analysis.
+docs/zai-frontend-bundle.js
