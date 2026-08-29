@@ -1,6 +1,7 @@
 import ast
 import io
 import json
+import logging
 import sys
 import tempfile
 import threading
@@ -217,7 +218,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertNotIn("glm2api_tool_calls", cleaned_real)
         self.assertEqual("说明\n\n正文", cleaned_real)
 
-    def test_finalize_strips_malformed_tool_markup(self) -> None:
+    def test_finalize_rejects_malformed_tool_markup_for_bounded_retry(self) -> None:
         request = app.normalize_openai_chat_request(
             {
                 "model": "glm-5.2",
@@ -226,17 +227,50 @@ class ProtocolAdaptersTest(unittest.TestCase):
             },
             False,
         )
-        turn = app.finalize_protocol_turn(
-            request,
-            '前置<glm2api_tool_calls>{"broken": </glm2api_tool_calls>后置',
-            "",
-        )
-        self.assertEqual("前置后置", turn.text)
-        self.assertEqual([], turn.tool_calls)
+        malformed = '前置<glm2api_tool_calls>{"broken": </glm2api_tool_calls>后置'
+        with self.assertRaises(app.ToolCallFormatError):
+            app.finalize_protocol_turn(request, malformed, "")
+        self.assertEqual("前置后置", app.strip_parsed_tool_markup(malformed))
+
+    def test_tool_parser_repairs_common_model_format_slips(self) -> None:
+        tools = [
+            {
+                "name": "read_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "options": {"type": "object"},
+                        "items": {"type": "array"},
+                        "optional": {},
+                    },
+                },
+            }
+        ]
+        markup = r'''＜|DSML|tool_calls＞
+          ＜|DSML|invoke name＝“read_file”＞
+            ＜|DSML|parameter name＝“path”＞<![CDATA["C:\workspace\test\notes.txt"]]＞＜/|DSML|parameter＞
+            ＜|DSML|parameter name＝“options”＞<mode>fast</mode><limit>2</limit>＜/|DSML|parameter＞
+            ＜|DSML|parameter name＝“items”＞<item>one</item><item>2</item>＜/|DSML|parameter＞
+            ＜|DSML|parameter name＝“optional”＞null＜/|DSML|parameter＞
+          ＜/|DSML|invoke＞'''
+        calls = app.parse_tool_calls_from_output(markup, tools, app.ToolChoice())
+        self.assertEqual(1, len(calls))
+        self.assertEqual(r"C:\workspace\test\notes.txt", calls[0].arguments["path"])
+        self.assertEqual({"mode": "fast", "limit": 2}, calls[0].arguments["options"])
+        self.assertEqual(["one", 2], calls[0].arguments["items"])
+        self.assertIsNone(calls[0].arguments["optional"])
+
+        loose = '<tool_calls><invoke name="read_file"><parameter name="options"><![CDATA[{mode:"fast",items:[1,2,],}]]></parameter></invoke>'
+        repaired = app.parse_tool_calls_from_output(loose, tools, app.ToolChoice())
+        self.assertEqual({"mode": "fast", "items": [1, 2]}, repaired[0].arguments["options"])
+        path_value, valid = app._parse_tool_json_value(r'"C:\workspace\new\file.txt"')
+        self.assertTrue(valid)
+        self.assertEqual(r"C:\workspace\new\file.txt", app._repair_tool_path_controls(path_value))
 
     def test_strip_parsed_tool_markup_removes_truncated_adapter_tags(self) -> None:
         cases = [
-            ('<tool_calls><invoke name="x"><parameter name="a">1</parameter></invoke>', "1"),
+            ('<tool_calls><invoke name="x"><parameter name="a">1</parameter></invoke>', ""),
             ('<|DSML|parameter name="a"><![CDATA[hello]]></|DSML|parameter>', "hello"),
             ('<glm2api_tool_calls><invoke name="x"></glm2api_tool_calls>', ""),
             ("</tool_calls>", ""),
@@ -619,6 +653,48 @@ class ProtocolAdaptersTest(unittest.TestCase):
             list(app.ADVERTISED_MODELS),
         )
 
+    def test_allowed_tools_filters_prompt_and_parser(self) -> None:
+        body = {
+            "model": "glm-5.2",
+            "input": "读取文件",
+            "tools": [
+                {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+                {"type": "function", "name": "get_weather", "parameters": {"type": "object"}},
+            ],
+            "tool_choice": {
+                "type": "allowed_tools",
+                "mode": "required",
+                "tools": [{"type": "function", "name": "read_file"}],
+            },
+        }
+        request = app.normalize_openai_responses_request(body, False)
+        self.assertEqual(("read_file",), request.tool_choice.allowed_names)
+        self.assertIn("name: read_file", request.context_text)
+        self.assertNotIn("name: get_weather", request.context_text)
+        raw_calls = [
+            {"name": "get_weather", "arguments": {}},
+            {"name": "read_file", "arguments": {"path": "README.md"}},
+        ]
+        calls = app.normalize_tool_call_candidates(raw_calls, request.tools, request.tool_choice)
+        self.assertEqual(["read_file"], [call.name for call in calls])
+
+        with self.assertRaisesRegex(ValueError, "undeclared tool"):
+            app.normalize_openai_responses_request(
+                {**body, "tool_choice": {"type": "allowed_tools", "tools": [{"name": "missing"}]}},
+                False,
+            )
+
+        forced = app.ToolChoice(mode="forced", forced_name="read_file", allowed_names=("read_file",))
+        duplicate_calls = app.normalize_tool_call_candidates(
+            [
+                {"name": "read_file", "arguments": {"path": "a"}},
+                {"name": "read_file", "arguments": {"path": "b"}},
+            ],
+            request.tools,
+            forced,
+        )
+        self.assertEqual(1, len(duplicate_calls))
+
     def test_file_mode_upstream_prompt_guard_and_mirror_alignment(self) -> None:
         # 对齐 dkceshi 文件模式：两个附件（纯对话 / 纯工具）+ 一个聊天框
         # （Output integrity guard + 执行指令）；镜像 history_text 记实际附件内容。
@@ -742,19 +818,128 @@ class ProtocolAdaptersTest(unittest.TestCase):
 
     def test_api_logs_endpoint_and_ring_capture(self) -> None:
         app.setup_logging("INFO", console=False)
-        app.log_event("api_logs_probe", marker="z-1234")
+        app.set_current_request_id("abc12345")
+        try:
+            app.log_event("api_logs_probe", marker="z-1234")
+        finally:
+            app.set_current_request_id("")
         status, raw = self.request("GET", "/api/logs?lines=50")
         self.assertEqual(200, status)
         data = json.loads(raw)
         self.assertTrue(data["ok"])
         self.assertTrue(any("api_logs_probe" in line for line in data["lines"]))
         self.assertTrue(any("z-1234" in line for line in data["lines"]))
+        self.assertTrue(any(entry["state"] == "api_logs_probe" for entry in data["entries"]))
+        self.assertTrue(any(entry["rid"] == "abc12345" for entry in data["entries"]))
+        self.assertGreaterEqual(data["stats"]["kinds"]["event"], 1)
         self.assertTrue(data["ring_capacity"] >= data["ring_count"])
         status, raw = self.request("GET", "/api/logs?lines=50&level=ERROR")
         data = json.loads(raw)
         self.assertTrue(all("[ERROR]" in line for line in data["lines"]))
         status, raw = self.request("GET", "/api/logs?lines=50&text=nomatch-xyz")
         self.assertEqual([], json.loads(raw)["lines"])
+        status, raw = self.request(
+            "GET",
+            "/api/logs?lines=50&kind=event&state=api_logs_probe&rid=abc12345",
+        )
+        filtered = json.loads(raw)
+        self.assertEqual(200, status)
+        self.assertEqual(1, filtered["stats"]["matched"])
+        self.assertEqual("api_logs_probe", filtered["entries"][0]["state"])
+
+        cursor = int(filtered["cursor"]["last_seq"])
+        app.set_current_request_id("abc12345")
+        try:
+            app.log_event("api_logs_probe", marker="z-5678")
+        finally:
+            app.set_current_request_id("")
+        status, raw = self.request(
+            "GET",
+            f"/api/logs?lines=50&format=structured&state=api_logs_probe&after_seq={cursor}",
+        )
+        incremental = json.loads(raw)
+        self.assertEqual(200, status)
+        self.assertNotIn("lines", incremental)
+        self.assertFalse(incremental["cursor"]["reset_required"])
+        self.assertEqual(2, incremental["stats"]["matched"])
+        self.assertEqual(1, len(incremental["entries"]))
+        self.assertIn("z-5678", incremental["entries"][0]["line"])
+
+    def test_log_ring_cursor_recovers_after_eviction_or_restart(self) -> None:
+        ring = app.RingBufferHandler(capacity=2)
+        ring.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        for index in range(4):
+            ring.emit(logging.LogRecord("test", logging.INFO, __file__, 1, f"event-{index}", (), None))
+
+        entries, matched, cursor = ring.query(limit=10, after_seq=1)
+        self.assertEqual(2, matched)
+        self.assertEqual([3, 4], [entry["seq"] for entry in entries])
+        self.assertTrue(cursor["reset_required"])
+        self.assertEqual(3, cursor["first_seq"])
+        self.assertEqual(4, cursor["last_seq"])
+        self.assertEqual(2, ring.stats()["capacity"])
+
+        entries, _matched, cursor = ring.query(limit=10, after_seq=99)
+        self.assertEqual([3, 4], [entry["seq"] for entry in entries])
+        self.assertTrue(cursor["reset_required"])
+
+    def test_api_metrics_aggregates_history_without_content(self) -> None:
+        now_ms = int(time.time() * 1000)
+        app._HISTORY_CACHE = [
+            {
+                "id": "req_metric_success",
+                "status": "success",
+                "surface": "openai_chat",
+                "caller": "api",
+                "model": "glm-5.3",
+                "created_at": now_ms - 60_000,
+                "elapsed_ms": 1200,
+                "status_code": 200,
+                "delivery_mode": "file",
+                "context_file_fallback": "",
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20, "reasoning_tokens": 5, "total_tokens": 35},
+                "final_prompt": "secret-prompt-must-not-leak",
+                "content": "secret-answer-must-not-leak",
+            },
+            {
+                "id": "req_metric_error",
+                "status": "error",
+                "surface": "anthropic_messages",
+                "caller": "api",
+                "model": "glm-5.2",
+                "created_at": now_ms - 30_000,
+                "elapsed_ms": 2400,
+                "status_code": 503,
+                "delivery_mode": "inline",
+                "context_file_fallback": "upload_failed",
+                "usage": {},
+                "error": "secret-upstream-error-must-not-leak",
+            },
+        ]
+        metrics = app.local_history_metrics(24, now_ms=now_ms)
+        self.assertEqual(2, metrics["requests"])
+        self.assertEqual({"success": 1, "error": 1, "stopped": 0, "streaming": 0}, metrics["statuses"])
+        self.assertEqual(0.5, metrics["success_rate"])
+        self.assertEqual(1800, metrics["avg_elapsed_ms"])
+        self.assertEqual(2400, metrics["p95_elapsed_ms"])
+        self.assertEqual(35, metrics["tokens"]["total_tokens"])
+        self.assertEqual(1, metrics["file_delivery_requests"])
+        self.assertEqual(1, metrics["fallback_requests"])
+        self.assertEqual(2, sum(bucket["total"] for bucket in metrics["timeline"]))
+        serialized = json.dumps(metrics, ensure_ascii=False)
+        self.assertNotIn("secret-prompt", serialized)
+        self.assertNotIn("secret-answer", serialized)
+        self.assertNotIn("secret-upstream-error", serialized)
+
+        self.request("GET", "/api/hello")
+        status, raw = self.request("GET", "/api/metrics?hours=24")
+        self.assertEqual(200, status)
+        payload = json.loads(raw)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(24, payload["window_hours"])
+        self.assertEqual(2, payload["history"]["requests"])
+        self.assertGreaterEqual(payload["runtime"]["requests_total"], 1)
+        self.assertTrue(any(item["path"] == "/api/hello" for item in payload["runtime"]["top_paths"]))
 
     def test_log_events_do_not_emit_raw_account_or_chat_identifiers(self) -> None:
         tree = ast.parse((PROJECT_ROOT / "glm2api.py").read_text(encoding="utf-8"))
@@ -872,6 +1057,124 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertNotIn("MODEL_CONCURRENCY_LIMIT", joined, "繁忙错误不应透传")
         self.assertIn("HELLO", joined)
         self.assertEqual(new_chat_calls[1], context["chat_id"], "context_out 应指向最终 attempt 的会话")
+
+    def test_upstream_sse_accepts_crlf_and_event_fields(self) -> None:
+        state = fake_state()
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'event: message\r\ndata: {"data":{"delta_content":"OK","phase":"answer"}}\r\n\r\n',
+                        b'data: {"data":"[DONE]"}\r\n\r\n',
+                    ]
+                )
+
+        real = (app.new_chat, app.urlopen)
+        app.new_chat = lambda *_a, **_k: ("00000000-0000-0000-0000-000000000088", "u1")
+        app.urlopen = lambda *_a, **_k: FakeResp()
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "hi",
+                    options=app.ChatOptions(model="glm-5.2"),
+                    retry_wait_sec=0,
+                    retry_attempts=1,
+                )
+            )
+        finally:
+            app.new_chat, app.urlopen = real
+        self.assertEqual("OK", "".join(app.extract_delta_from_event(event)[0] for event in events))
+        self.assertEqual("OK", app.extract_delta_from_event(events[0])[0])
+
+    def test_stream_tool_retry_hides_failed_attempt_and_sends_keepalive(self) -> None:
+        current_stream = app.stream_zai_completion
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+        original_new_chat = app.new_chat
+        original_urlopen = app.urlopen
+        attempts = {"count": 0, "chats": 0}
+
+        class FakeResp:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+        upstream_chunks = [
+            [
+                b'data: {"data":{"delta_content":"FAILED_THINKING","phase":"thinking"}}\n\n',
+                b'data: {"data":{"delta_content":"<tool_calls><invoke name=bad>","phase":"answer"}}\n\n',
+            ],
+            [
+                b'data: {"data":{"delta_content":"GOOD_THINKING","phase":"thinking"}}\n\n',
+                (
+                    'data: {"data":{"delta_content":"<tool_calls><invoke name=\\"get_weather\\">'
+                    '<parameter name=\\"city\\">北京</parameter></invoke></tool_calls>","phase":"answer"}}\n\n'
+                ).encode("utf-8"),
+            ],
+        ]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            attempts["chats"] += 1
+            return f"00000000-0000-0000-0000-{attempts['chats']:012d}", "u1"
+
+        def fake_urlopen(_request, timeout=None):
+            index = attempts["count"]
+            attempts["count"] += 1
+            return FakeResp(upstream_chunks[index])
+
+        app.stream_zai_completion = self.original_stream
+        app.new_chat = fake_new_chat
+        app.urlopen = fake_urlopen
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "天气"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                        }
+                    ],
+                    "tool_choice": "required",
+                    "include_thinking": True,
+                    "stream": True,
+                },
+            )
+        finally:
+            app.stream_zai_completion = current_stream
+            app.new_chat = original_new_chat
+            app.urlopen = original_urlopen
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        self.assertEqual(200, status, raw[:500])
+        self.assertEqual(2, attempts["count"])
+        self.assertIn(": keep-alive", raw)
+        self.assertNotIn("FAILED_THINKING", raw)
+        self.assertIn("GOOD_THINKING", raw)
+        self.assertIn('"tool_calls"', raw)
+        self.assertEqual(2, len(self.deleted_chats), "失败首轮与成功重试会话都应清理")
+        records = app.local_history_records()
+        self.assertEqual(1, len(records), "一次客户端请求的格式纠错不应产生两条历史记录")
+        detail = app.get_local_history_record(str(records[0]["id"])) or {}
+        self.assertIn("Tool-call correction:", str(detail.get("final_prompt") or ""))
 
     def test_stream_passes_through_non_transient_error(self) -> None:
         state = fake_state()
@@ -2331,7 +2634,15 @@ class ProtocolAdaptersTest(unittest.TestCase):
             self.assertEqual(401, status)
             self.assertIn("invalid or missing API key", raw)
 
+            status, raw = self.request("GET", "/api/metrics?hours=24")
+            self.assertEqual(401, status)
+            self.assertIn("invalid or missing API key", raw)
+
             status, raw = self.request("GET", "/api/auth/profiles", headers={"X-API-Key": "test-api-key"})
+            self.assertEqual(200, status)
+            self.assertTrue(json.loads(raw)["ok"])
+
+            status, raw = self.request("GET", "/api/metrics?hours=24", headers={"X-API-Key": "test-api-key"})
             self.assertEqual(200, status)
             self.assertTrue(json.loads(raw)["ok"])
 
@@ -2857,6 +3168,8 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("The dialogue up to this point. Pick up from the most recent user message.", package)
         self.assertIn("Valid example:", package)
         self.assertIn("name: get_weather\ndescription: 天气\nschema: ", package)
+        self.assertLess(package.index(app.TOOLS_TRANSCRIPT_INTRO), package.index("Valid example:"))
+        self.assertLess(package.index("Valid example:"), package.index(app.HISTORY_TRANSCRIPT_INTRO))
 
     def test_reference_history_normalization_preserves_role_reasoning_and_tool_name(self) -> None:
         messages = app.normalize_openai_messages_for_protocol(
@@ -3029,7 +3342,9 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual(1, html.count("function formatBytes("))
         self.assertIn('currentPage !== "history" || document.hidden', html)
         self.assertIn('if (!document.hidden && currentPage === "dashboard") refreshDashboardLog();', html)
-        self.assertIn('if (!document.hidden && currentPage === "logs") fetchLogs();', html)
+        self.assertIn('if (!document.hidden && currentPage === "logs") fetchLogs({ incremental: true });', html)
+        self.assertIn('format: "structured"', html)
+        self.assertIn('params.set("after_seq", String(logLastSeq));', html)
         self.assertIn('document.addEventListener("visibilitychange"', html)
         self.assertEqual(1, html.count('id="reasoning-effort-group"'))
         self.assertIn('id="reasoning-effort-settings-group"', html)

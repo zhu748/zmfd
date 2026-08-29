@@ -42,7 +42,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
@@ -73,12 +73,14 @@ _REQ_CONTEXT = threading.local()
 
 
 class RingBufferHandler(logging.Handler):
-    """Keep the latest formatted log lines in memory for the web panel."""
+    """Keep structured log entries in memory while preserving plain-line output."""
 
     def __init__(self, capacity: int = LOG_RING_CAPACITY) -> None:
         super().__init__(level=logging.DEBUG)
+        self.capacity = max(1, int(capacity))
         self._lock = threading.Lock()
-        self._records: deque[tuple[int, str]] = deque(maxlen=capacity)
+        self._records: deque[dict[str, Any]] = deque(maxlen=self.capacity)
+        self._sequence = 0
         self.dropped_by_filter = 0
 
     def emit(self, record: logging.LogRecord) -> None:
@@ -86,8 +88,86 @@ class RingBufferHandler(logging.Handler):
             line = self.format(record)
         except Exception:
             return
+        message = record.getMessage()
+        state = ""
+        rid = ""
+        kind = "system"
+        if message.startswith("{"):
+            try:
+                payload = json.loads(message)
+            except Exception:
+                payload = None
+            if isinstance(payload, dict) and payload.get("state"):
+                state = str(payload.get("state") or "")[:120]
+                rid = str(payload.get("rid") or "")[:32]
+                kind = "event"
+        if kind == "system":
+            access = re.match(r"\[([0-9a-f]{8})\]\s+(REQ|RES)\b", message, re.I)
+            if access:
+                rid = access.group(1)
+                kind = "access"
+            elif record.levelno >= logging.ERROR:
+                kind = "error"
         with self._lock:
-            self._records.append((record.levelno, line))
+            self._sequence += 1
+            self._records.append(
+                {
+                    "seq": self._sequence,
+                    "timestamp_ms": int(record.created * 1000),
+                    "level": record.levelname,
+                    "levelno": record.levelno,
+                    "thread": str(record.threadName or "")[:80],
+                    "kind": kind,
+                    "state": state,
+                    "rid": rid,
+                    "message": message,
+                    "line": line,
+                }
+            )
+
+    def query(
+        self,
+        limit: int = 300,
+        min_level: int = logging.DEBUG,
+        contains: str = "",
+        state: str = "",
+        kind: str = "",
+        rid: str = "",
+        after_seq: int = 0,
+    ) -> tuple[list[dict[str, Any]], int, dict[str, Any]]:
+        """Return filtered entries, match count, and a ring-aware incremental cursor."""
+        with self._lock:
+            records = list(self._records)
+        first_seq = int(records[0]["seq"]) if records else 0
+        last_seq = int(records[-1]["seq"]) if records else 0
+        after_seq = max(0, int(after_seq))
+        reset_required = bool(
+            after_seq
+            and records
+            and (after_seq < first_seq - 1 or after_seq > last_seq)
+        )
+        if min_level > logging.DEBUG:
+            records = [item for item in records if int(item["levelno"]) >= min_level]
+        if contains:
+            needle = contains.lower()
+            records = [item for item in records if needle in str(item["line"]).lower()]
+        if state:
+            state_needle = state.lower()
+            records = [item for item in records if state_needle in str(item["state"]).lower()]
+        if kind:
+            records = [item for item in records if str(item["kind"]).lower() == kind.lower()]
+        if rid:
+            rid_needle = rid.lower()
+            records = [item for item in records if rid_needle in str(item["rid"]).lower()]
+        matched = len(records)
+        if after_seq and not reset_required:
+            records = [item for item in records if int(item["seq"]) > after_seq]
+        cursor = {
+            "first_seq": first_seq,
+            "last_seq": last_seq,
+            "reset_required": reset_required,
+        }
+        return [dict(item) for item in records[-max(1, limit) :]], matched, cursor
 
     def snapshot(
         self,
@@ -95,14 +175,30 @@ class RingBufferHandler(logging.Handler):
         min_level: int = logging.DEBUG,
         contains: str = "",
     ) -> list[str]:
+        records, _matched, _cursor = self.query(limit=limit, min_level=min_level, contains=contains)
+        return [str(item["line"]) for item in records]
+
+    def stats(self, matched_count: int | None = None) -> dict[str, Any]:
         with self._lock:
             records = list(self._records)
-        if min_level > logging.DEBUG:
-            records = [item for item in records if item[0] >= min_level]
-        if contains:
-            needle = contains.lower()
-            records = [item for item in records if needle in item[1].lower()]
-        return [line for _, line in records[-max(1, limit) :]]
+        level_counts = Counter(str(item["level"]) for item in records)
+        kind_counts = Counter(str(item["kind"]) for item in records)
+        state_counts = Counter(str(item["state"]) for item in records if item.get("state"))
+        last_error_at = max(
+            (int(item["timestamp_ms"]) for item in records if int(item["levelno"]) >= logging.ERROR),
+            default=0,
+        )
+        return {
+            "total": len(records),
+            "matched": len(records) if matched_count is None else max(0, int(matched_count)),
+            "capacity": self.capacity,
+            "levels": {name: int(level_counts.get(name, 0)) for name in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")},
+            "kinds": dict(kind_counts),
+            "top_states": [{"state": name, "count": count} for name, count in state_counts.most_common(16)],
+            "last_error_at": last_error_at,
+            "oldest_at": int(records[0]["timestamp_ms"]) if records else 0,
+            "newest_at": int(records[-1]["timestamp_ms"]) if records else 0,
+        }
 
     def __len__(self) -> int:
         with self._lock:
@@ -139,6 +235,14 @@ def setup_logging(level: str = "INFO", console: bool = True) -> Path:
     return LOG_FILE_PATH
 
 
+def log_file_label() -> str:
+    """Return a non-identifying display label even when tests relocate the log file."""
+    try:
+        return LOG_FILE_PATH.relative_to(Path(__file__).resolve().parent).as_posix()
+    except ValueError:
+        return LOG_FILE_PATH.name
+
+
 def log_ring() -> RingBufferHandler:
     """Return the process-wide ring handler, installing logging on first use."""
     if not any(isinstance(handler, RingBufferHandler) for handler in LOG.handlers):
@@ -164,6 +268,79 @@ def log_event(state: str, level: int = logging.INFO, **fields: Any) -> None:
     if rid:
         payload = {"rid": rid, **payload}
     LOG.log(level, json.dumps(payload, ensure_ascii=False, default=str))
+
+
+def _percentile(values: Iterable[int | float], percentile: float) -> int:
+    ordered = sorted(max(0, int(value)) for value in values)
+    if not ordered:
+        return 0
+    position = max(0, min(len(ordered) - 1, round((len(ordered) - 1) * percentile)))
+    return ordered[position]
+
+
+def _metric_path(path: str) -> str:
+    """Normalize dynamic local paths so metrics never expose response identifiers."""
+    value = str(path or "/")
+    for prefix in ("/v1/responses/", "/responses/"):
+        if value.startswith(prefix):
+            return prefix + ":id"
+    return value
+
+
+class RuntimeMetrics:
+    """Small in-memory operational counters; content and account identifiers are excluded."""
+
+    def __init__(self) -> None:
+        self.started_at_ms = int(time.time() * 1000)
+        self.started_mono = time.monotonic()
+        self._lock = threading.Lock()
+        self._requests_total = 0
+        self._status = Counter()
+        self._methods = Counter()
+        self._paths = Counter()
+        self._samples: deque[tuple[float, int, int]] = deque(maxlen=4096)
+
+    def record_http(self, method: str, path: str, status: int, duration_ms: int) -> None:
+        status = max(0, int(status or 0))
+        duration_ms = max(0, int(duration_ms or 0))
+        with self._lock:
+            self._requests_total += 1
+            self._status[str(status)] += 1
+            self._methods[str(method or "UNKNOWN").upper()] += 1
+            self._paths[_metric_path(path)] += 1
+            self._samples.append((time.monotonic(), status, duration_ms))
+
+    def snapshot(self) -> dict[str, Any]:
+        now_mono = time.monotonic()
+        with self._lock:
+            requests_total = self._requests_total
+            status = Counter(self._status)
+            methods = Counter(self._methods)
+            paths = Counter(self._paths)
+            samples = list(self._samples)
+        durations = [item[2] for item in samples]
+        recent = [item for item in samples if now_mono - item[0] <= 300]
+        status_4xx = sum(count for code, count in status.items() if code.startswith("4"))
+        status_5xx = sum(count for code, count in status.items() if code.startswith("5"))
+        recent_errors = sum(1 for _at, code, _duration in recent if code >= 500)
+        return {
+            "started_at": self.started_at_ms,
+            "uptime_seconds": max(0, int(now_mono - self.started_mono)),
+            "requests_total": requests_total,
+            "status_4xx": status_4xx,
+            "status_5xx": status_5xx,
+            "error_rate": round(status_5xx / requests_total, 4) if requests_total else 0.0,
+            "avg_duration_ms": round(sum(durations) / len(durations)) if durations else 0,
+            "p50_duration_ms": _percentile(durations, 0.50),
+            "p95_duration_ms": _percentile(durations, 0.95),
+            "requests_5m": len(recent),
+            "errors_5m": recent_errors,
+            "methods": dict(methods),
+            "top_paths": [{"path": name, "count": count} for name, count in paths.most_common(8)],
+        }
+
+
+RUNTIME_METRICS = RuntimeMetrics()
 
 
 BASE_URL = "https://chat.z.ai"
@@ -226,6 +403,10 @@ MAX_HAR_UPLOAD_BYTES = 512 * 1024 * 1024
 MAX_CHAT_FILE_UPLOAD_BYTES = 128 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 MAX_SSE_BUFFER_BYTES = 2 * 1024 * 1024
+# Buffered tool/reasoning streams can be quiet from the client's perspective
+# even while upstream is still producing hidden semantic deltas.  SSE comments
+# are protocol-safe and keep SDK/proxy idle timers from tearing down the turn.
+SSE_KEEPALIVE_INTERVAL_SECONDS = 10.0
 UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_CONTEXT_FILE_BYTES = 4 * 1024 * 1024
 # Per-account concurrency cap for in-flight upstream generations (Z.ai 429s beyond this).
@@ -1272,6 +1453,7 @@ class ToolChoice:
     mode: str = "auto"
     forced_name: str = ""
     disable_parallel: bool = False
+    allowed_names: tuple[str, ...] = ()
 
 
 @dataclass
@@ -2961,6 +3143,28 @@ def update_history_progress(
         log_event("history_store_write_error", stage="progress", error=str(exc)[:200])
 
 
+def restart_history_record(record_id: str, final_prompt: str) -> None:
+    """Reuse one request mirror when a semantic tool-format retry is sampled."""
+    if not record_id:
+        return
+    try:
+        with _HISTORY_LOCK:
+            record = _history_find_locked(record_id)
+            if record is None:
+                return
+            record["status"] = "streaming"
+            record["final_prompt"] = str(final_prompt or "")[:HISTORY_FINAL_CHARS]
+            record["reasoning"] = ""
+            record["content"] = ""
+            record["error"] = ""
+            record["finish_reason"] = ""
+            record["updated_at"] = int(time.time() * 1000)
+            _HISTORY_DIRTY.add(record_id)
+            _history_persist_locked()
+    except Exception as exc:
+        log_event("history_store_write_error", stage="restart", error=str(exc)[:200])
+
+
 def finish_history_record(
     record_id: str,
     *,
@@ -3033,6 +3237,147 @@ def local_history_records() -> list[dict[str, Any]]:
     """只读快照，按写入顺序（旧→新）返回。"""
     with _HISTORY_LOCK:
         return list(_history_records_locked())
+
+
+def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[str, Any]:
+    """Aggregate retained request mirrors without copying prompt/reply content."""
+    hours = max(1, min(int(hours or 24), 24 * 30))
+    current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    window_ms = hours * 60 * 60 * 1000
+    if hours <= 2:
+        bucket_ms = 5 * 60 * 1000
+    elif hours <= 8:
+        bucket_ms = 15 * 60 * 1000
+    elif hours <= 48:
+        bucket_ms = 60 * 60 * 1000
+    elif hours <= 24 * 7:
+        bucket_ms = 6 * 60 * 60 * 1000
+    else:
+        bucket_ms = 24 * 60 * 60 * 1000
+    bucket_count = max(1, min(48, (window_ms + bucket_ms - 1) // bucket_ms))
+    end_bucket_ms = (current_ms // bucket_ms) * bucket_ms
+    start_bucket_ms = end_bucket_ms - (bucket_count - 1) * bucket_ms
+    bucket_rows: list[dict[str, Any]] = []
+    bucket_by_start: dict[int, dict[str, Any]] = {}
+    for index in range(bucket_count):
+        started = start_bucket_ms + index * bucket_ms
+        row = {
+            "start_ms": started,
+            "start": datetime.fromtimestamp(started / 1000, tz=timezone.utc).isoformat().replace("+00:00", "Z"),
+            "total": 0,
+            "success": 0,
+            "error": 0,
+            "stopped": 0,
+            "streaming": 0,
+            "elapsed_total_ms": 0,
+            "elapsed_samples": 0,
+        }
+        bucket_rows.append(row)
+        bucket_by_start[started] = row
+
+    with _HISTORY_LOCK:
+        records = _history_records_locked()
+        retained_total = len(records)
+        rows = [
+            {
+                "status": str(record.get("status") or ""),
+                "surface": str(record.get("surface") or "unknown"),
+                "caller": str(record.get("caller") or "unknown"),
+                "model": str(record.get("model") or "unknown"),
+                "created_at": int(record.get("created_at") or 0),
+                "elapsed_ms": max(0, int(record.get("elapsed_ms") or 0)),
+                "status_code": max(0, int(record.get("status_code") or 0)),
+                "delivery_mode": history_delivery_mode(record),
+                "fallback": bool(record.get("context_file_fallback")),
+                "usage": dict(record.get("usage") or {}) if isinstance(record.get("usage"), dict) else {},
+            }
+            for record in records
+        ]
+
+    status_counts: Counter[str] = Counter()
+    surface_counts: Counter[str] = Counter()
+    caller_counts: Counter[str] = Counter()
+    model_rows: dict[str, dict[str, Any]] = {}
+    durations: list[int] = []
+    token_totals = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
+    file_delivery_requests = 0
+    fallback_requests = 0
+    latest_at = 0
+    window_rows = 0
+    for row in rows:
+        created_at = int(row["created_at"])
+        if created_at < start_bucket_ms or created_at > current_ms + bucket_ms:
+            continue
+        bucket_start = (created_at // bucket_ms) * bucket_ms
+        bucket = bucket_by_start.get(bucket_start)
+        if bucket is None:
+            continue
+        window_rows += 1
+        latest_at = max(latest_at, created_at)
+        status = str(row["status"] or "unknown")
+        status_counts[status] += 1
+        surface_counts[str(row["surface"])] += 1
+        caller_counts[str(row["caller"])] += 1
+        bucket["total"] += 1
+        if status in {"success", "error", "stopped", "streaming"}:
+            bucket[status] += 1
+        elapsed_ms = int(row["elapsed_ms"])
+        if elapsed_ms > 0:
+            durations.append(elapsed_ms)
+            bucket["elapsed_total_ms"] += elapsed_ms
+            bucket["elapsed_samples"] += 1
+        if row["delivery_mode"] == "file":
+            file_delivery_requests += 1
+        if row["fallback"]:
+            fallback_requests += 1
+        usage = row["usage"]
+        for key in token_totals:
+            token_totals[key] += max(0, int(usage.get(key) or 0))
+        model = str(row["model"])
+        model_item = model_rows.setdefault(
+            model,
+            {"model": model, "count": 0, "success": 0, "error": 0, "stopped": 0, "tokens": 0, "elapsed_total_ms": 0, "elapsed_samples": 0},
+        )
+        model_item["count"] += 1
+        if status in {"success", "error", "stopped"}:
+            model_item[status] += 1
+        model_item["tokens"] += max(0, int(usage.get("total_tokens") or 0))
+        if elapsed_ms > 0:
+            model_item["elapsed_total_ms"] += elapsed_ms
+            model_item["elapsed_samples"] += 1
+
+    for bucket in bucket_rows:
+        samples = int(bucket.pop("elapsed_samples"))
+        total_elapsed = int(bucket.pop("elapsed_total_ms"))
+        bucket["avg_elapsed_ms"] = round(total_elapsed / samples) if samples else 0
+    models = []
+    for item in model_rows.values():
+        samples = int(item.pop("elapsed_samples"))
+        total_elapsed = int(item.pop("elapsed_total_ms"))
+        item["avg_elapsed_ms"] = round(total_elapsed / samples) if samples else 0
+        models.append(item)
+    models.sort(key=lambda item: (-int(item["count"]), str(item["model"]).lower()))
+    outcomes = int(status_counts.get("success", 0) + status_counts.get("error", 0))
+    return {
+        "hours": hours,
+        "bucket_minutes": bucket_ms // 60_000,
+        "retained_total": retained_total,
+        "requests": window_rows,
+        "latest_at": latest_at,
+        "statuses": {name: int(status_counts.get(name, 0)) for name in ("success", "error", "stopped", "streaming")},
+        "success_rate": round(status_counts.get("success", 0) / outcomes, 4) if outcomes else 0.0,
+        "avg_elapsed_ms": round(sum(durations) / len(durations)) if durations else 0,
+        "p50_elapsed_ms": _percentile(durations, 0.50),
+        "p95_elapsed_ms": _percentile(durations, 0.95),
+        "tokens": token_totals,
+        "file_delivery_requests": file_delivery_requests,
+        "file_delivery_rate": round(file_delivery_requests / window_rows, 4) if window_rows else 0.0,
+        "fallback_requests": fallback_requests,
+        "models": models[:12],
+        "surfaces": [{"surface": name, "count": count} for name, count in surface_counts.most_common(12)],
+        "callers": dict(caller_counts),
+        "timeline": bucket_rows,
+    }
 
 
 def local_history_summary(text: str = "", status: str = "") -> list[dict[str, Any]]:
@@ -3637,6 +3982,10 @@ def stream_zai_completion(
             )
             if hist_id:
                 history_ctx["_record_id"] = hist_id
+        else:
+            restart_history_record(hist_id, prompt)
+    if hist_id and context_out is not None:
+        context_out["_history_record_id"] = hist_id
     hist_started = time.monotonic()
     hist_status = "success"
     hist_error = ""
@@ -3779,8 +4128,11 @@ def stream_zai_completion(
                         buffer += text
                         if len(buffer) > MAX_SSE_BUFFER_BYTES:
                             raise RuntimeError("上游 SSE 事件超过本地缓冲上限")
-                        while "\n\n" in buffer:
-                            event, buffer = buffer.split("\n\n", 1)
+                        while True:
+                            framed = pop_sse_event(buffer)
+                            if framed is None:
+                                break
+                            event, buffer = framed
                             event = event.strip()
                             if not event:
                                 continue
@@ -3882,10 +4234,27 @@ def stream_zai_completion(
 
 
 
+SSE_EVENT_SEPARATOR_RE = re.compile(r"\r?\n\r?\n")
+
+
+def pop_sse_event(buffer: str) -> tuple[str, str] | None:
+    match = SSE_EVENT_SEPARATOR_RE.search(buffer)
+    if match is None:
+        return None
+    return buffer[: match.start()], buffer[match.end() :]
+
+
 def parse_sse_event(event: str) -> Any:
-    if event.startswith("data:"):
-        event = event[5:].strip()
-    return json_or_none(event)
+    """Parse LF/CRLF SSE frames, ignoring comments and joining data fields."""
+    data_lines: list[str] = []
+    for line in str(event or "").splitlines():
+        if not line or line.startswith(":"):
+            continue
+        field, separator, value = line.partition(":")
+        if separator and field.strip().lower() == "data":
+            data_lines.append(value[1:] if value.startswith(" ") else value)
+    payload = "\n".join(data_lines).strip() if data_lines else str(event or "").strip()
+    return json_or_none(payload)
 
 
 def extract_delta_from_event(event: str) -> tuple[str, str]:
@@ -4283,16 +4652,74 @@ def protocol_content_text(content: Any) -> str:
 
 def as_json_object(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
-        return dict(value)
+        return _repair_tool_path_controls(dict(value))
     if isinstance(value, str):
-        parsed = json_or_none(value.strip())
+        parsed, _valid = _parse_tool_json_value(value)
         if isinstance(parsed, dict):
-            return parsed
+            return _repair_tool_path_controls(parsed)
         if value.strip():
             return {"input": value}
     if value is not None:
         return {"input": value}
     return {}
+
+
+def _repair_invalid_json_backslashes(text: str) -> str:
+    """Escape only backslashes that cannot start a valid JSON escape sequence."""
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char != "\\":
+            out.append(char)
+            index += 1
+            continue
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        valid_escape = next_char in {'"', "\\", "/", "b", "f", "n", "r", "t"}
+        if next_char == "u":
+            unicode_digits = text[index + 2 : index + 6]
+            valid_escape = len(unicode_digits) == 4 and all(char in string.hexdigits for char in unicode_digits)
+        if not valid_escape:
+            out.append("\\\\")
+        else:
+            out.append("\\")
+        index += 1
+    return "".join(out)
+
+
+def _repair_loose_json(text: str) -> str:
+    """Handle two common model slips: unquoted object keys and trailing commas."""
+    text = re.sub(r"([,{]\s*)([A-Za-z_][A-Za-z0-9_.-]*)(\s*:)", r'\1"\2"\3', text)
+    return re.sub(r",\s*([}\]])", r"\1", text)
+
+
+def _parse_tool_json_value(value: str) -> tuple[Any, bool]:
+    raw = html.unescape(str(value or "").strip())
+    candidates = [raw]
+    repaired_slashes = _repair_invalid_json_backslashes(raw)
+    loose = _repair_loose_json(raw)
+    for candidate in (repaired_slashes, loose, _repair_loose_json(repaired_slashes)):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    for candidate in candidates:
+        try:
+            return json.loads(candidate), True
+        except (TypeError, ValueError):
+            continue
+    return raw, False
+
+
+def _repair_tool_path_controls(value: Any) -> Any:
+    """Undo JSON escape interpretation inside obvious Windows drive paths."""
+    if isinstance(value, dict):
+        return {key: _repair_tool_path_controls(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_repair_tool_path_controls(item) for item in value]
+    if isinstance(value, str) and re.match(r"^[A-Za-z]:", value):
+        replacements = {"\b": r"\b", "\f": r"\f", "\n": r"\n", "\r": r"\r", "\t": r"\t"}
+        for control, escaped in replacements.items():
+            value = value.replace(control, escaped)
+    return value
 
 
 def normalized_history_tool_call(raw: Any, fallback_index: int = 0) -> dict[str, Any] | None:
@@ -4625,6 +5052,30 @@ def tools_enable_web_search(raw_tools: Any) -> bool:
     return False
 
 
+def _normalize_allowed_tool_names(raw_allowed: Any, declared_names: set[str]) -> tuple[str, ...]:
+    """Validate the Responses-style allowed_tools subset without silently widening it."""
+    if raw_allowed is None:
+        return ()
+    if not isinstance(raw_allowed, list) or not raw_allowed:
+        raise ValueError("tool_choice.allowed_tools must be a non-empty list")
+    names: list[str] = []
+    for item in raw_allowed:
+        if isinstance(item, str):
+            name = item.strip()
+        elif isinstance(item, dict):
+            function = item.get("function") if isinstance(item.get("function"), dict) else item
+            name = str(function.get("name") or "").strip()
+        else:
+            name = ""
+        if not name or name not in declared_names:
+            raise ValueError("tool_choice.allowed_tools references an undeclared tool")
+        if name not in names:
+            names.append(name)
+    if not names:
+        raise ValueError("tool_choice.allowed_tools must contain at least one declared tool")
+    return tuple(names)
+
+
 def normalize_tool_choice(raw_choice: Any, tools: list[dict[str, Any]]) -> ToolChoice:
     names = {str(tool["name"]) for tool in tools}
     policy = ToolChoice(mode="auto" if names else "none")
@@ -4644,19 +5095,32 @@ def normalize_tool_choice(raw_choice: Any, tools: list[dict[str, Any]]) -> ToolC
         raise ValueError("tool_choice must be a string or object")
     policy.disable_parallel = coerce_bool(raw_choice.get("disable_parallel_tool_use"), False)
     mode = str(raw_choice.get("type") or "auto").strip().lower()
+    raw_allowed = raw_choice.get("allowed_tools")
+    if mode == "allowed_tools":
+        raw_allowed = raw_choice.get("tools") if raw_allowed is None else raw_allowed
+        mode = str(raw_choice.get("mode") or "auto").strip().lower()
+    policy.allowed_names = _normalize_allowed_tool_names(raw_allowed, names)
     if mode == "any":
         mode = "required"
     if mode in {"auto", "none", "required"}:
-        if mode == "required" and not names:
+        callable_names = set(policy.allowed_names) if policy.allowed_names else names
+        if mode == "required" and not callable_names:
             raise ValueError("tool_choice=required requires at least one declared function tool")
         policy.mode = mode
+        if mode == "none":
+            policy.allowed_names = ()
         return policy
     if mode in {"function", "tool"}:
         function = raw_choice.get("function") if isinstance(raw_choice.get("function"), dict) else raw_choice
         name = str(function.get("name") or "").strip()
         if not name or name not in names:
             raise ValueError("tool_choice references an undeclared tool")
-        return ToolChoice(mode="forced", forced_name=name, disable_parallel=policy.disable_parallel)
+        return ToolChoice(
+            mode="forced",
+            forced_name=name,
+            disable_parallel=policy.disable_parallel,
+            allowed_names=(name,),
+        )
     raise ValueError(f"unsupported tool_choice.type: {mode}")
 
 
@@ -4831,6 +5295,9 @@ def tools_allowed_by_policy(tools: list[dict[str, Any]], policy: ToolChoice | No
     """Return the exact callable surface exposed by the reference tool-choice policy."""
     if policy is not None and policy.mode == "none":
         return []
+    if policy is not None and policy.allowed_names:
+        allowed = set(policy.allowed_names)
+        tools = [tool for tool in tools if str(tool.get("name") or "").strip() in allowed]
     if policy is not None and policy.mode == "forced" and policy.forced_name:
         return [tool for tool in tools if str(tool.get("name") or "").strip() == policy.forced_name]
     return list(tools)
@@ -5194,15 +5661,17 @@ def file_mode_execution_prompt(tools: list[dict[str, Any]], policy: ToolChoice) 
 
 def build_context_package(surface: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]], policy: ToolChoice) -> str:
     parts: list[str] = []
-    transcript = build_history_transcript(messages)
-    if transcript:
-        parts.append(transcript)
+    # Keep policy/schema content ahead of the dialogue, mirroring the
+    # reference adapter's System -> User ordering after flattening to Z.ai.
     tools_text = build_tools_transcript(tools, policy)
     if tools_text:
         parts.append(tools_text)
     instructions = build_tool_instruction(tools, policy)
     if instructions:
         parts.append(instructions)
+    transcript = build_history_transcript(messages)
+    if transcript:
+        parts.append(transcript)
     if not parts:
         return ""
     return "\n\n".join(parts).strip() + "\n"
@@ -5371,6 +5840,24 @@ def strip_markdown_fenced_blocks(text: str) -> str:
 
 
 def canonicalize_dsml_tool_markup(markup: str) -> str:
+    # Full-width punctuation and smart quotes are a frequent side effect of
+    # multilingual generation. Normalize only characters used by the tag shell.
+    markup = str(markup or "").translate(
+        str.maketrans(
+            {
+                "＜": "<",
+                "＞": ">",
+                "｜": "|",
+                "／": "/",
+                "＝": "=",
+                "＂": '"',
+                "“": '"',
+                "”": '"',
+                "‘": "'",
+                "’": "'",
+            }
+        )
+    )
     # 实测上游偶尔把关闭标签写成 `<||DSML|invoke>`（双竖杠无斜杠）， 这里统一
     # 容忍每侧 0-3 个竖杠并把 DSML 前缀剥掉，ElementTree/兜底正则才能继续解析。
     pattern = re.compile(
@@ -5392,6 +5879,44 @@ def canonicalize_dsml_tool_markup(markup: str) -> str:
     return pattern.sub(replace, markup)
 
 
+def _tool_markup_candidate(markup: str) -> str:
+    """Return the last complete or safely repairable tool-call wrapper."""
+    matches = list(re.finditer(r"<tool_calls(?:\s[^>]*)?>.*?</tool_calls\s*>", markup, re.IGNORECASE | re.DOTALL))
+    if matches:
+        return matches[-1].group(0)
+    # The model commonly finishes the invoke and then gets cut off before the
+    # outer closing tag. That structure is unambiguous and safe to close.
+    opens = list(re.finditer(r"<tool_calls(?:\s[^>]*)?>", markup, re.IGNORECASE))
+    if opens:
+        tail = markup[opens[-1].start() :].strip()
+        if re.search(r"</invoke\s*>", tail, re.IGNORECASE):
+            return tail + "</tool_calls>"
+    # Also accept a complete bare invoke, as some models omit both outer tags.
+    invokes = list(re.finditer(r"<invoke\s+name=[\"'][^\"']+[\"'][^>]*>.*?</invoke\s*>", markup, re.IGNORECASE | re.DOTALL))
+    if invokes:
+        return "<tool_calls>" + invokes[-1].group(0) + "</tool_calls>"
+    return ""
+
+
+def _xml_tool_value(node: ElementTree.Element) -> Any:
+    children = list(node)
+    if children:
+        grouped: dict[str, Any] = {}
+        for child in children:
+            key = str(child.tag).split("}")[-1]
+            item = _xml_tool_value(child)
+            if key in grouped:
+                grouped[key] = grouped[key] + [item] if isinstance(grouped[key], list) else [grouped[key], item]
+            else:
+                grouped[key] = item
+        if set(grouped) == {"item"}:
+            item = grouped["item"]
+            return item if isinstance(item, list) else [item]
+        return grouped
+    parsed, valid = _parse_tool_json_value("".join(node.itertext()).strip())
+    return _repair_tool_path_controls(parsed) if valid else parsed
+
+
 def normalize_tool_call_candidates(
     raw_calls: Any,
     tools: list[dict[str, Any]],
@@ -5400,7 +5925,7 @@ def normalize_tool_call_candidates(
 ) -> list[ToolCall]:
     if not isinstance(raw_calls, list) or policy.mode == "none":
         return []
-    tools_by_name = {str(tool["name"]): tool for tool in tools}
+    tools_by_name = {str(tool["name"]): tool for tool in tools_allowed_by_policy(tools, policy)}
     allowed = set(tools_by_name)
     out: list[ToolCall] = []
     for raw in raw_calls:
@@ -5421,7 +5946,9 @@ def normalize_tool_call_candidates(
                 arguments=coerce_tool_arguments_to_schema(as_json_object(arguments), tools_by_name[name]),
             )
         )
-    if policy.disable_parallel and out:
+    # A forced choice means exactly one invocation of that function, even if
+    # the model repeats the block or the client otherwise permits parallelism.
+    if (policy.disable_parallel or policy.mode == "forced") and out:
         return out[:1]
     return out
 
@@ -5433,10 +5960,9 @@ def parse_xml_tool_calls(
     id_prefix: str = "call_",
 ) -> list[ToolCall]:
     normalized = canonicalize_dsml_tool_markup(markup)
-    matches = list(re.finditer(r"<tool_calls(?:\s[^>]*)?>.*?</tool_calls\s*>", normalized, re.IGNORECASE | re.DOTALL))
-    if not matches:
+    candidate = _tool_markup_candidate(normalized)
+    if not candidate:
         return []
-    candidate = matches[-1].group(0)
     try:
         root = ElementTree.fromstring(candidate)
     except ElementTree.ParseError:
@@ -5457,9 +5983,8 @@ def parse_xml_tool_calls(
             ):
                 param_name = parameter_match.group(1).strip()
                 raw_value = re.sub(r"<!\[CDATA\[(.*?)\]\]>", r"\1", parameter_match.group(2), flags=re.DOTALL).strip()
-                raw_value = html.unescape(raw_value)
-                parsed = json_or_none(raw_value)
-                arguments[param_name] = parsed if parsed is not None else raw_value
+                parsed, valid = _parse_tool_json_value(raw_value)
+                arguments[param_name] = _repair_tool_path_controls(parsed) if valid else parsed
             raw_calls.append({"name": name, "arguments": arguments})
         if raw_calls:
             return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix)
@@ -5472,9 +5997,7 @@ def parse_xml_tool_calls(
             param_name = str(parameter.attrib.get("name") or "").strip()
             if not param_name:
                 continue
-            raw_value = "".join(parameter.itertext()).strip()
-            parsed = json_or_none(raw_value)
-            arguments[param_name] = parsed if parsed is not None else raw_value
+            arguments[param_name] = _xml_tool_value(parameter)
         if not arguments:
             arguments_node = invoke.find("./arguments")
             if arguments_node is not None:
@@ -5515,6 +6038,32 @@ def parse_tool_calls_from_output(
     return []
 
 
+def tool_markup_attempted(text: str) -> bool:
+    visible = canonicalize_dsml_tool_markup(strip_markdown_fenced_blocks(str(text or "")))
+    return bool(
+        re.search(r"<\s*/?\s*(?:glm2api_)?tool_calls\b", visible, re.IGNORECASE)
+        or re.search(r"<\s*/?\s*(?:invoke|parameter)\b", visible, re.IGNORECASE)
+    )
+
+
+class ToolCallFormatError(RuntimeError):
+    """The upstream attempted or was required to emit a call, but none converted."""
+
+
+def protocol_request_with_tool_retry_hint(request: ProtocolRequest, error: str) -> ProtocolRequest:
+    allowed_names = [tool["name"] for tool in tools_allowed_by_policy(request.tools, request.tool_choice)]
+    hint = (
+        "Tool-call correction: the previous attempt could not be converted by the client "
+        f"({error[:180]}). Emit one complete DSML tool_calls block using only these names: "
+        f"{', '.join(allowed_names)}. Follow the declared parameter schema exactly; do not explain the correction."
+    )
+    return replace(
+        request,
+        context_text=request.context_text.rstrip() + "\n\n" + hint + "\n",
+        execution_prompt=request.execution_prompt.rstrip() + "\n\n" + hint,
+    )
+
+
 CODE_FENCE_RE = re.compile(r"```[^`]*```", re.DOTALL)
 
 
@@ -5533,8 +6082,24 @@ def strip_parsed_tool_markup(text: str) -> str:
         return f"\x00GLM2API_FENCE_{len(stashed) - 1}\x00"
 
     protected = CODE_FENCE_RE.sub(stash, str(text))
+    protected = canonicalize_dsml_tool_markup(protected)
     protected = TOOL_JSON_WRAPPER_RE.sub("", protected)
     protected = TOOL_XML_BLOCK_RE.sub("", protected)
+    # A complete invoke with a missing outer close is now parseable; remove
+    # that entire semantic block instead of leaking its argument values beside
+    # the native tool call returned to the client.
+    protected = re.sub(
+        r"<tool_calls(?:\s[^>]*)?>\s*(?:<invoke\b[^>]*>.*?</invoke\s*>\s*)+(?:</tool_calls\s*>)?",
+        "",
+        protected,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    protected = re.sub(
+        r"<invoke\s+name=[\"'][^\"']+[\"'][^>]*>.*?</invoke\s*>",
+        "",
+        protected,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
     # Fallback for truncated/malformed blocks: unwrap CDATA, then drop any
     # orphaned adapter tags (tool_calls / invoke / parameter in plain, DSML
     # and glm2api-prefixed spellings). Keeping the parameter text (and only
@@ -5583,9 +6148,13 @@ def finalize_protocol_turn(request: ProtocolRequest, text: str, thinking: str) -
     if not tool_calls and fallback_to_thinking:
         tool_calls = parse_tool_calls_from_output(thinking, request.tools, request.tool_choice, id_prefix=id_prefix)
         calls_source = "thinking"
+    if not tool_calls and request.tools and (
+        tool_markup_attempted(text) or (fallback_to_thinking and tool_markup_attempted(thinking))
+    ):
+        raise ToolCallFormatError("上游输出了工具调用标记，但其名称或参数格式无法转换")
     if request.tool_choice.mode in {"required", "forced"} and not tool_calls:
         wanted = request.tool_choice.forced_name or "任意已声明工具"
-        raise RuntimeError(f"上游未按 tool_choice 输出工具调用: {wanted}")
+        raise ToolCallFormatError(f"上游未按 tool_choice 输出工具调用: {wanted}")
     # Strip adapter markup unconditionally: a malformed tool block must never
     # leak to the client, even when it cannot be parsed into a ToolCall.
     text = strip_parsed_tool_markup(text)
@@ -5681,7 +6250,23 @@ def upload_context_package_to_zai(state: HarState, context_text: str, filename: 
 
 
 def _messages_contain_tool_history(messages: list[dict[str, Any]] | None) -> bool:
-    return any(str(m.get("role") or "").lower() in {"tool", "function"} for m in messages or [])
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").lower() in {"tool", "function"}:
+            return True
+        if message.get("tool_calls") or message.get("function_call"):
+            return True
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict)
+            and str(item.get("type") or "").lower() in {"tool_use", "tool_result", "function_call", "function_call_output"}
+            for item in content
+        ):
+            return True
+        if isinstance(content, str) and tool_markup_attempted(content):
+            return True
+    return False
 
 
 def apply_output_integrity_guard(
@@ -5967,6 +6552,7 @@ _QUIET_ACCESS_PATHS = {
     "/api/auth/profiles",
     "/api/auth/state",
     "/api/logs",
+    "/api/metrics",
     "/healthz",
     "/readyz",
     "/favicon.ico",
@@ -5981,6 +6567,8 @@ def _guard_dispatch(handler_method: Callable[[Any], None]) -> Callable[[Any], No
         set_current_request_id(rid)
         self._rid = rid
         self._request_started_at = time.time()
+        self._request_started_mono = time.monotonic()
+        self._response_code = 0
         path = urlsplit(self.path).path
         quiet_access = path in _QUIET_ACCESS_PATHS
         if not self.quiet and not quiet_access:
@@ -5988,8 +6576,11 @@ def _guard_dispatch(handler_method: Callable[[Any], None]) -> Callable[[Any], No
         try:
             handler_method(self)
         except (BrokenPipeError, ConnectionResetError):
+            if not getattr(self, "_response_code", 0):
+                self._response_code = 499
             log_event("client_disconnected", path=path)
         except Exception:
+            self._response_code = 500
             LOG.exception("[%s] unhandled dispatcher error %s %s", rid, self.command, self.path[:300])
             try:
                 self._json_response(
@@ -5999,6 +6590,13 @@ def _guard_dispatch(handler_method: Callable[[Any], None]) -> Callable[[Any], No
             except Exception:
                 pass
         finally:
+            duration_ms = max(0, int((time.monotonic() - self._request_started_mono) * 1000))
+            code = max(0, int(getattr(self, "_response_code", 0) or 0))
+            if path not in _QUIET_ACCESS_PATHS:
+                RUNTIME_METRICS.record_http(self.command, path, code, duration_ms)
+            if not (code < 400 and (self.quiet or path in _QUIET_ACCESS_PATHS)):
+                level = logging.ERROR if code >= 500 else logging.WARNING if code >= 400 else logging.INFO
+                LOG.log(level, "[%s] RES %s %s -> %s (%d ms)", rid, self.command, path, code or "-", duration_ms)
             set_current_request_id("")
 
     wrapper.__name__ = handler_method.__name__
@@ -6291,16 +6889,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
         chat_id = str(context.get("chat_id") or "").strip()
         if not chat_id:
             return
-        try:
-            delete_zai_chat(state, chat_id)
-        except Exception as exc:
-            log_event(
-                "failed_chat_cleanup_error",
-                chat_id_fp=sha16(chat_id),
-                error=str(exc)[:300],
-            )
+        if context.get("_failed_cleanup_scheduled"):
             return
-        self._clear_deleted_chat_from_active_profile(state, chat_id)
+        context["_failed_cleanup_scheduled"] = True
+        log_event("failed_chat_cleanup_scheduled", chat_id_fp=sha16(chat_id))
+
+        def _work() -> None:
+            try:
+                delete_zai_chat(state, chat_id)
+            except Exception as exc:
+                log_event(
+                    "failed_chat_cleanup_error",
+                    chat_id_fp=sha16(chat_id),
+                    error=str(exc)[:300],
+                )
+                return
+            self._clear_deleted_chat_from_active_profile(state, chat_id)
+            log_event("failed_chat_cleanup_completed", chat_id_fp=sha16(chat_id))
+
+        _submit_auto_delete(_work)
 
     def _cleanup_failed_upstream_files(self, state: HarState, files: list[dict[str, Any]] | None) -> None:
         """Best-effort delete of uploaded files orphaned by a failed chat attempt."""
@@ -6343,7 +6950,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
         return turn
 
-    def _start_protocol_completion(self, request: ProtocolRequest) -> tuple[Iterable[str], dict[str, Any], HarState]:
+    def _start_protocol_completion(
+        self,
+        request: ProtocolRequest,
+        history_record_id: str = "",
+    ) -> tuple[Iterable[str], dict[str, Any], HarState]:
         state = self._active_state()
         delivery_trace: dict[str, Any] = {}
         prompt, files = prepare_protocol_upstream_request(state, request, trace_out=delivery_trace)
@@ -6401,6 +7012,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "context_files": delivery_trace.get("context_files") or [],
             "account": (state.user_id or "")[:8],
         }
+        if history_record_id:
+            history_ctx["_record_id"] = history_record_id
         events = stream_zai_completion(
             state,
             prompt,
@@ -6428,11 +7041,14 @@ class ProxyHandler(BaseHTTPRequestHandler):
         state: HarState,
         request: ProtocolRequest,
         context: dict[str, Any],
+        progress: Callable[[], None] | None = None,
     ) -> tuple[str, str]:
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         try:
             for event in events:
+                if progress is not None:
+                    progress()
                 error = extract_error_from_event(event)
                 if error:
                     raise RuntimeError(error)
@@ -6444,6 +7060,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 else:
                     text_parts.append(delta)
         except Exception:
+            close = getattr(events, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             raise
@@ -6457,26 +7079,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
         context: dict[str, Any],
         text: str,
         thinking: str,
-        regenerate: Callable[[], tuple[str, str, dict[str, Any], HarState]] | None,
+        regenerate: Callable[[ProtocolRequest], tuple[str, str, dict[str, Any], HarState]] | None,
     ) -> ProtocolTurn:
         try:
             return self._complete_protocol_turn(request, state, context, text, thinking)
-        except RuntimeError as exc:
-            # tool_choice=required/forced 依赖模型自觉输出 DSML 块，存在偶发不依从
-            # （尤其上下文走附件的模式 B）。重新采样一次通常即可命中。
-            if regenerate is None or "上游未按 tool_choice" not in str(exc):
+        except ToolCallFormatError as exc:
+            # One bounded correction pass covers both missing required calls
+            # and recognizable-but-malformed call markup.
+            if regenerate is None:
                 raise
-        log_event("tool_choice_missing_retry", model=request.options.model)
-        text2, thinking2, context2, state2 = regenerate()
-        return self._complete_protocol_turn(request, state2, context2, text2, thinking2)
+            retry_reason = str(exc)
+        self._cleanup_failed_upstream_chat(state, context, request.options)
+        retry_request = protocol_request_with_tool_retry_hint(request, retry_reason)
+        log_event("tool_call_format_retry", model=request.options.model, reason=retry_reason[:200])
+        text2, thinking2, context2, state2 = regenerate(retry_request)
+        try:
+            return self._complete_protocol_turn(retry_request, state2, context2, text2, thinking2)
+        except Exception:
+            self._cleanup_failed_upstream_chat(state2, context2, retry_request.options)
+            raise
 
     def _collect_protocol_turn(self, request: ProtocolRequest) -> ProtocolTurn:
         events, context, state = self._start_protocol_completion(request)
         text, thinking = self._consume_protocol_events(events, state, request, context)
 
-        def regenerate() -> tuple[str, str, dict[str, Any], HarState]:
-            events2, context2, state2 = self._start_protocol_completion(request)
-            text2, thinking2 = self._consume_protocol_events(events2, state2, request, context2)
+        def regenerate(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
+            events2, context2, state2 = self._start_protocol_completion(
+                retry_request, str(context.get("_history_record_id") or "")
+            )
+            text2, thinking2 = self._consume_protocol_events(events2, state2, retry_request, context2)
             return text2, thinking2, context2, state2
 
         return self._complete_turn_with_required_retry(request, state, context, text, thinking, regenerate)
@@ -6716,6 +7347,19 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
         self.wfile.flush()
 
+    def _sse_keepalive(self) -> None:
+        self.wfile.write(b": keep-alive\n\n")
+        self.wfile.flush()
+
+    @staticmethod
+    def _close_upstream_events(events: Iterable[str]) -> None:
+        close = getattr(events, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+
     def _content_length(self, max_bytes: int, allow_empty: bool = False) -> int:
         value = self.headers.get("Content-Length")
         if value is None:
@@ -6868,6 +7512,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             with self.state_lock:
                 active_profile = self.profiles.get(self.active_profile_id)
                 state = active_profile.state if active_profile else self.state
+            with self.chat_inflight_lock:
+                active_chat_busy_count = max(0, int(self.chat_inflight.get(self.active_profile_id, 0)))
             self._json_response(
                 200,
                 {
@@ -6906,8 +7552,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "auto_delete_after_completion_default": DEFAULT_DELETE_CHAT_AFTER_COMPLETION,
                     },
                     "profile_store": self._profiles_payload()["profile_store"],
-                    "chat_busy": self.chat_inflight.get(self.active_profile_id, 0) > 0,
-                    "chat_busy_count": self.chat_inflight.get(self.active_profile_id, 0),
+                    "chat_busy": active_chat_busy_count > 0,
+                    "chat_busy_count": active_chat_busy_count,
                     "limits": {
                         "chat_file_upload_bytes": MAX_CHAT_FILE_UPLOAD_BYTES,
                         "har_upload_bytes": MAX_HAR_UPLOAD_BYTES,
@@ -6953,6 +7599,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/logs":
             self._handle_api_logs()
+            return
+        if path == "/api/metrics":
+            self._handle_api_metrics()
             return
         if path == "/api/history/chats":
             self._handle_history_chats()
@@ -7083,6 +7732,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         buffer_for_tools = bool(request.tools) and request.tool_choice.mode != "none"
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        last_client_write = time.monotonic()
+
+        def keepalive_if_due() -> None:
+            nonlocal last_client_write
+            now = time.monotonic()
+            if now - last_client_write >= SSE_KEEPALIVE_INTERVAL_SECONDS:
+                self._sse_keepalive()
+                last_client_write = now
+
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -7110,7 +7768,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     continue
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
-                    if request.options.include_thinking:
+                    if request.options.include_thinking and not buffer_for_tools:
                         self._write_openai_chunk(
                             {
                                 "id": completion_id,
@@ -7122,6 +7780,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 ],
                             }
                         )
+                        last_client_write = time.monotonic()
+                    else:
+                        keepalive_if_due()
                     continue
                 text_parts.append(delta)
                 if not buffer_for_tools:
@@ -7134,15 +7795,35 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
                         }
                     )
+                    last_client_write = time.monotonic()
+                else:
+                    keepalive_if_due()
             self._release_chat_slot_early()
-            def _regenerate_required_turn() -> tuple[str, str, dict[str, Any], HarState]:
-                events2, context2, state2 = self._start_protocol_completion(request)
-                text2, thinking2 = self._consume_protocol_events(events2, state2, request, context2)
+
+            def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
+                events2, context2, state2 = self._start_protocol_completion(
+                    retry_request, str(context.get("_history_record_id") or "")
+                )
+                text2, thinking2 = self._consume_protocol_events(
+                    events2, state2, retry_request, context2, progress=keepalive_if_due
+                )
                 return text2, thinking2, context2, state2
 
             turn = self._complete_turn_with_required_retry(
                 request, state, context, "".join(text_parts), "".join(thinking_parts), _regenerate_required_turn
             )
+            if buffer_for_tools and request.options.include_thinking and turn.thinking:
+                self._write_openai_chunk(
+                    {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": request.response_model,
+                        "choices": [
+                            {"index": 0, "delta": {"reasoning_content": turn.thinking}, "finish_reason": None}
+                        ],
+                    }
+                )
             if buffer_for_tools and turn.text:
                 self._write_openai_chunk(
                     {
@@ -7192,10 +7873,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
+            self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             return
         except Exception as exc:
+            self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             LOG.exception("[%s] streaming turn failed", current_request_id())
@@ -7249,14 +7932,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
         reasoning_wanted = bool(request.options.include_thinking) and bool(request.options.enable_thinking)
         reasoning_id = ("rs_" + uuid.uuid4().hex) if reasoning_wanted else None
         output_offset = 1 if reasoning_wanted else 0
+        last_client_write = time.monotonic()
 
         def send(event_name: str, payload: dict[str, Any]) -> None:
-            nonlocal sequence
+            nonlocal sequence, last_client_write
             sequence += 1
             data = dict(payload)
             data.setdefault("type", event_name)
             data.setdefault("sequence_number", sequence)
             self._sse_write(event_name, data)
+            last_client_write = time.monotonic()
+
+        def keepalive_if_due() -> None:
+            nonlocal last_client_write
+            now = time.monotonic()
+            if now - last_client_write >= SSE_KEEPALIVE_INTERVAL_SECONDS:
+                self._sse_keepalive()
+                last_client_write = now
 
         try:
             self.send_response(200)
@@ -7324,7 +8016,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     continue
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
-                    if reasoning_wanted:
+                    if reasoning_wanted and not buffer_for_tools:
                         send(
                             "response.reasoning_summary_text.delta",
                             {
@@ -7334,6 +8026,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                                 "delta": delta,
                             },
                         )
+                    else:
+                        keepalive_if_due()
                     continue
                 text_parts.append(delta)
                 if not buffer_for_tools:
@@ -7346,16 +8040,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
                             "delta": delta,
                         },
                     )
+                else:
+                    keepalive_if_due()
             self._release_chat_slot_early()
-            def _regenerate_required_turn() -> tuple[str, str, dict[str, Any], HarState]:
-                events2, context2, state2 = self._start_protocol_completion(request)
-                text2, thinking2 = self._consume_protocol_events(events2, state2, request, context2)
+
+            def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
+                events2, context2, state2 = self._start_protocol_completion(
+                    retry_request, str(context.get("_history_record_id") or "")
+                )
+                text2, thinking2 = self._consume_protocol_events(
+                    events2, state2, retry_request, context2, progress=keepalive_if_due
+                )
                 return text2, thinking2, context2, state2
 
             turn = self._complete_turn_with_required_retry(
                 request, state, context, "".join(text_parts), "".join(thinking_parts), _regenerate_required_turn
             )
             if reasoning_wanted:
+                if buffer_for_tools and turn.thinking:
+                    send(
+                        "response.reasoning_summary_text.delta",
+                        {
+                            "item_id": reasoning_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": turn.thinking,
+                        },
+                    )
                 send(
                     "response.reasoning_summary_text.done",
                     {
@@ -7481,10 +8192,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
+            self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             return
         except Exception as exc:
+            self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             LOG.exception("[%s] streaming turn failed", current_request_id())
@@ -7537,6 +8250,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         text_parts: list[str] = []
         thinking_parts: list[str] = []
         message_id = "msg_" + uuid.uuid4().hex
+        last_client_write = time.monotonic()
+
+        def keepalive_if_due() -> None:
+            nonlocal last_client_write
+            now = time.monotonic()
+            if now - last_client_write >= SSE_KEEPALIVE_INTERVAL_SECONDS:
+                self._sse_keepalive()
+                last_client_write = now
+
         try:
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -7576,6 +8298,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     continue
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
+                    keepalive_if_due()
                     continue
                 text_parts.append(delta)
                 if not buffer_for_semantics:
@@ -7583,10 +8306,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "content_block_delta",
                         {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": delta}},
                     )
+                    last_client_write = time.monotonic()
+                else:
+                    keepalive_if_due()
             self._release_chat_slot_early()
-            def _regenerate_required_turn() -> tuple[str, str, dict[str, Any], HarState]:
-                events2, context2, state2 = self._start_protocol_completion(request)
-                text2, thinking2 = self._consume_protocol_events(events2, state2, request, context2)
+
+            def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
+                events2, context2, state2 = self._start_protocol_completion(
+                    retry_request, str(context.get("_history_record_id") or "")
+                )
+                text2, thinking2 = self._consume_protocol_events(
+                    events2, state2, retry_request, context2, progress=keepalive_if_due
+                )
                 return text2, thinking2, context2, state2
 
             turn = self._complete_turn_with_required_retry(
@@ -7630,10 +8361,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             )
             self._sse_write("message_stop", {"type": "message_stop"})
         except (BrokenPipeError, ConnectionResetError):
+            self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             return
         except Exception as exc:
+            self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             LOG.exception("[%s] streaming turn failed", current_request_id())
@@ -8492,20 +9225,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
     quiet: bool = False  # --quiet 时抑制逐请求访问日志
 
     def log_request(self, code: int | str, size: int | None = None) -> None:
-        """Access log with duration; polling endpoints and --quiet only log failures."""
-        duration_ms = int((time.time() - getattr(self, "_request_started_at", time.time())) * 1000)
-        rid = getattr(self, "_rid", "")
-        path = urlsplit(self.path).path
-        code_num = code if isinstance(code, int) else 500
-        if code_num < 400 and (self.quiet or path in _QUIET_ACCESS_PATHS):
-            return
-        LOG.info("[%s] RES %s %s -> %s (%d ms)", rid, self.command, path, code, duration_ms)
+        """Capture the response code; the dispatch guard logs full handler duration."""
+        try:
+            self._response_code = int(code)
+        except (TypeError, ValueError):
+            self._response_code = 500
 
     def log_message(self, fmt: str, *args: Any) -> None:
         LOG.info("[proxy] " + fmt % args)
 
     def _handle_api_logs(self) -> None:
-        """Tail the in-memory ring buffer for the panel log viewer."""
+        """Query the structured in-memory ring while keeping legacy line output."""
         params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
         try:
             limit = max(1, min(int(params.get("lines", "300")), 2000))
@@ -8514,21 +9244,71 @@ class ProxyHandler(BaseHTTPRequestHandler):
         level = str(params.get("level", "")).upper()
         min_level = getattr(logging, level, logging.DEBUG) if level in {"DEBUG", "INFO", "WARNING", "ERROR"} else logging.DEBUG
         contains = str(params.get("text", ""))[:200]
+        state = str(params.get("state", ""))[:120]
+        kind = str(params.get("kind", "")).lower()
+        if kind not in {"event", "access", "system", "error"}:
+            kind = ""
+        rid = re.sub(r"[^0-9a-f]", "", str(params.get("rid", "")).lower())[:32]
+        try:
+            after_seq = max(0, int(params.get("after_seq", "0")))
+        except ValueError:
+            after_seq = 0
+        structured_only = str(params.get("format", "")).lower() == "structured"
         ring = log_ring()
+        entries, matched, cursor = ring.query(
+            limit=limit,
+            min_level=min_level,
+            contains=contains,
+            state=state,
+            kind=kind,
+            rid=rid,
+            after_seq=after_seq,
+        )
         try:
             file_bytes = LOG_FILE_PATH.stat().st_size
         except OSError:
             file_bytes = 0
+        payload = {
+            "ok": True,
+            "entries": [
+                {
+                    key: item[key]
+                    for key in ("seq", "timestamp_ms", "level", "thread", "kind", "state", "rid", "message", "line")
+                }
+                for item in entries
+            ],
+            "cursor": cursor,
+            "stats": ring.stats(matched),
+            "file": log_file_label(),
+            "file_bytes": file_bytes,
+            "ring_count": len(ring),
+            "ring_capacity": ring.capacity,
+            "level": logging.getLevelName(LOG.getEffectiveLevel()),
+        }
+        if not structured_only:
+            payload["lines"] = [str(item["line"]) for item in entries]
+        self._json_response(200, payload)
+
+    def _handle_api_metrics(self) -> None:
+        """Return aggregate operational and retained-history telemetry."""
+        params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+        try:
+            hours = max(1, min(int(params.get("hours", "24")), 24 * 30))
+        except ValueError:
+            hours = 24
+        runtime = RUNTIME_METRICS.snapshot()
+        with self.chat_inflight_lock:
+            runtime["inflight"] = sum(max(0, int(value)) for value in self.chat_inflight.values())
+            runtime["active_profile_inflight"] = max(0, int(self.chat_inflight.get(self.active_profile_id, 0)))
         self._json_response(
             200,
             {
                 "ok": True,
-                "lines": ring.snapshot(limit=limit, min_level=min_level, contains=contains),
-                "file": str(LOG_FILE_PATH),
-                "file_bytes": file_bytes,
-                "ring_count": len(ring),
-                "ring_capacity": LOG_RING_CAPACITY,
-                "level": logging.getLevelName(LOG.getEffectiveLevel()),
+                "generated_at": int(time.time() * 1000),
+                "window_hours": hours,
+                "runtime": runtime,
+                "history": local_history_metrics(hours),
+                "logs": log_ring().stats(),
             },
         )
 
@@ -8973,7 +9753,7 @@ def main() -> int:
             auth_ready=active_state is not None,
             profile_count=len(ProxyHandler.profiles),
             api_key_protected=bool(api_key),
-            log_file=str(LOG_FILE_PATH),
+            log_file=log_file_label(),
             log_level=logging.getLevelName(LOG.getEffectiveLevel()),
         )
         if args.open_web:

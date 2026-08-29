@@ -52,7 +52,15 @@ http://127.0.0.1:8008/
 
 ## 面板结构
 
-Web UI 是控制台式布局：左侧导航 + 顶栏状态，共七页——「概览」（状态磁贴/快捷操作/最近日志/调用入口）、「对话」（可收起会话抽屉 + 紧凑控制条 + 输入框）、「历史」（请求级镜像记录：思维链/流式输出/最终提示词）、「日志」（实时运行日志）、「账号」（登录态管理）、「设置」（默认行为与上游参数）、「接口」（API Key/端点/示例）。
+Web UI 是控制台式布局：左侧导航 + 顶栏状态，共八页——「概览」（请求信号轨/状态磁贴/快捷操作/最近日志）、「统计」（请求趋势、Token 构成、模型与入口分布、运行态）、「对话」（可收起会话抽屉 + 紧凑控制条 + 输入框）、「历史」（请求级镜像记录：思维链/流式输出/最终提示词）、「日志」（结构化实时事件流）、「账号」（登录态管理）、「设置」（默认行为与上游参数）、「接口」（API Key/端点/示例）。
+
+## 统计与可观测性
+
+- 「概览」展示轻量请求信号轨，可切换最近 1 小时 / 24 小时 / 7 天，并显示请求量、成功率、P95、估算 Token 和进程运行时长。
+- 独立「统计」页基于已保留的请求镜像聚合成功/错误/停止、耗时分位数、历史拆分占比、Token 构成、模型排行和调用入口；不会把提示词、回复、账号 ID 或错误正文带入统计响应。
+- 统计页可把当前时间窗口导出为带版本标识的 JSON；导出内容与 `/api/metrics` 一致，仅含脱敏聚合值，便于留档和离线比较。
+- 运行态计数器只统计真实业务/管理请求，忽略 `/api/status`、`/api/logs`、`/api/metrics` 等面板轮询，提供本次进程 HTTP 总量、4xx/5xx、近 5 分钟请求数、真实 handler P50/P95 和当前并发。
+- `GET /api/metrics?hours=24` 返回 `runtime`、`history`、`logs` 三组聚合值；`hours` 支持 1–720，面板常用 1 / 24 / 168。
 
 ## 历史对话浏览
 
@@ -60,7 +68,7 @@ Web UI 是控制台式布局：左侧导航 + 顶栏状态，共七页——「�
 
 ### 请求记录（ds2api 同款请求级镜像）
 
-- **两阶段落盘 + 流中节流持久化（ds2api progress 同款）**：请求进入 `stream_zai_completion` 时先写一条 `streaming` 记录（含完整出站消息、文件清单、上下文文本、最终 prompt、账号、调用方），流式进行中按详情页读取频率每 750ms 把已读到的思维链/回复节流写盘（换会话重试时立即清掉上一轮残留），流结束时更新为 `success` / `stopped`（客户端断开/停止生成，保留已读部分，状态码 200）/ `error`（上游失败，保留错误摘要）；`thinking` 与正文按 phase 持续分流积累。所有协议面（OpenAI Chat/Responses、Anthropic Messages、控制台、CLI）共用这一个汇聚点；同一 `history_ctx` 复用同一条记录，面板降级重试不会产生重复条目。
+- **两阶段落盘 + 流中节流持久化（ds2api progress 同款）**：请求进入 `stream_zai_completion` 时先写一条 `streaming` 记录（含完整出站消息、文件清单、上下文文本、最终 prompt、账号、调用方），流式进行中按详情页读取频率每 750ms 把已读到的思维链/回复节流写盘（换会话重试时立即清掉上一轮残留），流结束时更新为 `success` / `stopped`（客户端断开/停止生成，保留已读部分，状态码 200）/ `error`（上游失败，保留错误摘要）；`thinking` 与正文按 phase 持续分流积累。所有协议面（OpenAI Chat/Responses、Anthropic Messages、控制台、CLI）共用这一个汇聚点；同一 `history_ctx`、上游瞬时重试和工具格式纠错都会复用同一条记录，并用最终实际 prompt 覆盖首轮失败 prompt，不产生重复条目。
 - **每条记录保存**：状态生命周期、接口面（openai_chat / anthropic_messages / panel_chat…）、模型、账号（上游 user_id 前 8 位）、调用方（panel / cli / api）、流式标记、`messages`（实际发出的消息数组，图片/文件块以 `[图片]` / `[文件: 名]` 占位）、`files` 元数据、`delivery_mode`（实际直传/附件拆分）、拆分请求与降级原因、`context_files`（内部生成的历史/工具文本附件：真实文件名、用途、大小和镜像正文，单文件最多 80000 字符并标记是否截断）、`final_prompt`（真实上游输入框文本）、思维链、回复、错误、耗时、估算 tokens（prompt 会计入内部附件正文）。用户上传文件仍只保存文件名/大小/类型，**不保存用户附件内容**。
 - 存储（`glm2api.history.v4`，已 gitignore 绝不入库）：`history.local.json` 是携带摘要条目（id/状态/预览/账号/调用方等）的小索引，完整记录在 `history.local.json.d/<id>.json` 每条一个文件——写入只重写单条 detail + 小索引，无全量重写写放大；detail 与索引均通过同目录临时文件原子替换，detail 或索引写入失败会保留脏标记，在下一次历史变更时重试，不会把失败误记为已持久化；旧 v3 ids 索引与 v2/v1 单文件格式首次读取时自动迁移。保留上限可在设置页配置（`history_max_records`，50–2000，默认 300），超出裁掉最旧并同步清理 detail 文件。
 - **列表**：状态徽标（成功/失败/已停止/进行中）+ 内容预览（回复→思维链→错误→用户输入）+ 模型 · 接口面 · 账号 · 时间 + 条数徽章，每条内嵌 ✕ 删除；仅在历史页可见且停留第一页时每 1.5s 静默自动刷新（新请求自动出现、进行中状态实时变化），翻看更早页或隐藏标签页时暂停；无筛选的常规刷新只构建当前 50 条摘要，不再为最多 2000 条记录做无用转换。侧栏支持关键字搜索（标题/预览/模型/账号）与状态下拉筛选（后端 `?text=&status=`）。
@@ -131,7 +139,7 @@ profiles.local.json
 
 ## 运行日志
 
-服务全程输出结构化运行日志，三路同写：`logs/glm2api.log`（UTF-8，8MB×5 轮转）、stderr（控制台）、内存环形缓冲（1500 条，面板「日志」页可实时查看，支持级别/关键字过滤与自动刷新）。
+服务全程输出结构化运行日志，三路同写：`logs/glm2api.log`（UTF-8，8MB×5 轮转）、stderr（控制台）、内存环形缓冲（1500 条）。面板「日志」页按时间、级别、线程、事件名、RID 和正文分栏展示，支持级别/类型/事件/RID/关键字组合过滤、异常快捷筛选、折行、复制与自动刷新。自动刷新使用序号游标只追加新事件，不再周期性下载并重建全部 500 行；慢请求期间不会叠加下一次轮询，游标因环形淘汰或服务重启失效时会自动回退到完整快照。
 
 - 请求访问日志：`[rid] REQ/RES 方法 路径 -> 状态码 (耗时 ms)`；面板轮询端点（`/api/status` 等）静默，仅在失败时记录。
 - 调用链事件（JSON `{"state": ...}` 风格，带 `rid` 关联同一次请求）：
@@ -140,11 +148,12 @@ profiles.local.json
   - `fresh_captcha_*`：验证码求解全过程（backend、attempt、耗时、降级）；
   - `context_file_uploaded` / `context_file_cache_hit`：历史拆分附件上传（label=history/tools、文件名、字数）与缓存命中；
   - `context_upload_degrade_enter/skip`：Mode B 连续失败降级到模式 A 及窗口内跳过；
-  - `tool_calls_parsed`：解析出的工具调用名与来源（output/thinking）；`tool_choice_missing_retry`：required 模式重采样；
+  - `tool_calls_parsed`：解析出的工具调用名与来源（output/thinking）；`tool_call_format_retry`：required/forced 未调用或工具标记无法转换时的一次纠错重采样；
   - `upstream_stream_open/done`：SSE 开始与结束（事件数、耗时）；`upstream_http_error` / `upstream_connect_failed`：上游错误摘要；
   - `upstream_chat_deleted` / `auto_delete_failed`：自动删除结果；
   - `server_started` / `server_stopped`：启动配置与退出。
 - 协议 handler 抛出的异常会带完整堆栈写入日志；HTTP 层未捕获异常兜底记录并返回 500。
+- 内存日志 API 默认同时返回向后兼容的 `lines` 与结构化 `entries`，并附带游标、各级别计数、事件类型计数和热门 `state`；`format=structured` 可省略重复文本数组，`after_seq` 可增量读取。点击日志行的事件名或 RID 可直接追踪同类事件/单次请求。
 - 日志级别用 `--log-level {DEBUG,INFO,WARNING,ERROR}` 调整（默认 INFO）。
 - 安全约定：token、captcha、API key、user_id、chat_id 等敏感或可关联标识一律只记录 sha16 指纹，不落全文；`logs/` 目录请勿提交仓库。
 
@@ -257,7 +266,8 @@ python .\glm2api.py --serve --api-key "your-local-secret"
 - `GET /api/history/record?id=<req_id>`：单条请求镜像完整记录（出站消息、实际实发模式、内部附件清单/正文、上游输入框、回复与思维链）。
 - `POST /api/history/record/delete`：删除单条请求镜像记录，body 为 `{"id":"<req_id>"}`。
 - `POST /api/history/clear`：清空全部请求镜像记录。
-- `GET /api/logs?lines=300&level=&text=`：读取最近运行日志（内存环形缓冲，`lines` 1-2000，`level` 可选 INFO/WARNING/ERROR 下限，`text` 为关键字过滤）。
+- `GET /api/metrics?hours=24`：读取历史调用、进程运行态与日志健康度聚合统计；不返回提示词/回复正文。
+- `GET /api/logs?lines=300&level=&kind=&state=&rid=&text=&after_seq=`：读取最近运行日志（`lines` 1-2000；支持级别下限、事件/访问/系统/异常类型、事件名、RID 与关键字过滤），默认返回兼容 `lines`、结构化 `entries`、`cursor` 和 `stats`；传 `format=structured` 时省略重复的 `lines`，传 `after_seq=<cursor.last_seq>` 时只返回新事件。若游标已被环形缓冲淘汰或来自旧进程，`cursor.reset_required=true` 且响应自动携带当前尾部快照。
 - `GET /v1/models` / `POST /v1/chat/completions`：OpenAI Chat Completions 兼容接口。
 - `POST /v1/responses`、`GET /v1/responses/{response_id}`：OpenAI Responses 兼容接口。
 - `POST /anthropic/v1/messages`：Anthropic Messages 兼容接口。
@@ -332,12 +342,12 @@ API 协议面**默认回传思维链**，不受面板"显示 Thinking"开关影�
 函数工具支持 OpenAI 的 `tools: [{type: "function", function: ...}]`、Responses 的 `tools: [{type: "function", name: ...}]` 与 Anthropic 的 `tools: [{name, input_schema, ...}]`；`inputSchema` 与 `schema` 也会归一化。适配器会把 JSON Schema、工具选择策略和完整对话一起封装，并将模型返回值转回原协议的 `tool_calls` / `function_call` / `tool_use` 结构。
 
 - 工具只会返回给调用客户端，glm2api 不会自行执行文件、命令、HTTP 或任何其他函数。
-- 支持 `tool_choice` 的 `auto`、`none`、`required` / `any` 和指定函数；`required` 未提供函数定义会直接返回 400。
+- 支持 `tool_choice` 的 `auto`、`none`、`required` / `any`、指定函数和 Responses `allowed_tools` 子集；子集会同步过滤提示词、工具附件和解析结果，空集合/未声明名称直接返回 400。
 - 支持 OpenAI 的 `parallel_tool_calls: false` 与 Anthropic 的 `disable_parallel_tool_use: true`。
 - 下一轮将工具执行结果作为 OpenAI `role: "tool"`、Responses `function_call_output` 或 Anthropic `tool_result` 传回，即可继续工具链。
 - OpenAI / Responses 里声明的 `web_search*` 内置工具会映射为当前上游的联网搜索开关；自定义函数仍由客户端负责执行。
 
-工具调用提示词与参考项目 dkceshi 对齐：英文 DSML 指令（7 条规则 + 5 个反例 + 按当前请求工具动态生成的正确示例），并保留 `required` / 指定工具的强制调用句与 Read 类工具的缓存守卫提示；解析同时兼容 glm2api JSON 外壳、标准 XML 和 DeepSeek 风格尾部竖线变体。代码围栏内示例不会被识别为调用，未声明工具会被拒绝，声明为 `string` 的参数会在模型误输出对象 / 数组时转为紧凑 JSON 字符串。工具调用标记在上游流中会先缓冲和解析，不会泄露给 SDK；普通无工具文本仍保持流式转发。
+工具调用提示词与参考项目 dkceshi 对齐：英文 DSML 指令（7 条规则 + 5 个反例 + 按当前请求工具动态生成的正确示例），并保留 `required` / 指定工具的强制调用句与 Read 类工具的缓存守卫提示；内联上下文按工具 schema/规则在前、对话历史在后的语义顺序发送。解析兼容 glm2api JSON 外壳、标准 XML、DeepSeek 尾部竖线、常见全角标签与可安全补齐的外层结束标签，并修复嵌套 XML 参数、JSON 尾逗号/未引号键和路径反斜杠。代码围栏内示例不会被识别为调用，未声明工具会被拒绝，声明为 `string` 的参数会在模型误输出对象 / 数组时转为紧凑 JSON 字符串。明显尝试调用但无法转换时会附带纠错提示重采样一次；首轮正文/reasoning 不会泄露给客户端。工具调用标记在上游流中会先缓冲和解析，隐藏阶段发送 SSE keep-alive 注释降低空闲断线概率；普通无工具文本仍保持流式转发。
 
 ## 上下文文件封装
 
@@ -359,7 +369,7 @@ API 协议面**默认回传思维链**，不受面板"显示 Thinking"开关影�
 
 `delete_chat_after_completion`（别名 `delete_after_completion` / `auto_delete`）默认是 `true`。`/api/chat`、Chat Completions、Responses、Anthropic Messages 以及 CLI 直连模式（`--prompt`）在**成功完成**后都会删除本次上游 chat；本地的 Responses 历史缓存不受影响。
 
-传入 `false` 可保留 chat。取消、上游错误、工具策略校验失败不会自动删除；自动删除失败不会丢弃已生成答案，网页会显示失败信息，协议入口会写入脱敏本地日志。
+传入 `false` 可保留 chat。启用自动删除时，取消/断连、上游错误与工具格式重试会异步回收已创建的失败 chat；自动删除失败不会丢弃已生成答案，网页会显示失败信息，协议入口会写入脱敏本地日志。
 
 删除和停止生成会按浏览器 HAR 补齐 `Sec-Fetch-*` / `sec-ch-ua*` 同源请求头；如果上游仍返回 401/403，会自动用当前 profile 的 token、设备 ID 和前端版本重试一次。旧 profile 没有保存 Client Hints 时会从 User-Agent 自动推导，通常不需要重新登录。
 

@@ -31,6 +31,8 @@
 
 本地 API Key 可通过面板“API 调试”页启用/更新/清除（DPAPI 加密保存到 `apikey.local.json`），也可用 `GLM2API_API_KEY` 或 `--api-key` 在启动时配置（后者优先级更高）。启用后，所有 API 入口（除 `/healthz` 和最小化 `/api/status` 外）都会校验本地密钥，可传 `X-API-Key: <key>` 或 `Authorization: Bearer <key>`。
 
+本地可观测性端点同样受 API Key 保护：`GET /api/metrics?hours=24` 只返回请求状态、耗时、Token、模型/入口与运行态聚合值，不包含提示词/回复正文；统计页可直接导出同结构的脱敏 JSON。`GET /api/logs` 默认同时返回兼容文本行和结构化事件，可按 `level`、`kind`、`state`、`rid`、`text` 组合过滤；`format=structured&after_seq=<seq>` 支持无重复文本数组的游标增量读取，游标失效时以 `cursor.reset_required` 指示并返回当前快照。
+
 服务默认只绑定回环地址。绑定 `0.0.0.0` 或其他非回环地址时，必须同时传 `--allow-remote` 并配置 API Key，否则服务拒绝启动。
 
 ## 上下文文件策略
@@ -89,14 +91,15 @@ Anthropic Messages：
 
 ### 工具选择与执行边界
 
-- `tool_choice` 支持 `auto`、`none`、`required` / `any` 和指定函数。
+- `tool_choice` 支持 `auto`、`none`、`required` / `any`、指定函数，以及 Responses 风格的 `{"type":"allowed_tools","mode":"auto|required","tools":[...]}`。`allowed_tools` 会同时收窄提示词、工具附件和结果解析，空集合或未声明名称直接返回 400，不会静默扩大权限。
 - OpenAI 的 `parallel_tool_calls: false` 与 Anthropic 的 `disable_parallel_tool_use: true` 都会限制为至多一个调用。
+- 指定函数（forced）始终只返回该函数的一个调用，即使模型重复输出调用块。
 - OpenAI/Responses 中 `web_search*` 类型的内置工具会打开 GLM 的联网搜索；其余工具全部是客户端函数。
 - glm2api 只解析和返回调用请求，绝不会执行工具内容。这包括命令、文件、网络、数据库和 MCP 风格工具。
 
-工具调用提示词与参考项目 dkceshi 对齐（英文 7 条规则 + 5 反例 + 动态正确示例），内部推荐模型在需要调用时输出半角管道 DSML XML 外壳：`<|DSML|tool_calls> → <|DSML|invoke> → <|DSML|parameter>`。同时兼容标准 XML、早期 glm2api JSON 外壳，以及带尾部竖线的 DeepSeek 风格变体（`<|DSML|tool_calls|>` / `<|DSML|invoke name="x"|>` 等）。代码围栏内的示例不会触发解析；未声明工具、强制工具之外的名称不会进入调用结果。该标记会在转协议前移除；普通文本不会看到它，流式工具请求会等待完整语义块解析后再作为原生工具块发送。
+工具调用提示词与参考项目 dkceshi 对齐（英文 7 条规则 + 5 反例 + 动态正确示例），并按“工具 schema / 调用规则 → 对话历史”的 System→User 语义顺序放入上游输入框。内部推荐模型在需要调用时输出半角管道 DSML XML 外壳：`<|DSML|tool_calls> → <|DSML|invoke> → <|DSML|parameter>`。解析同时兼容标准 XML、早期 glm2api JSON 外壳、DeepSeek 尾部竖线变体、常见全角标签符号和缺失但可安全补齐的外层结束标签；XML 子节点可还原对象/数组，参数 JSON 可修复尾逗号、未加引号的键和无效路径反斜杠。代码围栏内的示例不会触发解析；未声明工具、强制工具之外的名称不会进入调用结果。该标记会在转协议前移除；普通文本不会看到它，流式工具请求会等待完整语义块解析后再作为原生工具块发送。
 
-生成的工具调用 ID 按协议使用原生前缀和标准长度：OpenAI Chat Completions 为 `call_` + 24 位十六进制，Responses 为 `fc_`，Anthropic 为 `toolu_`，避免严格 SDK 校验拒绝。截断或畸形的工具块在移除时会解开 CDATA 并删除残留的 `invoke` / `parameter` 标签，只保留其中的参数文本，不会向客户端泄漏适配器外壳。`required` / `any` 模式下若调用出现在思考流中，即使正文有文字也会回退解析；`auto` 模式仅在正文为空时才从思考流提取，防止把思考示例误判为真实调用。
+生成的工具调用 ID 按协议使用原生前缀和标准长度：OpenAI Chat Completions 为 `call_` + 24 位十六进制，Responses 为 `fc_`，Anthropic 为 `toolu_`，避免严格 SDK 校验拒绝。截断或畸形的工具块在移除时会解开 CDATA 并删除残留的 `invoke` / `parameter` 标签，只保留其中的参数文本，不会向客户端泄漏适配器外壳。若上游明显尝试了工具块但无法转换，或未满足 `required` / forced，代理会清理首轮上游会话、附加一条精确纠错提示并只重新采样一次；重试仍失败才返回错误。`required` / `any` 模式下若调用出现在思考流中，即使正文有文字也会回退解析；`auto` 模式仅在正文为空时才从思考流提取，防止把思考示例误判为真实调用。
 
 ### 客户端工具循环
 
@@ -128,13 +131,13 @@ Anthropic Messages：
 
 `delete_chat_after_completion` 默认是 `true`，`delete_after_completion` 与 `auto_delete` 是等价别名。一次成功 completion 结束后，代理会删除对应的 Z.ai chat；即使这样，本地 Responses 缓存依然可用于 `previous_response_id`。
 
-请求中传入 `false` 即保留该会话。取消、上游错误和工具策略失败不触发清理。清理失败不会撤销已经生成的协议响应：网页接口会携带失败说明，协议接口会输出只含 chat ID 指纹的本地诊断日志。
+请求中传入 `false` 即保留该会话。启用自动删除时，客户端断开、上游流错误和工具格式重试也会异步回收已经创建的失败会话；同一上下文只调度一次，避免重复删除。清理失败不会撤销已经生成的协议响应：网页接口会携带失败说明，协议接口会输出只含 chat ID 指纹的本地诊断日志。
 
 ## 流式事件
 
 Chat Completions 返回标准 `data: {...}` 片段并以 `data: [DONE]` 结束。Responses 会发送 `response.created`、`response.in_progress`、输出项/文本/函数参数事件以及 `response.completed`；开启 `include_thinking` 且上游思考可用时，还会以标准 `reasoning` 输出项（索引 0）发送 `response.output_item.added`、`response.content_part.added`、`response.reasoning_summary_text.delta/.done`、`response.content_part.done`、`response.output_item.done`，思考摘要与 completed 对象中的 `reasoning.summary` 一致。Anthropic 会发送 `message_start`、`content_block_start`、`content_block_delta`、`content_block_stop`、`message_delta` 和 `message_stop`。
 
-带工具或 Anthropic thinking 的响应会在语义块完整后再写入 SSE，以确保调用端不会收到半截 JSON、内部工具标记或不完整 thinking 块。无工具的普通文本继续边生成边转发。
+带工具或 Anthropic thinking 的响应会在语义块完整后再写入 SSE，以确保调用端不会收到半截 JSON、内部工具标记、不完整 thinking 块，或格式重试前一轮的 reasoning。隐藏阶段每 10 秒最多发送一条标准 SSE 注释 `: keep-alive`（上游有事件推进时检查），降低反向代理/SDK 因下游空闲而断开的概率；无工具的普通文本继续边生成边转发。上游 SSE 分帧同时接受 LF 与 CRLF，并支持标准 `event:`/多 `data:` 字段。
 
 ## 思考、计量与限制
 

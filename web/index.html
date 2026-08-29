@@ -7,7 +7,7 @@
   <style>
     /* ==========================================================================
        GLM Proxy Console — 控制台式管理面板
-       结构：左侧导航栏 + 顶栏 + 六个页面（概览/对话/账号/设置/接口/日志）
+       结构：左侧导航栏 + 顶栏 + 八个页面（概览/统计/对话/历史/日志/账号/设置/接口）
        ========================================================================== */
     :root {
       --bg-base: #0a0d13;
@@ -40,6 +40,7 @@
       --text-inverse: #06131a;
 
       --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+      --font-display: "Bahnschrift SemiCondensed", "Segoe UI Variable Display", "Microsoft YaHei", sans-serif;
       --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 
       --radius-sm: 6px;
@@ -69,6 +70,11 @@
     ::-webkit-scrollbar-track { background: transparent; }
 
     code, pre, .mono { font-family: var(--font-mono); }
+
+    button:focus-visible, input:focus-visible, select:focus-visible, [tabindex]:focus-visible {
+      outline: 2px solid var(--cyan-core);
+      outline-offset: 2px;
+    }
 
     .hidden { display: none !important; }
 
@@ -346,6 +352,131 @@
     .tile-value.warn { color: var(--amber-core); }
     .tile-value.bad { color: var(--rose-core); }
     .tile-value.mono { font-family: var(--font-mono); font-size: 13px; }
+
+    .telemetry-console {
+      position: relative;
+      overflow: hidden;
+      border: 1px solid var(--cyan-border);
+      border-radius: var(--radius-lg);
+      background:
+        linear-gradient(rgba(34, 211, 238, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(34, 211, 238, 0.025) 1px, transparent 1px),
+        var(--bg-surface);
+      background-size: 24px 24px;
+    }
+    .telemetry-head {
+      display: flex; align-items: center; gap: 14px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: rgba(7, 10, 16, 0.72);
+    }
+    .telemetry-title-wrap { display: flex; flex-direction: column; gap: 3px; }
+    .telemetry-eyebrow {
+      color: var(--cyan-core); font-family: var(--font-mono); font-size: 9.5px;
+      font-weight: 800; letter-spacing: 0.15em;
+    }
+    .telemetry-title { font-family: var(--font-display); font-size: 16px; font-weight: 700; letter-spacing: 0.02em; }
+    .telemetry-window { margin-left: auto; display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--border-subtle); border-radius: 8px; background: var(--bg-input); }
+    .telemetry-window button {
+      border: 0; border-radius: 5px; padding: 4px 9px; color: var(--text-dim);
+      background: transparent; font: 700 10.5px var(--font-mono); cursor: pointer;
+    }
+    .telemetry-window button.active { color: var(--text-inverse); background: var(--cyan-core); }
+    .telemetry-body { display: grid; grid-template-columns: 190px minmax(0, 1fr); min-height: 166px; }
+    .telemetry-primary {
+      padding: 18px 18px 16px; display: flex; flex-direction: column; justify-content: space-between;
+      border-right: 1px solid var(--border-subtle); background: rgba(10, 13, 19, 0.55);
+    }
+    .telemetry-primary-label { color: var(--text-dim); font-size: 10.5px; }
+    .telemetry-primary-value {
+      margin-top: 4px; color: var(--text-main); font-family: var(--font-display);
+      font-size: 44px; font-weight: 700; line-height: 1; letter-spacing: -0.035em;
+    }
+    .telemetry-primary-meta { color: var(--text-muted); font-family: var(--font-mono); font-size: 10px; line-height: 1.6; }
+    .signal-panel { position: relative; min-width: 0; padding: 15px 16px 13px; overflow: hidden; }
+    .signal-panel::after {
+      content: ""; position: absolute; top: 0; bottom: 0; width: 70px; left: -90px;
+      background: linear-gradient(90deg, transparent, rgba(34, 211, 238, 0.08), transparent);
+      animation: telemetry-scan 6s linear infinite; pointer-events: none;
+    }
+    @keyframes telemetry-scan { to { transform: translateX(1100px); } }
+    .signal-caption { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--text-dim); font-size: 10px; }
+    .signal-legend { display: flex; align-items: center; gap: 10px; }
+    .signal-key { display: inline-flex; align-items: center; gap: 5px; }
+    .signal-dot { width: 6px; height: 6px; border-radius: 2px; background: var(--text-dim); }
+    .signal-dot.success { background: var(--emerald-core); }
+    .signal-dot.error { background: var(--rose-core); }
+    .signal-dot.stopped { background: var(--amber-core); }
+    .signal-track {
+      height: 112px; margin-top: 10px; display: grid; grid-auto-flow: column;
+      grid-auto-columns: minmax(5px, 1fr); gap: 4px; align-items: end;
+      border-bottom: 1px solid var(--border-medium);
+      background: repeating-linear-gradient(to top, transparent 0, transparent 27px, var(--border-subtle) 28px);
+    }
+    .signal-column { height: 100%; display: flex; align-items: flex-end; justify-content: center; position: relative; }
+    .signal-stack { width: min(12px, 72%); min-height: 2px; display: flex; flex-direction: column-reverse; overflow: hidden; border-radius: 2px 2px 0 0; background: rgba(148, 163, 184, 0.08); }
+    .signal-segment { min-height: 1px; }
+    .signal-segment.success { background: var(--emerald-core); }
+    .signal-segment.error { background: var(--rose-core); }
+    .signal-segment.stopped { background: var(--amber-core); }
+    .signal-column:hover::after { content: attr(data-label); position: absolute; bottom: calc(100% + 5px); z-index: 5; white-space: nowrap; padding: 4px 6px; border: 1px solid var(--border-medium); border-radius: 5px; background: var(--bg-code); color: var(--text-muted); font: 9.5px var(--font-mono); }
+    .metric-strip { display: grid; grid-template-columns: repeat(4, 1fr); border-top: 1px solid var(--border-subtle); }
+    .metric-cell { min-width: 0; padding: 12px 15px; border-right: 1px solid var(--border-subtle); background: rgba(15, 19, 27, 0.88); }
+    .metric-cell:last-child { border-right: 0; }
+    .metric-label { color: var(--text-dim); font-size: 10px; }
+    .metric-value { margin-top: 4px; color: var(--text-main); font: 700 20px var(--font-display); }
+    .metric-value.good { color: var(--emerald-core); }
+    .metric-value.bad { color: var(--rose-core); }
+    .metric-meta { margin-top: 3px; color: var(--text-dim); font: 9.5px var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .model-lanes { display: flex; flex-direction: column; gap: 8px; }
+    .model-lane { display: grid; grid-template-columns: minmax(112px, 0.9fr) minmax(100px, 2fr) 72px; align-items: center; gap: 10px; }
+    .model-lane-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); font: 10.5px var(--font-mono); }
+    .model-lane-track { height: 6px; border-radius: 999px; overflow: hidden; background: rgba(148, 163, 184, 0.09); }
+    .model-lane-fill { height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--cyan-core), var(--violet-light)); }
+    .model-lane-meta { text-align: right; color: var(--text-dim); font: 10px var(--font-mono); }
+
+    .stats-page-head { display: flex; align-items: flex-end; gap: 16px; }
+    .stats-page-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+    .stats-page-copy { display: flex; flex-direction: column; gap: 5px; }
+    .stats-page-kicker { color: var(--cyan-core); font: 800 9.5px var(--font-mono); letter-spacing: 0.15em; }
+    .stats-page-title { font: 700 25px var(--font-display); letter-spacing: -0.015em; }
+    .stats-page-desc { color: var(--text-dim); font-size: 11.5px; }
+    .stats-page-head .telemetry-window { margin-left: 0; }
+    .stats-kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+    .stats-kpi {
+      padding: 13px 14px; border: 1px solid var(--border-subtle); border-radius: var(--radius-lg);
+      background: var(--bg-surface); min-width: 0;
+    }
+    .stats-kpi-label { color: var(--text-dim); font-size: 10.5px; }
+    .stats-kpi-value { margin-top: 5px; font: 700 25px var(--font-display); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stats-kpi-meta { margin-top: 4px; color: var(--text-dim); font: 9.5px var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stats-card-chart { min-height: 210px; }
+    .stats-signal-track { height: 150px; }
+    .breakdown-list { display: flex; flex-direction: column; gap: 10px; }
+    .breakdown-row { display: grid; grid-template-columns: minmax(95px, 1fr) minmax(100px, 2fr) 76px; gap: 10px; align-items: center; }
+    .breakdown-label { color: var(--text-muted); font: 10.5px var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .breakdown-track { height: 7px; border-radius: 999px; overflow: hidden; background: rgba(148, 163, 184, 0.09); }
+    .breakdown-fill { height: 100%; border-radius: inherit; background: var(--cyan-core); }
+    .breakdown-fill.success { background: var(--emerald-core); }
+    .breakdown-fill.warning { background: var(--amber-core); }
+    .breakdown-fill.error { background: var(--rose-core); }
+    .breakdown-meta { color: var(--text-dim); text-align: right; font: 10px var(--font-mono); }
+    .token-composition { display: flex; height: 12px; border-radius: 999px; overflow: hidden; background: rgba(148, 163, 184, 0.09); }
+    .token-segment.prompt { background: var(--cyan-core); }
+    .token-segment.completion { background: var(--emerald-core); }
+    .token-segment.reasoning { background: var(--violet-light); }
+    .token-legend { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .token-legend-item { display: flex; flex-direction: column; gap: 3px; color: var(--text-dim); font-size: 10px; }
+    .token-legend-item strong { color: var(--text-main); font: 700 14px var(--font-display); }
+    .stats-table { display: flex; flex-direction: column; }
+    .stats-table-row { display: grid; grid-template-columns: minmax(0, 1fr) 58px; gap: 10px; padding: 8px 0; border-bottom: 1px dashed var(--border-subtle); }
+    .stats-table-row:last-child { border-bottom: 0; }
+    .stats-table-name { color: var(--text-muted); font: 10.5px var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .stats-table-value { color: var(--text-main); text-align: right; font: 700 11px var(--font-mono); }
+    .stats-empty { color: var(--text-dim); font-size: 11px; line-height: 1.7; padding: 14px 0; }
+    @media (max-width: 1100px) {
+      .stats-kpi-grid { grid-template-columns: repeat(2, 1fr); }
+    }
 
     .quick-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
     @media (max-width: 900px) { .quick-grid { grid-template-columns: repeat(2, 1fr); } }
@@ -930,7 +1061,17 @@
     /* ------------------------------------------------------------------
        页面 6：日志
        ------------------------------------------------------------------ */
-    .log-toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .log-health-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .log-health {
+      display: flex; align-items: center; justify-content: space-between; gap: 8px;
+      padding: 8px 10px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md);
+      background: var(--bg-input); color: var(--text-dim); font-size: 10.5px;
+    }
+    .log-health strong { color: var(--text-main); font: 700 14px var(--font-display); }
+    .log-health.warning strong { color: var(--amber-core); }
+    .log-health.error strong { color: var(--rose-core); }
+    .log-health.event strong { color: var(--cyan-core); }
+    .log-toolbar { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
     .log-toolbar select, .log-toolbar input {
       background: var(--bg-input);
       border: 1px solid var(--border-subtle);
@@ -942,25 +1083,66 @@
       outline: none;
     }
     .log-toolbar select { width: auto; flex: none; cursor: pointer; }
-    .log-toolbar input { flex: 1; min-width: 120px; }
+    .log-toolbar input { width: 126px; min-width: 100px; }
+    .log-toolbar #log-filter { flex: 1; width: auto; min-width: 170px; }
     .log-viewer {
       flex: 1; min-height: 300px;
       overflow: auto;
       background: var(--bg-code);
       border: 1px solid var(--border-subtle);
       border-radius: var(--radius-md);
-      padding: 12px 14px;
-      font-family: var(--font-mono);
-      font-size: 11px; line-height: 1.6;
+      font-family: var(--font-mono); font-size: 10.5px;
       color: var(--text-muted);
-      white-space: pre-wrap;
-      word-break: break-all;
-      margin: 0;
+      margin: 0; display: flex; flex-direction: column;
     }
-    .log-viewer .log-error { color: var(--rose-core); }
-    .log-viewer .log-warning { color: var(--amber-core); }
-    .log-viewer .log-debug { color: var(--text-dim); }
+    .log-row {
+      display: grid; grid-template-columns: 82px 62px 96px minmax(0, 1fr); gap: 9px; align-items: start;
+      padding: 8px 10px 8px 8px; border-bottom: 1px solid rgba(148, 163, 184, 0.07);
+      border-left: 2px solid transparent;
+    }
+    .log-row:last-child { border-bottom: 0; }
+    .log-row:hover { background: rgba(148, 163, 184, 0.045); }
+    .log-row.level-warning { border-left-color: var(--amber-core); background: rgba(251, 191, 36, 0.025); }
+    .log-row.level-error, .log-row.level-critical { border-left-color: var(--rose-core); background: rgba(251, 113, 133, 0.035); }
+    .log-row-time, .log-row-thread { color: var(--text-dim); white-space: nowrap; }
+    .log-row-thread { overflow: hidden; text-overflow: ellipsis; }
+    .log-level-chip { width: fit-content; padding: 1px 5px; border-radius: 4px; color: var(--text-dim); background: rgba(148, 163, 184, 0.08); font-size: 9px; font-weight: 800; }
+    .level-info .log-level-chip { color: var(--emerald-core); background: var(--emerald-subtle); }
+    .level-warning .log-level-chip { color: var(--amber-core); background: var(--amber-subtle); }
+    .level-error .log-level-chip, .level-critical .log-level-chip { color: var(--rose-core); background: var(--rose-subtle); }
+    .log-row-main { min-width: 0; }
+    .log-row-heading { display: flex; align-items: center; gap: 6px; min-width: 0; margin-bottom: 3px; }
+    .log-state-btn, .log-rid-btn { border: 0; padding: 0; background: transparent; font: inherit; cursor: pointer; }
+    .log-state-btn { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--cyan-core); font-weight: 700; }
+    .log-rid-btn { color: var(--violet-light); }
+    .log-kind { color: var(--text-dim); font-size: 9px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .log-row-message { color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.55; }
+    .log-viewer.wrap .log-row-message { white-space: pre-wrap; overflow: visible; word-break: break-word; }
+    .log-empty { margin: auto; padding: 36px; text-align: center; color: var(--text-dim); line-height: 1.8; }
     .log-meta { font-size: 11px; color: var(--text-dim); font-family: var(--font-mono); white-space: nowrap; }
+
+    @media (max-width: 760px) {
+      .telemetry-body { grid-template-columns: 1fr; }
+      .telemetry-primary { border-right: 0; border-bottom: 1px solid var(--border-subtle); gap: 14px; }
+      .telemetry-primary-value { font-size: 36px; }
+      .metric-strip { grid-template-columns: repeat(2, 1fr); }
+      .metric-cell:nth-child(2) { border-right: 0; }
+      .metric-cell:nth-child(-n+2) { border-bottom: 1px solid var(--border-subtle); }
+      .model-lane { grid-template-columns: minmax(90px, 1fr) minmax(80px, 2fr); }
+      .model-lane-meta { grid-column: 2; }
+      .stats-page-head { align-items: flex-start; flex-direction: column; }
+      .stats-page-actions { width: 100%; margin-left: 0; justify-content: space-between; }
+      .stats-kpi-grid { grid-template-columns: repeat(2, 1fr); }
+      .breakdown-row { grid-template-columns: minmax(80px, 1fr) minmax(80px, 2fr); }
+      .breakdown-meta { grid-column: 2; }
+      .log-health-grid { grid-template-columns: repeat(2, 1fr); }
+      .log-row { grid-template-columns: 66px 54px minmax(0, 1fr); }
+      .log-row-thread { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; }
+    }
 
     /* ------------------------------------------------------------------
        代码块
@@ -1043,6 +1225,10 @@
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
           <span>概览</span>
         </button>
+        <button class="nav-item" data-page="stats" id="nav-stats">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19V9"/><path d="M10 19V5"/><path d="M16 19v-7"/><path d="M22 19H2"/></svg>
+          <span>统计</span>
+        </button>
 
         <div class="nav-section">工作区</div>
         <button class="nav-item" data-page="chat" id="nav-chat">
@@ -1107,6 +1293,47 @@
         <section id="page-dashboard" class="page active">
           <div class="page-scroll">
             <div class="page-inner">
+              <div class="telemetry-console">
+                <div class="telemetry-head">
+                  <div class="telemetry-title-wrap">
+                    <span class="telemetry-eyebrow">REQUEST TELEMETRY</span>
+                    <span class="telemetry-title">请求信号轨</span>
+                  </div>
+                  <span id="metric-generated" class="card-desc">等待统计数据</span>
+                  <div class="telemetry-window" aria-label="统计时间窗口">
+                    <button type="button" data-metric-hours="1">1H</button>
+                    <button type="button" data-metric-hours="24" class="active">24H</button>
+                    <button type="button" data-metric-hours="168">7D</button>
+                  </div>
+                </div>
+                <div class="telemetry-body">
+                  <div class="telemetry-primary">
+                    <div>
+                      <div class="telemetry-primary-label">窗口内请求</div>
+                      <div id="metric-request-count" class="telemetry-primary-value">—</div>
+                    </div>
+                    <div id="metric-request-sub" class="telemetry-primary-meta">读取历史镜像中…</div>
+                  </div>
+                  <div class="signal-panel">
+                    <div class="signal-caption">
+                      <span id="metric-window-label">最近 24 小时</span>
+                      <span class="signal-legend">
+                        <span class="signal-key"><i class="signal-dot success"></i>成功</span>
+                        <span class="signal-key"><i class="signal-dot error"></i>错误</span>
+                        <span class="signal-key"><i class="signal-dot stopped"></i>停止</span>
+                      </span>
+                    </div>
+                    <div id="metric-timeline" class="signal-track" aria-label="请求趋势"></div>
+                  </div>
+                </div>
+                <div class="metric-strip">
+                  <div class="metric-cell"><div class="metric-label">成功率</div><div id="metric-success-rate" class="metric-value">—</div><div id="metric-success-meta" class="metric-meta">成功 / 错误</div></div>
+                  <div class="metric-cell"><div class="metric-label">P95 耗时</div><div id="metric-p95" class="metric-value">—</div><div id="metric-latency-meta" class="metric-meta">窗口内完成请求</div></div>
+                  <div class="metric-cell"><div class="metric-label">估算 Token</div><div id="metric-tokens" class="metric-value">—</div><div id="metric-token-meta" class="metric-meta">提示词 + 回复 + 思考</div></div>
+                  <div class="metric-cell"><div class="metric-label">服务运行</div><div id="metric-runtime" class="metric-value">—</div><div id="metric-runtime-meta" class="metric-meta">等待运行态数据</div></div>
+                </div>
+              </div>
+
               <div class="dash-tiles">
                 <div class="tile">
                   <span class="tile-label">服务状态</span>
@@ -1211,6 +1438,104 @@
                     <span class="endpoint-method">POST</span>
                     <span class="endpoint-path" data-endpoint>/v1/responses</span>
                     <span class="btn-copy-chip" data-copy-path="/v1/responses">复制</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ========== 页面：统计 ========== -->
+        <section id="page-stats" class="page">
+          <div class="page-scroll">
+            <div class="page-inner">
+              <div class="stats-page-head">
+                <div class="stats-page-copy">
+                  <span class="stats-page-kicker">OBSERVABILITY / AGGREGATES</span>
+                  <h2 class="stats-page-title">运行与调用统计</h2>
+                  <p id="stats-generated" class="stats-page-desc">只聚合请求状态、耗时和 Token，不读取提示词正文。</p>
+                </div>
+                <div class="stats-page-actions">
+                  <button type="button" id="btn-stats-export" class="tool-btn" title="导出当前窗口的脱敏聚合 JSON"><span>导出 JSON</span></button>
+                  <div class="telemetry-window" aria-label="统计页面时间窗口">
+                    <button type="button" data-metric-hours="1">1H</button>
+                    <button type="button" data-metric-hours="24" class="active">24H</button>
+                    <button type="button" data-metric-hours="168">7D</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="stats-kpi-grid">
+                <div class="stats-kpi"><div class="stats-kpi-label">请求总量</div><div id="stats-kpi-requests" class="stats-kpi-value">—</div><div id="stats-kpi-requests-meta" class="stats-kpi-meta">当前时间窗口</div></div>
+                <div class="stats-kpi"><div class="stats-kpi-label">成功率</div><div id="stats-kpi-success" class="stats-kpi-value">—</div><div id="stats-kpi-success-meta" class="stats-kpi-meta">成功 / 错误</div></div>
+                <div class="stats-kpi"><div class="stats-kpi-label">错误与停止</div><div id="stats-kpi-errors" class="stats-kpi-value">—</div><div id="stats-kpi-errors-meta" class="stats-kpi-meta">异常结果</div></div>
+                <div class="stats-kpi"><div class="stats-kpi-label">历史拆分占比</div><div id="stats-kpi-file-rate" class="stats-kpi-value">—</div><div id="stats-kpi-file-meta" class="stats-kpi-meta">FILES + PROMPT</div></div>
+              </div>
+
+              <div class="grid-2">
+                <div class="card stats-card-chart">
+                  <div class="card-head"><span class="card-title">请求结果趋势</span><span id="stats-timeline-meta" class="card-desc">—</span></div>
+                  <div class="card-body">
+                    <div class="signal-caption">
+                      <span>按服务端时间桶聚合</span>
+                      <span class="signal-legend"><span class="signal-key"><i class="signal-dot success"></i>成功</span><span class="signal-key"><i class="signal-dot error"></i>错误</span><span class="signal-key"><i class="signal-dot stopped"></i>停止</span></span>
+                    </div>
+                    <div id="stats-timeline" class="signal-track stats-signal-track" aria-label="统计页请求趋势"></div>
+                  </div>
+                </div>
+                <div class="card stats-card-chart">
+                  <div class="card-head"><span class="card-title">Token 构成</span><span id="stats-token-total" class="card-desc">—</span></div>
+                  <div class="card-body">
+                    <div id="stats-token-composition" class="token-composition" aria-label="Token 构成"></div>
+                    <div class="token-legend">
+                      <div class="token-legend-item">提示词<strong id="stats-token-prompt">—</strong></div>
+                      <div class="token-legend-item">回复<strong id="stats-token-completion">—</strong></div>
+                      <div class="token-legend-item">思考<strong id="stats-token-reasoning">—</strong></div>
+                    </div>
+                    <div class="kv-grid">
+                      <div class="kv-row"><span class="kv-key">平均耗时</span><span id="stats-latency-avg" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">P50 / P95</span><span id="stats-latency-percentiles" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">拆分降级</span><span id="stats-fallbacks" class="kv-val">—</span></div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div class="card">
+                  <div class="card-head"><span class="card-title">模型使用排行</span><span class="card-desc">请求量 · Token · 平均耗时</span></div>
+                  <div class="card-body"><div id="stats-models" class="breakdown-list"><div class="stats-empty">暂无模型调用记录</div></div></div>
+                </div>
+                <div class="card">
+                  <div class="card-head"><span class="card-title">调用入口分布</span><span class="card-desc">协议面与调用方</span></div>
+                  <div class="card-body"><div id="stats-surfaces" class="breakdown-list"><div class="stats-empty">暂无入口统计</div></div></div>
+                </div>
+              </div>
+
+              <div class="grid-2">
+                <div class="card">
+                  <div class="card-head"><span class="card-title">服务运行态</span><span id="stats-uptime" class="card-desc">—</span></div>
+                  <div class="card-body">
+                    <div class="kv-grid">
+                      <div class="kv-row"><span class="kv-key">本次进程请求</span><span id="stats-runtime-requests" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">近 5 分钟</span><span id="stats-runtime-recent" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">HTTP P50 / P95</span><span id="stats-runtime-latency" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">4xx / 5xx</span><span id="stats-runtime-errors" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">当前并发</span><span id="stats-runtime-inflight" class="kv-val">—</span></div>
+                    </div>
+                    <div id="stats-paths" class="stats-table"><div class="stats-empty">暂无本地路由调用</div></div>
+                  </div>
+                </div>
+                <div class="card">
+                  <div class="card-head"><span class="card-title">日志健康度</span><span id="stats-log-total" class="card-desc">—</span></div>
+                  <div class="card-body">
+                    <div class="log-health-grid">
+                      <div class="log-health"><span>INFO</span><strong id="stats-log-info">0</strong></div>
+                      <div class="log-health warning"><span>WARN</span><strong id="stats-log-warning">0</strong></div>
+                      <div class="log-health error"><span>ERROR</span><strong id="stats-log-error">0</strong></div>
+                      <div class="log-health event"><span>EVENT</span><strong id="stats-log-events">0</strong></div>
+                    </div>
+                    <div id="stats-event-list" class="stats-table"><div class="stats-empty">暂无结构化事件</div></div>
                   </div>
                 </div>
               </div>
@@ -1663,6 +1988,12 @@
                   <div class="card-head-spacer"></div>
                 </div>
                 <div class="card-body" style="flex: 1; min-height: 0;">
+                  <div class="log-health-grid">
+                    <div class="log-health"><span>当前匹配</span><strong id="log-stat-matched">0</strong></div>
+                    <div class="log-health warning"><span>WARNING</span><strong id="log-stat-warning">0</strong></div>
+                    <div class="log-health error"><span>ERROR</span><strong id="log-stat-error">0</strong></div>
+                    <div class="log-health event"><span>结构化事件</span><strong id="log-stat-events">0</strong></div>
+                  </div>
                   <div class="log-toolbar">
                     <select id="log-level">
                       <option value="">全部级别</option>
@@ -1670,12 +2001,24 @@
                       <option value="WARNING">WARNING+</option>
                       <option value="ERROR">仅 ERROR</option>
                     </select>
-                    <input id="log-filter" type="text" placeholder="关键字过滤（回车应用）">
+                    <select id="log-kind">
+                      <option value="">全部类型</option>
+                      <option value="event">事件</option>
+                      <option value="access">访问</option>
+                      <option value="system">系统</option>
+                      <option value="error">异常</option>
+                    </select>
+                    <input id="log-state" type="text" list="log-state-options" placeholder="事件名">
+                    <datalist id="log-state-options"></datalist>
+                    <input id="log-rid" type="text" placeholder="请求 RID">
+                    <input id="log-filter" type="text" placeholder="关键字过滤">
+                    <button id="btn-log-errors" class="btn-secondary" type="button"><span>只看异常</span></button>
                     <button id="btn-log-refresh" class="btn-secondary" type="button"><span>刷新</span></button>
                     <button id="btn-log-autorefresh" class="btn-secondary" type="button"><span>自动:开</span></button>
+                    <button id="btn-log-wrap" class="btn-secondary active" type="button"><span>折行:开</span></button>
                     <button id="btn-log-copy" class="btn-secondary" type="button"><span>复制</span></button>
                   </div>
-                  <pre id="log-viewer" class="log-viewer">正在加载日志…</pre>
+                  <div id="log-viewer" class="log-viewer wrap"><div class="log-empty">正在加载日志…</div></div>
                 </div>
               </div>
             </div>
@@ -1980,6 +2323,7 @@
     // ==========================================================================
     const PAGE_META = {
       dashboard: { title: "概览", sub: "服务状态与快捷入口" },
+      stats: { title: "统计", sub: "请求趋势、Token、模型与运行态" },
       chat: { title: "对话", sub: "与 GLM 模型聊天 · 会话按账号隔离" },
       history: { title: "历史", sub: "请求级镜像：思维链 / 流式输出 / 发给上游的提示词" },
       logs: { title: "日志", sub: "调用过程、重试与报错全链路" },
@@ -2012,6 +2356,12 @@
         setDashLogAuto(true);
       } else {
         setDashLogAuto(false);
+      }
+      if (pageId === "dashboard" || pageId === "stats") {
+        refreshMetrics();
+        setMetricAuto(true);
+      } else {
+        setMetricAuto(false);
       }
       if (pageId === "history") {
         ensureHistoryLoaded();
@@ -2046,7 +2396,8 @@
       "openai_responses": "OpenAI Responses",
       "anthropic_messages": "Anthropic Messages",
       "panel_chat": "控制台对话",
-      "cli_direct": "CLI 直连"
+      "cli_direct": "CLI 直连",
+      "unknown": "未标记入口"
     };
     function surfaceLabel(surface) {
       return SURFACE_LABELS[String(surface || "")] || (String(surface || "") || "—");
@@ -2097,8 +2448,32 @@
       return `${(v / 1024 / 1024).toFixed(1)}MB`;
     }
 
-    function downloadTextFile(filename, text) {
-      const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+    function formatCompactNumber(value) {
+      const n = Number(value) || 0;
+      if (Math.abs(n) < 1000) return n.toLocaleString();
+      if (Math.abs(n) < 1000000) return `${(n / 1000).toFixed(n < 10000 ? 1 : 0)}K`;
+      if (Math.abs(n) < 1000000000) return `${(n / 1000000).toFixed(n < 10000000 ? 1 : 0)}M`;
+      return `${(n / 1000000000).toFixed(1)}B`;
+    }
+
+    function formatPercent(value, hasSamples = true) {
+      if (!hasSamples) return "—";
+      return `${(Number(value || 0) * 100).toFixed(1)}%`;
+    }
+
+    function formatUptime(seconds) {
+      let remaining = Math.max(0, Math.floor(Number(seconds) || 0));
+      const days = Math.floor(remaining / 86400);
+      remaining %= 86400;
+      const hours = Math.floor(remaining / 3600);
+      const minutes = Math.floor((remaining % 3600) / 60);
+      if (days) return `${days}d ${hours}h`;
+      if (hours) return `${hours}h ${minutes}m`;
+      return `${minutes}m`;
+    }
+
+    function downloadTextFile(filename, text, mime = "text/plain;charset=utf-8") {
+      const blob = new Blob([text], { type: mime });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -3863,47 +4238,439 @@
     bindChip("chip-include-thinking", includeThinkingToggle);
     bindChip("chip-auto-delete", autoDeleteToggle);
 
+    // ---- 统计与遥测 ----
+    let metricHours = 24;
+    let metricAutoTimer = null;
+    let metricLastData = null;
+
+    function metricWindowText(hours) {
+      if (hours === 1) return "最近 1 小时";
+      if (hours === 168) return "最近 7 天";
+      return `最近 ${hours} 小时`;
+    }
+
+    function renderMetricTimeline(container, timeline) {
+      if (!container) return;
+      container.replaceChildren();
+      const rows = Array.isArray(timeline) ? timeline : [];
+      const maxTotal = Math.max(1, ...rows.map(row => Number(row.total) || 0));
+      rows.forEach(row => {
+        const total = Number(row.total) || 0;
+        const column = document.createElement("div");
+        column.className = "signal-column";
+        const when = new Date(Number(row.start_ms) || 0);
+        const timeLabel = isNaN(when.getTime()) ? "—" : when.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false });
+        column.dataset.label = `${timeLabel} · 总计 ${total} / 成功 ${row.success || 0} / 错误 ${row.error || 0} / 停止 ${row.stopped || 0}`;
+        const stack = document.createElement("div");
+        stack.className = "signal-stack";
+        stack.style.height = total ? `${Math.max(4, (total / maxTotal) * 100)}%` : "2px";
+        ["success", "stopped", "error"].forEach(status => {
+          const count = Number(row[status]) || 0;
+          if (!count) return;
+          const segment = document.createElement("span");
+          segment.className = `signal-segment ${status}`;
+          segment.style.flex = String(count);
+          stack.appendChild(segment);
+        });
+        column.appendChild(stack);
+        container.appendChild(column);
+      });
+    }
+
+    function renderBreakdown(container, items, labelKey, metaBuilder, tone = "") {
+      if (!container) return;
+      container.replaceChildren();
+      const rows = Array.isArray(items) ? items : [];
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "stats-empty";
+        empty.textContent = "当前时间窗口暂无数据。";
+        container.appendChild(empty);
+        return;
+      }
+      const maxCount = Math.max(1, ...rows.map(item => Number(item.count) || 0));
+      rows.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "breakdown-row";
+        const label = document.createElement("span");
+        label.className = "breakdown-label";
+        label.textContent = String(item[labelKey] || "unknown");
+        label.title = label.textContent;
+        const track = document.createElement("div");
+        track.className = "breakdown-track";
+        const fill = document.createElement("div");
+        fill.className = `breakdown-fill ${tone}`.trim();
+        fill.style.width = `${Math.max(2, ((Number(item.count) || 0) / maxCount) * 100)}%`;
+        track.appendChild(fill);
+        const meta = document.createElement("span");
+        meta.className = "breakdown-meta";
+        meta.textContent = metaBuilder(item);
+        row.append(label, track, meta);
+        container.appendChild(row);
+      });
+    }
+
+    function renderStatsTable(container, items, nameKey, valueKey) {
+      if (!container) return;
+      container.replaceChildren();
+      const rows = Array.isArray(items) ? items : [];
+      if (!rows.length) {
+        const empty = document.createElement("div");
+        empty.className = "stats-empty";
+        empty.textContent = "暂无数据。";
+        container.appendChild(empty);
+        return;
+      }
+      rows.forEach(item => {
+        const row = document.createElement("div");
+        row.className = "stats-table-row";
+        const name = document.createElement("span");
+        name.className = "stats-table-name";
+        name.textContent = String(item[nameKey] || "unknown");
+        name.title = name.textContent;
+        const value = document.createElement("span");
+        value.className = "stats-table-value";
+        value.textContent = formatCompactNumber(item[valueKey]);
+        row.append(name, value);
+        container.appendChild(row);
+      });
+    }
+
+    function renderMetrics(data) {
+      metricLastData = data;
+      const history = data.history || {};
+      const runtime = data.runtime || {};
+      const logs = data.logs || {};
+      const statuses = history.statuses || {};
+      const success = Number(statuses.success) || 0;
+      const errors = Number(statuses.error) || 0;
+      const stopped = Number(statuses.stopped) || 0;
+      const outcomes = success + errors;
+      const tokens = history.tokens || {};
+      const generated = new Date(Number(data.generated_at) || Date.now());
+      const generatedText = `更新 ${generated.toLocaleTimeString("zh-CN", { hour12: false })}`;
+
+      document.querySelectorAll("[data-metric-hours]").forEach(button => {
+        button.classList.toggle("active", Number(button.dataset.metricHours) === metricHours);
+      });
+      $("metric-generated").textContent = generatedText;
+      $("metric-window-label").textContent = metricWindowText(metricHours);
+      $("metric-request-count").textContent = formatCompactNumber(history.requests || 0);
+      $("metric-request-sub").textContent = `成功 ${success} · 错误 ${errors} · 停止 ${stopped} · 保留 ${history.retained_total || 0}`;
+      const successRate = $("metric-success-rate");
+      successRate.textContent = formatPercent(history.success_rate, outcomes > 0);
+      successRate.className = `metric-value ${outcomes && history.success_rate >= 0.95 ? "good" : outcomes && history.success_rate < 0.8 ? "bad" : ""}`.trim();
+      $("metric-success-meta").textContent = outcomes ? `${success} / ${outcomes} 个有效结果` : "暂无成功或错误结果";
+      $("metric-p95").textContent = formatElapsed(history.p95_elapsed_ms);
+      $("metric-latency-meta").textContent = `平均 ${formatElapsed(history.avg_elapsed_ms)} · P50 ${formatElapsed(history.p50_elapsed_ms)}`;
+      $("metric-tokens").textContent = formatCompactNumber(tokens.total_tokens || 0);
+      $("metric-token-meta").textContent = `P ${formatCompactNumber(tokens.prompt_tokens)} · C ${formatCompactNumber(tokens.completion_tokens)} · R ${formatCompactNumber(tokens.reasoning_tokens)}`;
+      $("metric-runtime").textContent = formatUptime(runtime.uptime_seconds);
+      $("metric-runtime-meta").textContent = `本次进程 ${runtime.requests_total || 0} 请求 · 当前并发 ${runtime.inflight || 0}`;
+      renderMetricTimeline($("metric-timeline"), history.timeline);
+
+      $("stats-generated").textContent = `${metricWindowText(metricHours)} · ${generatedText} · 只聚合状态、耗时与 Token`;
+      $("stats-kpi-requests").textContent = formatCompactNumber(history.requests || 0);
+      $("stats-kpi-requests-meta").textContent = `历史保留 ${history.retained_total || 0} 条 · 进行中 ${statuses.streaming || 0}`;
+      $("stats-kpi-success").textContent = formatPercent(history.success_rate, outcomes > 0);
+      $("stats-kpi-success-meta").textContent = `成功 ${success} / 错误 ${errors}`;
+      $("stats-kpi-errors").textContent = formatCompactNumber(errors + stopped);
+      $("stats-kpi-errors-meta").textContent = `错误 ${errors} · 主动停止 ${stopped}`;
+      $("stats-kpi-file-rate").textContent = formatPercent(history.file_delivery_rate, Number(history.requests) > 0);
+      $("stats-kpi-file-meta").textContent = `拆分 ${history.file_delivery_requests || 0} · 降级 ${history.fallback_requests || 0}`;
+      $("stats-timeline-meta").textContent = `${history.bucket_minutes || 0} 分钟 / 桶`;
+      renderMetricTimeline($("stats-timeline"), history.timeline);
+
+      const promptTokens = Number(tokens.prompt_tokens) || 0;
+      const completionTokens = Number(tokens.completion_tokens) || 0;
+      const reasoningTokens = Number(tokens.reasoning_tokens) || 0;
+      const tokenTotal = promptTokens + completionTokens + reasoningTokens;
+      $("stats-token-total").textContent = `总计 ${formatCompactNumber(tokenTotal)}`;
+      $("stats-token-prompt").textContent = formatCompactNumber(promptTokens);
+      $("stats-token-completion").textContent = formatCompactNumber(completionTokens);
+      $("stats-token-reasoning").textContent = formatCompactNumber(reasoningTokens);
+      const composition = $("stats-token-composition");
+      composition.replaceChildren();
+      [["prompt", promptTokens], ["completion", completionTokens], ["reasoning", reasoningTokens]].forEach(([name, value]) => {
+        if (!value || !tokenTotal) return;
+        const segment = document.createElement("span");
+        segment.className = `token-segment ${name}`;
+        segment.style.width = `${(value / tokenTotal) * 100}%`;
+        segment.title = `${name}: ${value.toLocaleString()}`;
+        composition.appendChild(segment);
+      });
+      $("stats-latency-avg").textContent = formatElapsed(history.avg_elapsed_ms);
+      $("stats-latency-percentiles").textContent = `${formatElapsed(history.p50_elapsed_ms)} / ${formatElapsed(history.p95_elapsed_ms)}`;
+      $("stats-fallbacks").textContent = `${history.fallback_requests || 0} 次`;
+      renderBreakdown(
+        $("stats-models"),
+        history.models,
+        "model",
+        item => `${item.count} · ${formatCompactNumber(item.tokens)} tk · ${formatElapsed(item.avg_elapsed_ms)}`
+      );
+      const surfaces = (history.surfaces || []).map(item => ({ ...item, display: surfaceLabel(item.surface) }));
+      renderBreakdown($("stats-surfaces"), surfaces, "display", item => `${item.count} 次`);
+
+      $("stats-uptime").textContent = `已运行 ${formatUptime(runtime.uptime_seconds)}`;
+      $("stats-runtime-requests").textContent = `${runtime.requests_total || 0} 次`;
+      $("stats-runtime-recent").textContent = `${runtime.requests_5m || 0} 请求 · ${runtime.errors_5m || 0} 个 5xx`;
+      $("stats-runtime-latency").textContent = `${formatElapsed(runtime.p50_duration_ms)} / ${formatElapsed(runtime.p95_duration_ms)}`;
+      $("stats-runtime-errors").textContent = `${runtime.status_4xx || 0} / ${runtime.status_5xx || 0}`;
+      $("stats-runtime-inflight").textContent = `${runtime.inflight || 0}（当前账号 ${runtime.active_profile_inflight || 0}）`;
+      renderStatsTable($("stats-paths"), runtime.top_paths, "path", "count");
+
+      const levels = logs.levels || {};
+      const kinds = logs.kinds || {};
+      $("stats-log-total").textContent = `内存环 ${logs.total || 0}/${logs.capacity || 0}`;
+      $("stats-log-info").textContent = levels.INFO || 0;
+      $("stats-log-warning").textContent = levels.WARNING || 0;
+      $("stats-log-error").textContent = (levels.ERROR || 0) + (levels.CRITICAL || 0);
+      $("stats-log-events").textContent = kinds.event || 0;
+      renderStatsTable($("stats-event-list"), logs.top_states, "state", "count");
+    }
+
+    async function refreshMetrics() {
+      try {
+        const response = await fetch(`/api/metrics?hours=${metricHours}`, { headers: apiHeaders() });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${response.status}`);
+        renderMetrics(data);
+        return true;
+      } catch (error) {
+        if (currentPage === "stats") $("stats-generated").textContent = `统计加载失败：${error.message}`;
+        return false;
+      }
+    }
+
+    function setMetricAuto(on) {
+      if (metricAutoTimer) {
+        clearInterval(metricAutoTimer);
+        metricAutoTimer = null;
+      }
+      if (on) metricAutoTimer = setInterval(() => {
+        if (!document.hidden && (currentPage === "dashboard" || currentPage === "stats")) refreshMetrics();
+      }, 10000);
+    }
+
+    document.querySelectorAll("[data-metric-hours]").forEach(button => {
+      button.addEventListener("click", () => {
+        metricHours = Number(button.dataset.metricHours) || 24;
+        document.querySelectorAll("[data-metric-hours]").forEach(item => item.classList.toggle("active", Number(item.dataset.metricHours) === metricHours));
+        refreshMetrics();
+      });
+    });
+    $("btn-stats-export").addEventListener("click", () => {
+      if (!metricLastData) {
+        window.showToast("统计数据尚未加载", "error");
+        return;
+      }
+      const exportedAt = new Date().toISOString();
+      const payload = { ...metricLastData, schema: "glm2api.metrics.v1", exported_at: exportedAt };
+      const stamp = exportedAt.replace(/[:.]/g, "-");
+      downloadTextFile(
+        `glm2api-metrics-${metricHours}h-${stamp}.json`,
+        JSON.stringify(payload, null, 2),
+        "application/json;charset=utf-8"
+      );
+      window.showToast("已导出脱敏聚合统计", "success");
+    });
+
     // ---- 运行日志查看器 ----
     const logViewer = $("log-viewer");
     const logMeta = $("log-meta");
     const logLevelSel = $("log-level");
+    const logKindSel = $("log-kind");
+    const logStateInput = $("log-state");
+    const logRidInput = $("log-rid");
     const logFilterInput = $("log-filter");
     let logAutoTimer = null;
+    let logFilterTimer = null;
     let logLastText = "";
+    let logLastSeq = 0;
+    let logVisibleEntries = [];
+    let logFetchController = null;
+    const LOG_VISIBLE_LIMIT = 500;
 
-    function renderLogs(lines) {
-      const nearBottom =
-        logViewer.scrollHeight - logViewer.scrollTop - logViewer.clientHeight < 60 || !logLastText;
-      logViewer.textContent = "";
-      const frag = document.createDocumentFragment();
-      lines.forEach(line => {
-        const span = document.createElement("span");
-        if (line.includes("[ERROR]")) span.className = "log-error";
-        else if (line.includes("[WARNING]")) span.className = "log-warning";
-        else if (line.includes("[DEBUG]")) span.className = "log-debug";
-        span.textContent = line + "\n";
-        frag.appendChild(span);
-      });
-      logViewer.appendChild(frag);
-      if (nearBottom) logViewer.scrollTop = logViewer.scrollHeight;
-      logLastText = lines.join("\n");
+    function formatLogClock(timestampMs) {
+      const date = new Date(Number(timestampMs) || 0);
+      if (isNaN(date.getTime())) return "--:--:--";
+      const pad = value => String(value).padStart(2, "0");
+      return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${String(date.getMilliseconds()).padStart(3, "0")}`;
     }
 
-    async function fetchLogs() {
+    function compactLogValue(value) {
+      if (typeof value === "string") return value;
+      try { return JSON.stringify(value); } catch (_) { return String(value); }
+    }
+
+    function displayLogMessage(entry) {
+      const message = String(entry.message || entry.line || "");
+      if (entry.kind === "event") {
+        try {
+          const payload = JSON.parse(message);
+          delete payload.state;
+          delete payload.rid;
+          const fields = Object.entries(payload).map(([key, value]) => `${key}=${compactLogValue(value)}`);
+          return fields.join("  ") || "事件已记录";
+        } catch (_) {}
+      }
+      const body = entry.kind === "access" ? message.replace(/^\[[0-9a-f]{8}\]\s*/i, "") : message;
+      const fullLine = String(entry.line || "");
+      const traceAt = fullLine.indexOf("\n");
+      return traceAt >= 0 ? `${body}${fullLine.slice(traceAt)}` : body;
+    }
+
+    function fallbackLogEntries(lines) {
+      return (lines || []).map((line, index) => ({
+        seq: index,
+        timestamp_ms: 0,
+        level: line.includes("[ERROR]") ? "ERROR" : line.includes("[WARNING]") ? "WARNING" : line.includes("[DEBUG]") ? "DEBUG" : "INFO",
+        thread: "",
+        kind: "system",
+        state: "",
+        rid: "",
+        message: line,
+        line
+      }));
+    }
+
+    function createLogRow(entry) {
+      const row = document.createElement("div");
+      row.className = `log-row level-${String(entry.level || "INFO").toLowerCase()}`;
+      row.title = String(entry.line || "");
+      const time = document.createElement("span");
+      time.className = "log-row-time";
+      time.textContent = formatLogClock(entry.timestamp_ms);
+      const level = document.createElement("span");
+      level.className = "log-level-chip";
+      level.textContent = String(entry.level || "INFO");
+      const thread = document.createElement("span");
+      thread.className = "log-row-thread";
+      thread.textContent = String(entry.thread || "—");
+      thread.title = thread.textContent;
+      const main = document.createElement("div");
+      main.className = "log-row-main";
+      const heading = document.createElement("div");
+      heading.className = "log-row-heading";
+      const kind = document.createElement("span");
+      kind.className = "log-kind";
+      kind.textContent = String(entry.kind || "system");
+      heading.appendChild(kind);
+      if (entry.state) {
+        const stateButton = document.createElement("button");
+        stateButton.type = "button";
+        stateButton.className = "log-state-btn";
+        stateButton.textContent = entry.state;
+        stateButton.title = "按此事件筛选";
+        stateButton.addEventListener("click", () => {
+          logStateInput.value = entry.state;
+          fetchLogs();
+        });
+        heading.appendChild(stateButton);
+      }
+      if (entry.rid) {
+        const ridButton = document.createElement("button");
+        ridButton.type = "button";
+        ridButton.className = "log-rid-btn";
+        ridButton.textContent = `#${entry.rid}`;
+        ridButton.title = "追踪此请求";
+        ridButton.addEventListener("click", () => {
+          logRidInput.value = entry.rid;
+          fetchLogs();
+        });
+        heading.appendChild(ridButton);
+      }
+      const message = document.createElement("div");
+      message.className = "log-row-message";
+      message.textContent = displayLogMessage(entry);
+      main.append(heading, message);
+      row.append(time, level, thread, main);
+      return row;
+    }
+
+    function renderLogs(entries, lines = [], append = false) {
+      const nearBottom =
+        logViewer.scrollHeight - logViewer.scrollTop - logViewer.clientHeight < 60 || !logLastText;
+      let rows = entries && entries.length ? entries : fallbackLogEntries(lines);
+      if (append) {
+        const known = new Set(logVisibleEntries.map(entry => Number(entry.seq) || 0));
+        rows = rows.filter(entry => !known.has(Number(entry.seq) || 0));
+        if (!rows.length) return;
+        logViewer.querySelector(".log-empty")?.remove();
+        logVisibleEntries = logVisibleEntries.concat(rows).slice(-LOG_VISIBLE_LIMIT);
+        const frag = document.createDocumentFragment();
+        rows.forEach(entry => frag.appendChild(createLogRow(entry)));
+        logViewer.appendChild(frag);
+        while (logViewer.childElementCount > logVisibleEntries.length) logViewer.firstElementChild?.remove();
+      } else {
+        logVisibleEntries = rows.slice(-LOG_VISIBLE_LIMIT);
+        logViewer.replaceChildren();
+        if (!logVisibleEntries.length) {
+          const empty = document.createElement("div");
+          empty.className = "log-empty";
+          empty.textContent = "没有符合当前筛选条件的日志。\n可清除事件名、RID 或关键字后重试。";
+          logViewer.appendChild(empty);
+        } else {
+          const frag = document.createDocumentFragment();
+          logVisibleEntries.forEach(entry => frag.appendChild(createLogRow(entry)));
+          logViewer.appendChild(frag);
+        }
+      }
+      if (nearBottom) logViewer.scrollTop = logViewer.scrollHeight;
+      logLastText = logVisibleEntries.map(entry => entry.line || entry.message || "").join("\n");
+    }
+
+    async function fetchLogs(options = {}) {
+      const incremental = Boolean(options.incremental && logLastSeq);
+      if (incremental && logFetchController) return;
+      if (!incremental && logFetchController) logFetchController.abort();
+      const controller = new AbortController();
+      logFetchController = controller;
       try {
         const params = new URLSearchParams({
           lines: "500",
+          format: "structured",
           level: logLevelSel.value || "",
+          kind: logKindSel.value || "",
+          state: logStateInput.value.trim() || "",
+          rid: logRidInput.value.trim() || "",
           text: logFilterInput.value.trim() || ""
         });
-        const resp = await fetch("/api/logs?" + params.toString(), { headers: apiHeaders() });
+        if (incremental) params.set("after_seq", String(logLastSeq));
+        const resp = await fetch("/api/logs?" + params.toString(), {
+          headers: apiHeaders(),
+          signal: controller.signal
+        });
         const data = await resp.json();
-        if (!data.ok) throw new Error((data.error && data.error.message) || "加载失败");
-        renderLogs(data.lines || []);
-        const kb = (data.file_bytes / 1024).toFixed(1);
-        logMeta.textContent = "内存 " + data.ring_count + "/" + data.ring_capacity + " 条 · 文件 " + kb + " KB · 级别 " + data.level;
+        if (!resp.ok || !data.ok) throw new Error((data.error && data.error.message) || "加载失败");
+        if (controller !== logFetchController) return;
+        const cursor = data.cursor || {};
+        const resetRequired = Boolean(cursor.reset_required);
+        renderLogs(data.entries || [], data.lines || [], incremental && !resetRequired);
+        logLastSeq = Number(cursor.last_seq) || 0;
+        const stats = data.stats || {};
+        const levels = stats.levels || {};
+        const kinds = stats.kinds || {};
+        $("log-stat-matched").textContent = stats.matched ?? (data.lines || []).length;
+        $("log-stat-warning").textContent = levels.WARNING || 0;
+        $("log-stat-error").textContent = (levels.ERROR || 0) + (levels.CRITICAL || 0);
+        $("log-stat-events").textContent = kinds.event || 0;
+        const stateOptions = $("log-state-options");
+        stateOptions.replaceChildren();
+        (stats.top_states || []).forEach(item => {
+          const option = document.createElement("option");
+          option.value = item.state;
+          option.label = `${item.count} 次`;
+          stateOptions.appendChild(option);
+        });
+        logMeta.textContent = `内存 ${stats.total ?? data.ring_count}/${stats.capacity ?? data.ring_capacity} · 显示 ${logVisibleEntries.length}/${stats.matched ?? 0} · 游标 ${logLastSeq || "—"} · 文件 ${formatBytes(data.file_bytes) || "0B"} · ${data.level}`;
+        $("btn-log-errors").classList.toggle("active", logLevelSel.value === "WARNING");
       } catch (e) {
-        logMeta.textContent = "加载失败: " + e.message;
+        if (e.name !== "AbortError" && controller === logFetchController) {
+          logMeta.textContent = "加载失败: " + e.message;
+        }
+      } finally {
+        if (controller === logFetchController) logFetchController = null;
       }
     }
 
@@ -3913,21 +4680,40 @@
         logAutoTimer = null;
       }
       if (on) logAutoTimer = setInterval(() => {
-        if (!document.hidden && currentPage === "logs") fetchLogs();
+        if (!document.hidden && currentPage === "logs") fetchLogs({ incremental: true });
       }, 2500);
       const btn = $("btn-log-autorefresh");
       btn.classList.toggle("active", !!on);
       btn.querySelector("span").textContent = on ? "自动:开" : "自动:关";
     }
 
-    $("btn-log-refresh").addEventListener("click", fetchLogs);
+    $("btn-log-refresh").addEventListener("click", () => fetchLogs());
     $("btn-log-autorefresh").addEventListener("click", () => setLogAuto(logAutoTimer === null));
+    $("btn-log-errors").addEventListener("click", () => {
+      logLevelSel.value = logLevelSel.value === "WARNING" ? "" : "WARNING";
+      fetchLogs();
+    });
+    $("btn-log-wrap").addEventListener("click", () => {
+      const wrapped = !logViewer.classList.contains("wrap");
+      logViewer.classList.toggle("wrap", wrapped);
+      $("btn-log-wrap").classList.toggle("active", wrapped);
+      $("btn-log-wrap").querySelector("span").textContent = wrapped ? "折行:开" : "折行:关";
+    });
     $("btn-log-copy").addEventListener("click", () => {
-      navigator.clipboard.writeText(logLastText).then(() => window.showToast("已复制当前日志", "success"));
+      navigator.clipboard.writeText(logLastText)
+        .then(() => window.showToast("已复制当前日志", "success"))
+        .catch(error => window.showToast(`复制失败: ${error.message}`, "error"));
     });
     logLevelSel.addEventListener("change", fetchLogs);
-    logFilterInput.addEventListener("keydown", e => {
-      if (e.key === "Enter") fetchLogs();
+    logKindSel.addEventListener("change", fetchLogs);
+    [logStateInput, logRidInput, logFilterInput].forEach(input => {
+      input.addEventListener("input", () => {
+        if (logFilterTimer) clearTimeout(logFilterTimer);
+        logFilterTimer = setTimeout(fetchLogs, 300);
+      });
+      input.addEventListener("keydown", event => {
+        if (event.key === "Enter") fetchLogs();
+      });
     });
 
     // ---- 概览页最近日志 mini 视图 ----
@@ -4578,6 +5364,9 @@
         fetchLogs();
       } else if (currentPage === "dashboard") {
         refreshDashboardLog();
+        refreshMetrics();
+      } else if (currentPage === "stats") {
+        refreshMetrics();
       }
     });
 
