@@ -2,6 +2,7 @@ import ast
 import io
 import json
 import logging
+import subprocess
 import sys
 import tempfile
 import threading
@@ -64,7 +65,9 @@ class ProtocolAdaptersTest(unittest.TestCase):
         # 测试钩子：后台自动删除改为内联执行，保证断言确定性；
         # 禁用验证码后台预解并清空验证码池，避免用例间互相污染。
         self._auto_delete_inline_prev = app._AUTO_DELETE_INLINE
+        self._auto_delete_max_pending_prev = app.AUTO_DELETE_MAX_PENDING
         app._AUTO_DELETE_INLINE = True
+        app._AUTO_DELETE_STOP.clear()
         self._captcha_prefetch_prev = app._CAPTCHA_PREFETCH_ENABLED
         app._CAPTCHA_PREFETCH_ENABLED = False
         app._CAPTCHA_POOL.clear()
@@ -90,7 +93,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 '</glm2api_tool_calls>","phase":"answer"}}'
             )
 
-        def fake_delete(_state, chat_id: str):
+        def fake_delete(_state, chat_id: str, **_kwargs):
             self.deleted_chats.append(chat_id)
             return True
 
@@ -103,6 +106,12 @@ class ProtocolAdaptersTest(unittest.TestCase):
         QuietProxyHandler.response_store = {}
         QuietProxyHandler.chat_inflight = {}
         self.settings_tmp = tempfile.TemporaryDirectory()
+        self._profile_store_path_prev = QuietProxyHandler.profile_store_path
+        self._profile_store_saved_at_prev = QuietProxyHandler.profile_store_saved_at
+        self._profile_store_error_prev = QuietProxyHandler.profile_store_error
+        QuietProxyHandler.profile_store_path = Path(self.settings_tmp.name) / "profiles.local.json"
+        QuietProxyHandler.profile_store_saved_at = ""
+        QuietProxyHandler.profile_store_error = ""
         QuietProxyHandler.settings_path = Path(self.settings_tmp.name) / "settings.local.json"
         QuietProxyHandler.settings = app.local_settings_defaults()
         QuietProxyHandler.settings_saved_at = ""
@@ -120,7 +129,27 @@ class ProtocolAdaptersTest(unittest.TestCase):
         app._HISTORY_CACHE = None
         app._HISTORY_DIRTY.clear()
         app._HISTORY_DELETED.clear()
+        self._history_store_error_prev = (app._HISTORY_STORE_ERROR, app._HISTORY_STORE_ERROR_AT)
+        app._HISTORY_STORE_ERROR = ""
+        app._HISTORY_STORE_ERROR_AT = ""
         self._history_conf_prev = dict(app._HISTORY_CONF)
+        self._history_max_detail_bytes_prev = app.HISTORY_MAX_DETAIL_BYTES
+        self._pending_delete_path_prev = app.PENDING_DELETE_STORE_PATH
+        self._pending_delete_cache_prev = app._PENDING_DELETE_CACHE
+        self._pending_delete_error_prev = app._PENDING_DELETE_STORE_ERROR
+        self._pending_delete_replay_prev = (
+            app._PENDING_DELETE_REPLAY_SCHEDULED,
+            app._PENDING_DELETE_REPLAY_UNMATCHED,
+            app._PENDING_DELETE_REPLAY_DEFERRED,
+            app._PENDING_DELETE_REPLAY_THREAD,
+        )
+        app.PENDING_DELETE_STORE_PATH = Path(self.settings_tmp.name) / "pending_deletes.local.json"
+        app._PENDING_DELETE_CACHE = None
+        app._PENDING_DELETE_STORE_ERROR = ""
+        app._PENDING_DELETE_REPLAY_SCHEDULED = 0
+        app._PENDING_DELETE_REPLAY_UNMATCHED = 0
+        app._PENDING_DELETE_REPLAY_DEFERRED = 0
+        app._PENDING_DELETE_REPLAY_THREAD = None
         self.server = app.LocalProxyServer(("127.0.0.1", 0), QuietProxyHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -134,6 +163,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         app.stream_zai_completion = self.original_stream
         app.delete_zai_chat = self.original_delete
         app._AUTO_DELETE_INLINE = self._auto_delete_inline_prev
+        app.AUTO_DELETE_MAX_PENDING = self._auto_delete_max_pending_prev
         app._CAPTCHA_PREFETCH_ENABLED = self._captcha_prefetch_prev
         app._CAPTCHA_POOL.clear()
         app.HISTORY_STORE_PATH = self._history_path_prev
@@ -141,8 +171,23 @@ class ProtocolAdaptersTest(unittest.TestCase):
         app._HISTORY_CACHE = None
         app._HISTORY_DIRTY.clear()
         app._HISTORY_DELETED.clear()
+        app._HISTORY_STORE_ERROR, app._HISTORY_STORE_ERROR_AT = self._history_store_error_prev
         app._HISTORY_CONF.clear()
         app._HISTORY_CONF.update(self._history_conf_prev)
+        app.HISTORY_MAX_DETAIL_BYTES = self._history_max_detail_bytes_prev
+        app.PENDING_DELETE_STORE_PATH = self._pending_delete_path_prev
+        app._PENDING_DELETE_CACHE = self._pending_delete_cache_prev
+        app._PENDING_DELETE_STORE_ERROR = self._pending_delete_error_prev
+        (
+            app._PENDING_DELETE_REPLAY_SCHEDULED,
+            app._PENDING_DELETE_REPLAY_UNMATCHED,
+            app._PENDING_DELETE_REPLAY_DEFERRED,
+            app._PENDING_DELETE_REPLAY_THREAD,
+        ) = self._pending_delete_replay_prev
+        app._AUTO_DELETE_STOP.clear()
+        QuietProxyHandler.profile_store_path = self._profile_store_path_prev
+        QuietProxyHandler.profile_store_saved_at = self._profile_store_saved_at_prev
+        QuietProxyHandler.profile_store_error = self._profile_store_error_prev
         self.settings_tmp.cleanup()
 
     def request(self, method: str, path: str, body: dict | bytes | None = None, headers: dict | None = None) -> tuple[int, str]:
@@ -164,6 +209,24 @@ class ProtocolAdaptersTest(unittest.TestCase):
             status = exc.code
             exc.close()
             return status, raw
+
+    def raw_http_request(self, request_bytes: bytes) -> tuple[int, bytes]:
+        sock = app.socket.create_connection(("127.0.0.1", self.server.server_port), timeout=3)
+        try:
+            sock.sendall(request_bytes)
+            sock.settimeout(3)
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+        finally:
+            sock.close()
+        header, body = raw.split(b"\r\n\r\n", 1)
+        status = int(header.split(b"\r\n", 1)[0].split(b" ", 2)[1])
+        return status, body
 
     def test_tool_parser_accepts_adapter_and_dsml_but_ignores_code_fences(self) -> None:
         tools = [{"name": "read_file", "description": "", "parameters": {"type": "object"}}]
@@ -207,6 +270,69 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual('{"line":1}', typed_calls[0].arguments["content"])
         self.assertIs(True, typed_calls[0].arguments["overwrite"])
 
+    def test_tool_parser_accepts_observed_claude_code_fallback_formats(self) -> None:
+        tools = [
+            {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string"},
+                        "description": {"type": "string"},
+                    },
+                },
+            }
+        ]
+        policy = app.ToolChoice()
+        observed = (
+            "先确认文件规模："
+            "<tool_call>Bash<arg_key>command</arg_key>"
+            "<arg_value>cd &quot;E:/project&quot; &amp;&amp; wc -l src/*.js</arg_value>"
+            # 真实历史里第二个参数漏了 opening <arg_key>，仍保留 closing tag。
+            "description</arg_key><arg_value>统计源文件行数</arg_value></tool_call>"
+        )
+        calls = app.parse_tool_calls_from_output(observed, tools, policy)
+        self.assertEqual(1, len(calls))
+        self.assertEqual("Bash", calls[0].name)
+        self.assertEqual('cd "E:/project" && wc -l src/*.js', calls[0].arguments["command"])
+        self.assertEqual("统计源文件行数", calls[0].arguments["description"])
+        self.assertEqual("先确认文件规模：", app.strip_parsed_tool_markup(observed))
+
+        native = 'Tool: Bash\n<tool_input>{"command":"pwd","description":"查看目录"}</tool_input>'
+        calling = '**Calling:** Bash\n{"command":"pwd","description":"查看目录"}'
+        function_call = (
+            '<function_call>{"name":"Bash","arguments":{"command":"pwd",'
+            '"description":"查看目录"}}</function_call>'
+        )
+        for raw in (native, calling, function_call):
+            parsed = app.parse_tool_calls_from_output(raw, tools, policy)
+            self.assertEqual(1, len(parsed), raw)
+            self.assertEqual("pwd", parsed[0].arguments["command"])
+            self.assertEqual("", app.strip_parsed_tool_markup(raw), raw)
+
+    def test_claude_fallback_examples_inside_robust_fences_are_not_executed_or_stripped(self) -> None:
+        tools = [{"name": "Bash", "parameters": {"type": "object"}}]
+        examples = [
+            "~~~xml\n<tool_call>Bash<arg_key>command</arg_key><arg_value>pwd `x`</arg_value></tool_call>\n~~~",
+            "````text\nTool: Bash\n<tool_input>{\"command\":\"pwd\"}</tool_input>\n````",
+            "```xml\n<function_call>{\"name\":\"Bash\",\"arguments\":{}}</function_call>",
+        ]
+        for raw in examples:
+            self.assertEqual([], app.parse_tool_calls_from_output(raw, tools, app.ToolChoice()), raw)
+            self.assertEqual(raw, app.strip_parsed_tool_markup(raw), raw)
+
+    def test_dsml_separator_and_local_name_drift_is_normalized(self) -> None:
+        tools = [{"name": "Bash", "parameters": {"type": "object"}}]
+        markup = (
+            '<！DSML！ToolCalls><DSMLinvoke name="Bash">'
+            '<、DSML、parameter name="command">pwd</、DSML、parameter>'
+            '〈/DSMLinvoke〉</！DSML！ToolCalls>'
+        )
+        calls = app.parse_tool_calls_from_output(markup, tools, app.ToolChoice())
+        self.assertEqual(1, len(calls))
+        self.assertEqual({"command": "pwd"}, calls[0].arguments)
+        self.assertEqual("", app.strip_parsed_tool_markup(markup))
+
     def test_strip_parsed_tool_markup_preserves_code_fences(self) -> None:
         fenced = '示例：\n```xml\n<tool_calls><invoke name="demo"></invoke></tool_calls>\n```\n保留。'
         cleaned = app.strip_parsed_tool_markup(fenced)
@@ -231,6 +357,100 @@ class ProtocolAdaptersTest(unittest.TestCase):
         with self.assertRaises(app.ToolCallFormatError):
             app.finalize_protocol_turn(request, malformed, "")
         self.assertEqual("前置后置", app.strip_parsed_tool_markup(malformed))
+
+    def test_tool_output_strict_mode_rejects_partial_or_invalid_batches(self) -> None:
+        tools = app.normalize_tool_definitions(
+            [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"path": {"type": "string"}},
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+            "openai_chat",
+        )
+        mixed = (
+            '<glm2api_tool_calls>{"tool_calls":['
+            '{"name":"read_file","arguments":{"path":"README.md"}},'
+            '{"name":"undeclared_tool","arguments":{}}]}'
+            '</glm2api_tool_calls>'
+        )
+        with self.assertRaisesRegex(app.ToolCallFormatError, "未声明"):
+            app.parse_tool_calls_from_output(mixed, tools, app.ToolChoice())
+
+        malformed_arguments = (
+            '<glm2api_tool_calls>{"tool_calls":['
+            '{"name":"read_file","arguments":"{path:"}]}'
+            '</glm2api_tool_calls>'
+        )
+        with self.assertRaisesRegex(app.ToolCallFormatError, "arguments 不是"):
+            app.parse_tool_calls_from_output(malformed_arguments, tools, app.ToolChoice())
+
+        missing_required = (
+            '<glm2api_tool_calls>{"tool_calls":['
+            '{"name":"read_file","arguments":{}}]}'
+            '</glm2api_tool_calls>'
+        )
+        with self.assertRaisesRegex(app.ToolCallFormatError, "缺少必填字段: path"):
+            app.parse_tool_calls_from_output(missing_required, tools, app.ToolChoice())
+
+    def test_tool_output_limits_calls_arguments_and_definitions(self) -> None:
+        tools = [{"name": "echo", "parameters": {"type": "object", "properties": {}}}]
+        previous_calls = app.MAX_TOOL_CALLS_PER_TURN
+        previous_arguments = app.MAX_TOOL_ARGUMENTS_BYTES
+        try:
+            app.MAX_TOOL_CALLS_PER_TURN = 1
+            with self.assertRaisesRegex(app.ToolCallFormatError, "超过 1 个"):
+                app.normalize_tool_call_candidates(
+                    [
+                        {"name": "echo", "arguments": {}},
+                        {"name": "echo", "arguments": {}},
+                    ],
+                    tools,
+                    app.ToolChoice(),
+                    strict=True,
+                )
+            app.MAX_TOOL_ARGUMENTS_BYTES = 16
+            with self.assertRaisesRegex(app.ToolCallFormatError, "arguments 超过"):
+                app.normalize_tool_call_candidates(
+                    [{"name": "echo", "arguments": {"value": "x" * 64}}],
+                    tools,
+                    app.ToolChoice(),
+                    strict=True,
+                )
+        finally:
+            app.MAX_TOOL_CALLS_PER_TURN = previous_calls
+            app.MAX_TOOL_ARGUMENTS_BYTES = previous_arguments
+
+        too_many = [
+            {
+                "type": "function",
+                "function": {"name": f"tool_{index}", "parameters": {"type": "object"}},
+            }
+            for index in range(app.MAX_TOOL_DEFINITIONS + 1)
+        ]
+        with self.assertRaisesRegex(ValueError, "definition limit"):
+            app.normalize_tool_definitions(too_many, "openai_chat")
+
+    def test_tool_parser_merges_multiple_json_wrappers_in_output_order(self) -> None:
+        tools = [{"name": "echo", "parameters": {"type": "object"}}]
+        output = (
+            '准备两项。<glm2api_tool_calls>{"tool_calls":['
+            '{"name":"echo","arguments":{"value":"first"}}]}'
+            '</glm2api_tool_calls>继续<glm2api_tool_calls>{"tool_calls":['
+            '{"name":"echo","arguments":{"value":"second"}}]}'
+            '</glm2api_tool_calls>'
+        )
+        calls = app.parse_tool_calls_from_output(output, tools, app.ToolChoice())
+        self.assertEqual(["first", "second"], [call.arguments["value"] for call in calls])
+        self.assertEqual(2, len({call.id for call in calls}))
+        self.assertEqual("准备两项。继续", app.strip_parsed_tool_markup(output))
 
     def test_tool_parser_repairs_common_model_format_slips(self) -> None:
         tools = [
@@ -362,11 +582,109 @@ class ProtocolAdaptersTest(unittest.TestCase):
             {"model": "glm-5.2", "messages": [{"role": "user", "content": "天气？"}], "tools": tools},
             False,
         )
+        # Auto mode follows the model's visible final-channel decision. Hidden
+        # thinking markup is never promoted into an executable client call.
         auto_turn = app.finalize_protocol_turn(auto, "我来查一下。", markup)
-        # Auto mode stays conservative: prose plus a thinking example must not
-        # turn into a real call.
         self.assertEqual([], auto_turn.tool_calls)
+        self.assertEqual("我来查一下。", auto_turn.text)
         self.assertEqual("", auto_turn.thinking)
+
+    def test_auto_keeps_tool_free_decision_with_fenced_thinking_call(self) -> None:
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "Read",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"file_path": {"type": "string"}},
+                    },
+                },
+            }
+        ]
+        request = app.normalize_openai_chat_request(
+            {"model": "glm-5.3", "messages": [{"role": "user", "content": "继续审查项目"}], "tools": tools},
+            True,
+        )
+        thinking = (
+            "The task is unfinished, so I will read the core file now.\n\n"
+            "```xml\n"
+            '<|DSML|tool_calls><|DSML|invoke name="Read">'
+            '<|DSML|parameter name="file_path"><![CDATA[C:\\workspace\\src\\server.js]]>'
+            '</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>\n'
+            "```\n\nThe final channel should contain that call."
+        )
+
+        turn = app.finalize_protocol_turn(request, "接下来读取核心文件。", thinking)
+        self.assertEqual([], turn.tool_calls)
+        self.assertEqual("接下来读取核心文件。", turn.text)
+
+        retry_request = app.protocol_request_with_tool_retry_hint(request, "malformed wrapper")
+        self.assertEqual("auto", retry_request.tool_choice.mode)
+        self.assertTrue(retry_request.tool_retry_active)
+        turn = app.finalize_protocol_turn(retry_request, "接下来读取核心文件。", thinking)
+        self.assertEqual([], turn.tool_calls)
+        self.assertEqual("接下来读取核心文件。", turn.text)
+
+    def test_auto_retry_does_not_execute_instruction_examples_from_thinking(self) -> None:
+        tools = [{"name": "Bash", "description": "Run command", "parameters": {"type": "object"}}]
+        request = app.ProtocolRequest(
+            surface="anthropic_messages",
+            response_model="glm-5.3",
+            options=app.ChatOptions(),
+            stream=False,
+            messages=[],
+            context_text="",
+            execution_prompt="",
+            files=[],
+            tools=tools,
+            tool_choice=app.ToolChoice(),
+            context_as_file=False,
+            tool_retry_active=True,
+        )
+        thinking = "I am checking the instruction examples:\n\n" + app.build_tool_instruction(tools, request.tool_choice)
+        turn = app.finalize_protocol_turn(request, "任务已经完整完成。", thinking)
+        self.assertEqual([], turn.tool_calls)
+
+    def test_auto_keeps_tool_free_decision_with_claude_style_hidden_call(self) -> None:
+        tools = [
+            {
+                "name": "Bash",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                },
+            }
+        ]
+        request = app.ProtocolRequest(
+            surface="anthropic_messages",
+            response_model="glm-5.3",
+            options=app.ChatOptions(),
+            stream=False,
+            messages=[],
+            context_text="",
+            execution_prompt="",
+            files=[],
+            tools=tools,
+            tool_choice=app.ToolChoice(),
+            context_as_file=False,
+        )
+        thinking = (
+            "The task is unfinished.\n"
+            "<tool_call>Bash<arg_key>command</arg_key><arg_value>pwd</arg_value></tool_call>"
+        )
+        turn = app.finalize_protocol_turn(request, "接下来检查目录。", thinking)
+        self.assertEqual([], turn.tool_calls)
+        self.assertNotIn("<tool_call>", turn.thinking)
+
+        retry_request = app.protocol_request_with_tool_retry_hint(request, "hidden Claude-style call")
+        turn = app.finalize_protocol_turn(retry_request, "接下来检查目录。", thinking)
+        self.assertEqual([], turn.tool_calls)
+        self.assertNotIn("<tool_call>", turn.thinking)
+
+        malformed = "<tool_call>Bash<arg_key>command</arg_key><arg_value>pwd</tool_call>"
+        malformed_turn = app.finalize_protocol_turn(request, "接下来检查目录。", malformed)
+        self.assertEqual([], malformed_turn.tool_calls)
 
     def test_trailing_pipe_dsml_parses_and_strips(self) -> None:
         tools = [{"name": "get_weather", "description": "", "parameters": {"type": "object"}}]
@@ -522,7 +840,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         original_http_json = app.http_json
         delete_calls: list[tuple[str, str]] = []
 
-        def fake_http_json(method, url, headers, payload=None):
+        def fake_http_json(method, url, headers, payload=None, **_kwargs):
             if method == "DELETE":
                 delete_calls.append((method, url))
                 return {"deleted": True}
@@ -535,14 +853,83 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 "/api/files/cleanup",
                 {"files": [{"id": "file_1"}, "file_2", 123, ""]},
             )
-            self.assertEqual(200, status)
+            self.assertEqual(202, status)
             data = json.loads(body)
             self.assertEqual(2, data["count"])
-            self.assertEqual(["file_1", "file_2"], data["removed"])
+            self.assertEqual(["file_1", "file_2"], data["accepted"])
+            self.assertEqual(2, data["accepted_count"])
+            self.assertEqual(2, data["invalid_count"])
+            self.assertEqual(0, data["journal_capacity_dropped"])
+            self.assertTrue(data["scheduled"])
+            self.assertTrue(data["cleanup_pending"])
+            self.assertTrue(data["journal_persisted"])
+            self.assertEqual([], data["removed"])
             self.assertEqual(2, len(delete_calls))
             self.assertTrue(all(url.endswith("/api/v1/files/file_1") or url.endswith("/api/v1/files/file_2") for _, url in delete_calls))
+            self.assertEqual(0, app.pending_chat_delete_status()["journal_file_pending"])
         finally:
             app.http_json = original_http_json
+
+    def test_file_cleanup_endpoint_journals_failed_deletes_and_classifies_errors(self) -> None:
+        original_delete = app.delete_zai_file
+        original_cleanup = app._best_effort_delete_upstream_files
+        original_pending_add = app.pending_resource_deletes_add
+
+        def failing_delete(*_args, **_kwargs):
+            raise app.UpstreamRequestError("temporary upstream delete failure")
+
+        app.delete_zai_file = failing_delete
+        try:
+            status, raw = self.request("POST", "/api/files/cleanup", {"files": ["file_retry_1"]})
+            self.assertEqual(202, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertTrue(payload["scheduled"])
+            self.assertTrue(payload["cleanup_pending"])
+            self.assertEqual(1, app.pending_chat_delete_status()["journal_file_pending"])
+            journal = json.loads(app.PENDING_DELETE_STORE_PATH.read_text(encoding="utf-8"))
+            self.assertEqual("file_retry_1", journal["items"][0]["resource_id"])
+            self.assertEqual(1, journal["items"][0]["attempts"])
+
+            missing_status, missing_raw = self.request(
+                "POST",
+                "/api/files/cleanup",
+                {"files": ["file_retry_2"], "profile_id": "profile_missing"},
+            )
+            self.assertEqual(404, missing_status, missing_raw[:500])
+            self.assertEqual("profile_not_found", json.loads(missing_raw)["error"]["code"])
+
+            leaked_path = "C:" + "\\Users\\cleanup-user\\queue.tmp"
+
+            def failing_enqueue(*_args, **_kwargs):
+                raise RuntimeError(f"queue failed at '{leaked_path}'")
+
+            app._best_effort_delete_upstream_files = failing_enqueue
+            internal_status, internal_raw = self.request(
+                "POST",
+                "/api/files/cleanup",
+                {"files": ["file_retry_3"]},
+            )
+            self.assertEqual(500, internal_status, internal_raw[:500])
+            self.assertEqual("file_cleanup_enqueue_failed", json.loads(internal_raw)["error"]["code"])
+            self.assertNotIn("cleanup-user", internal_raw)
+
+            app._best_effort_delete_upstream_files = original_cleanup
+            app.pending_resource_deletes_add = lambda *_args, **_kwargs: []
+            capacity_status, capacity_raw = self.request(
+                "POST",
+                "/api/files/cleanup",
+                {"files": ["file_capacity_drop"]},
+            )
+            self.assertEqual(200, capacity_status, capacity_raw[:500])
+            capacity_payload = json.loads(capacity_raw)
+            self.assertEqual(0, capacity_payload["accepted_count"])
+            self.assertEqual(1, capacity_payload["journal_capacity_dropped"])
+            self.assertFalse(capacity_payload["scheduled"])
+            self.assertFalse(capacity_payload["cleanup_pending"])
+        finally:
+            app.delete_zai_file = original_delete
+            app._best_effort_delete_upstream_files = original_cleanup
+            app.pending_resource_deletes_add = original_pending_add
 
     def test_delete_zai_file_404_405_semantics(self) -> None:
         original_http_json = app.http_json
@@ -551,7 +938,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         try:
             seen: list[int] = []
 
-            def fake_http_json(method, url, headers, payload=None):
+            def fake_http_json(method, url, headers, payload=None, **_kwargs):
                 seen.append(404)
                 error = HTTPError(url, 404, "Not Found", None, io.BytesIO(b"gone"))
                 errors.append(error)
@@ -561,7 +948,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             self.assertTrue(app.delete_zai_file(state, "file_1"))
             self.assertTrue(errors[-1].closed)
 
-            def fake_405(method, url, headers, payload=None):
+            def fake_405(method, url, headers, payload=None, **_kwargs):
                 seen.append(405)
                 error = HTTPError(url, 405, "Method Not Allowed", None, io.BytesIO(b"unsupported"))
                 errors.append(error)
@@ -582,7 +969,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         state = fake_state()
         deleted: list[str] = []
 
-        def fake_delete(_state, file_id):
+        def fake_delete(_state, file_id, **_kwargs):
             deleted.append(file_id)
             return True
 
@@ -600,6 +987,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 ],
             )
             self.assertEqual(["f1", "f2"], deleted)
+            self.assertEqual(0, app.pending_chat_delete_status()["journal_file_pending"])
         finally:
             app.delete_zai_file = original_delete
 
@@ -652,6 +1040,105 @@ class ProtocolAdaptersTest(unittest.TestCase):
             ],
             list(app.ADVERTISED_MODELS),
         )
+
+    def test_disable_parallel_tool_calls_rejects_multi_call_output_on_all_surfaces(self) -> None:
+        openai_tools = [
+            {"type": "function", "function": {"name": "echo", "parameters": {"type": "object"}}}
+        ]
+        anthropic_tools = [
+            {"name": "echo", "input_schema": {"type": "object"}}
+        ]
+        requests = [
+            app.normalize_openai_chat_request(
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "echo"}],
+                    "tools": openai_tools,
+                    "parallel_tool_calls": False,
+                },
+                False,
+            ),
+            app.normalize_openai_responses_request(
+                {
+                    "model": "glm-5.2",
+                    "input": "echo",
+                    "tools": [{"type": "function", "name": "echo", "parameters": {"type": "object"}}],
+                    "parallel_tool_calls": False,
+                },
+                False,
+            ),
+            app.normalize_anthropic_messages_request(
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "echo"}],
+                    "tools": anthropic_tools,
+                    "tool_choice": {"type": "auto", "disable_parallel_tool_use": True},
+                },
+                False,
+            ),
+        ]
+        output = (
+            '<glm2api_tool_calls>{"tool_calls":['
+            '{"name":"echo","arguments":{"value":1}},'
+            '{"name":"echo","arguments":{"value":2}}]}'
+            '</glm2api_tool_calls>'
+        )
+        for request in requests:
+            self.assertTrue(request.tool_choice.disable_parallel, request.surface)
+            with self.assertRaisesRegex(app.ToolCallFormatError, "禁用并行"):
+                app.finalize_protocol_turn(request, output, "")
+
+        parallel = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.2",
+                "messages": [{"role": "user", "content": "echo"}],
+                "tools": openai_tools,
+                "parallel_tool_calls": True,
+            },
+            False,
+        )
+        self.assertEqual(2, len(app.finalize_protocol_turn(parallel, output, "").tool_calls))
+
+    def test_legacy_openai_function_result_links_to_prior_function_call(self) -> None:
+        messages = app.normalize_openai_messages_for_protocol(
+            [
+                {"role": "user", "content": "查询天气"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "function_call": {
+                        "name": "get_weather",
+                        "arguments": '{"city":"北京"}',
+                    },
+                },
+                {"role": "function", "name": "get_weather", "content": "晴 25 度"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_modern_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city":"上海"}'},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_modern_1",
+                    "name": "get_weather",
+                    "content": "多云 23 度",
+                },
+            ]
+        )
+        legacy_call_id = messages[1]["tool_calls"][0]["id"]
+        self.assertTrue(legacy_call_id.startswith("call_history_"))
+        self.assertEqual("tool", messages[2]["role"])
+        self.assertEqual(legacy_call_id, messages[2]["tool_call_id"])
+        self.assertEqual("call_modern_1", messages[4]["tool_call_id"])
+        transcript = app.build_history_transcript(messages)
+        self.assertIn(f"invocation_id={legacy_call_id}", transcript)
+        self.assertIn("晴 25 度", transcript)
 
     def test_allowed_tools_filters_prompt_and_parser(self) -> None:
         body = {
@@ -792,6 +1279,88 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("[tool]", self.uploads[0][1])
         self.assertNotIn(app.TOOLS_TRANSCRIPT_INTRO, self.uploads[0][1])
 
+    def test_glm53_splits_generated_history_and_tools_below_readable_boundary(self) -> None:
+        latest_request = "LATEST_USER_REQUEST_MUST_SURVIVE"
+        request = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.3-forcehistory",
+                "messages": [
+                    {"role": "system", "content": "system rules"},
+                    {"role": "user", "content": "old context\n" + ("历史填充。" * 18000)},
+                    {"role": "assistant", "content": "previous answer"},
+                    {"role": "user", "content": latest_request},
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "large_schema_tool",
+                            "description": "D" * 60000,
+                            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+                        },
+                    }
+                ],
+            },
+            False,
+        )
+        self.uploads = []
+        trace: dict[str, object] = {}
+
+        prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
+
+        self.assertIn("split across multiple attachments", prompt)
+        self.assertGreater(len(files), 2)
+        self.assertEqual(len(files), len(self.uploads))
+        self.assertTrue(
+            all(len(content.encode("utf-8")) <= app.GLM53_CONTEXT_FILE_PART_BYTES for _name, content in self.uploads)
+        )
+        context_files = trace["context_files"]
+        history_parts = [item for item in context_files if item["kind"] == "history"]
+        tools_parts = [item for item in context_files if item["kind"] == "tools"]
+        self.assertGreater(len(history_parts), 1)
+        self.assertGreater(len(tools_parts), 1)
+        self.assertEqual(list(range(1, len(history_parts) + 1)), [item["part"] for item in history_parts])
+        self.assertTrue(all(item["parts"] == len(history_parts) for item in history_parts))
+        self.assertIn(latest_request, history_parts[-1]["content"])
+        self.assertIn(
+            f"conversation history segment {len(history_parts)}/{len(history_parts)}",
+            history_parts[-1]["content"],
+        )
+        self.assertIn("function definitions segment 1/", tools_parts[0]["content"])
+        persisted = app.history_context_files_snapshot(context_files)
+        self.assertEqual(
+            [(item["kind"], item["part"], item["parts"]) for item in context_files],
+            [(item["kind"], item["part"], item["parts"]) for item in persisted],
+        )
+
+    def test_glm52_keeps_large_generated_context_as_single_files(self) -> None:
+        request = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.2-forcehistory",
+                "messages": [{"role": "user", "content": "H" * 70000}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "large_schema_tool",
+                            "description": "D" * 60000,
+                            "parameters": {"type": "object"},
+                        },
+                    }
+                ],
+            },
+            False,
+        )
+        self.uploads = []
+        trace: dict[str, object] = {}
+
+        _prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
+
+        self.assertEqual(2, len(files))
+        self.assertEqual(["history", "tools"], [item["kind"] for item in trace["context_files"]])
+        self.assertEqual([1, 1], [item["parts"] for item in trace["context_files"]])
+        self.assertTrue(all("[glm2api " not in content for _name, content in self.uploads))
+
     def test_output_integrity_guard_scope(self) -> None:
         # 无工具且无 tool 历史：不加守卫（避免多余指纹）；有工具：守卫前置且不重复
         plain = app.normalize_openai_chat_request(
@@ -833,6 +1402,13 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertTrue(any(entry["rid"] == "abc12345" for entry in data["entries"]))
         self.assertGreaterEqual(data["stats"]["kinds"]["event"], 1)
         self.assertTrue(data["ring_capacity"] >= data["ring_count"])
+        self.assertEqual(data["file_bytes"], data["store"]["active_bytes"])
+        self.assertGreaterEqual(data["store"]["total_bytes"], data["store"]["active_bytes"])
+        self.assertEqual(app.LOG_BACKUP_COUNT + 1, data["store"]["max_segments"])
+        self.assertEqual(
+            app.LOG_MAX_BYTES * (app.LOG_BACKUP_COUNT + 1),
+            data["store"]["max_total_bytes"],
+        )
         status, raw = self.request("GET", "/api/logs?lines=50&level=ERROR")
         data = json.loads(raw)
         self.assertTrue(all("[ERROR]" in line for line in data["lines"]))
@@ -883,6 +1459,51 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual([3, 4], [entry["seq"] for entry in entries])
         self.assertTrue(cursor["reset_required"])
 
+    def test_log_ring_caps_individual_records_and_preserves_event_metadata(self) -> None:
+        ring = app.RingBufferHandler(capacity=2)
+        ring.setFormatter(app.RedactingFormatter("%(levelname)s %(message)s"))
+        provider_key = "ghp_" + ("z" * 32)
+        record = logging.LogRecord(
+            "test",
+            logging.WARNING,
+            __file__,
+            1,
+            f"token={provider_key} " + ("长" * (app.LOG_RECORD_MAX_CHARS * 2)),
+            (),
+            None,
+        )
+        record.glm2api_event_state = "oversize_probe"
+        record.glm2api_event_rid = "abc12345"
+
+        ring.emit(record)
+
+        entries, matched, _cursor = ring.query(limit=2, state="oversize_probe")
+        self.assertEqual(1, matched)
+        self.assertEqual("event", entries[0]["kind"])
+        self.assertEqual("abc12345", entries[0]["rid"])
+        self.assertLessEqual(len(entries[0]["message"]), app.LOG_RECORD_MAX_CHARS)
+        self.assertLessEqual(len(entries[0]["line"]), app.LOG_RECORD_MAX_CHARS)
+        self.assertTrue(entries[0]["line"].endswith(app.LOG_TRUNCATION_SUFFIX))
+        self.assertNotIn(provider_key, entries[0]["message"])
+        self.assertEqual(1, ring.stats()["truncated_total"])
+        self.assertEqual(app.LOG_RECORD_MAX_CHARS, ring.stats()["max_record_chars"])
+
+    def test_runtime_metrics_bounds_path_cardinality_and_length(self) -> None:
+        metrics = app.RuntimeMetrics()
+        long_path = "/long/" + ("x" * (app.MAX_RUNTIME_METRIC_PATH_CHARS * 3))
+        for _ in range(20):
+            metrics.record_http("GET", long_path, 404, 1)
+        for index in range(app.MAX_RUNTIME_METRIC_PATHS + 50):
+            metrics.record_http("GET", f"/random-probe/{index}", 404, 1)
+
+        snapshot = metrics.snapshot()
+        self.assertLessEqual(snapshot["tracked_paths"], app.MAX_RUNTIME_METRIC_PATHS)
+        self.assertEqual(app.MAX_RUNTIME_METRIC_PATHS, snapshot["max_paths"])
+        self.assertGreater(snapshot["path_overflow_total"], 0)
+        self.assertTrue(all(len(item["path"]) <= app.MAX_RUNTIME_METRIC_PATH_CHARS for item in snapshot["top_paths"]))
+        overflow = next(item for item in snapshot["top_paths"] if item["path"] == app.RUNTIME_METRIC_OTHER_PATH)
+        self.assertEqual(snapshot["path_overflow_total"], overflow["count"])
+
     def test_api_metrics_aggregates_history_without_content(self) -> None:
         now_ms = int(time.time() * 1000)
         app._HISTORY_CACHE = [
@@ -898,6 +1519,11 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 "delivery_mode": "file",
                 "context_file_fallback": "",
                 "usage": {"prompt_tokens": 10, "completion_tokens": 20, "reasoning_tokens": 5, "total_tokens": 35},
+                "finish_reason": "tool_calls",
+                "tool_calls_count": 2,
+                "tool_call_names": ["secret_tool_name"],
+                "tool_calls_source": "thinking_retry",
+                "tool_retry_count": 1,
                 "final_prompt": "secret-prompt-must-not-leak",
                 "content": "secret-answer-must-not-leak",
             },
@@ -913,6 +1539,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 "delivery_mode": "inline",
                 "context_file_fallback": "upload_failed",
                 "usage": {},
+                "tool_retry_count": 1,
                 "error": "secret-upstream-error-must-not-leak",
             },
         ]
@@ -925,11 +1552,24 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual(35, metrics["tokens"]["total_tokens"])
         self.assertEqual(1, metrics["file_delivery_requests"])
         self.assertEqual(1, metrics["fallback_requests"])
+        self.assertEqual(
+            {
+                "turns": 1,
+                "calls": 2,
+                "turn_rate": 0.5,
+                "format_retry_requests": 2,
+                "format_retry_successes": 1,
+                "format_retry_success_rate": 0.5,
+                "thinking_recovered_turns": 1,
+            },
+            metrics["tools"],
+        )
         self.assertEqual(2, sum(bucket["total"] for bucket in metrics["timeline"]))
         serialized = json.dumps(metrics, ensure_ascii=False)
         self.assertNotIn("secret-prompt", serialized)
         self.assertNotIn("secret-answer", serialized)
         self.assertNotIn("secret-upstream-error", serialized)
+        self.assertNotIn("secret_tool_name", serialized)
 
         self.request("GET", "/api/hello")
         status, raw = self.request("GET", "/api/metrics?hours=24")
@@ -939,7 +1579,68 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual(24, payload["window_hours"])
         self.assertEqual(2, payload["history"]["requests"])
         self.assertGreaterEqual(payload["runtime"]["requests_total"], 1)
+        self.assertIsInstance(payload["runtime"]["request_timeouts"], int)
+        self.assertLessEqual(payload["runtime"]["tracked_paths"], app.MAX_RUNTIME_METRIC_PATHS)
+        self.assertEqual(app.MAX_RUNTIME_METRIC_PATHS, payload["runtime"]["max_paths"])
+        self.assertIsInstance(payload["runtime"]["path_overflow_total"], int)
         self.assertTrue(any(item["path"] == "/api/hello" for item in payload["runtime"]["top_paths"]))
+        self.assertEqual(app.AUTO_DELETE_MAX_PENDING, payload["runtime"]["auto_delete"]["max_pending"])
+        self.assertEqual(
+            app.PENDING_DELETE_MAX_RECORDS,
+            payload["runtime"]["auto_delete"]["journal_max_records"],
+        )
+        self.assertEqual(0, payload["runtime"]["auto_delete"]["journal_chat_pending"])
+        self.assertEqual(0, payload["runtime"]["auto_delete"]["journal_file_pending"])
+        self.assertEqual(
+            app.CAPTCHA_WORKER_MAX_PENDING,
+            payload["runtime"]["captcha_worker"]["max_pending"],
+        )
+        self.assertEqual(app.MAX_HTTP_HANDLER_THREADS, payload["runtime"]["http_handlers"]["max_active"])
+        self.assertIsInstance(payload["runtime"]["http_handlers"]["rejected_total"], int)
+        self.assertEqual(
+            app.MAX_ACTIVE_CHAT_FILE_UPLOADS,
+            payload["runtime"]["upload_slots"]["file"]["max_active"],
+        )
+        self.assertEqual(
+            app.MAX_ACTIVE_HAR_UPLOADS,
+            payload["runtime"]["upload_slots"]["har"]["max_active"],
+        )
+        self.assertEqual(
+            app.MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+            payload["runtime"]["upstream_responses"]["json_max_bytes"],
+        )
+        self.assertIsInstance(payload["runtime"]["upstream_responses"]["rejected_total"], int)
+        self.assertEqual(
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+            payload["runtime"]["upstream_responses"]["stream_output_max_bytes"],
+        )
+        self.assertEqual(
+            app.MAX_UPSTREAM_STREAM_WIRE_BYTES,
+            payload["runtime"]["upstream_responses"]["stream_wire_max_bytes"],
+        )
+        self.assertIsInstance(payload["runtime"]["upstream_responses"]["stream_rejected_total"], int)
+        self.assertIsInstance(payload["runtime"]["upstream_responses"]["stream_incomplete_total"], int)
+        self.assertEqual(app.UPSTREAM_READER_QUEUE_SIZE, payload["runtime"]["upstream_readers"]["queue_size"])
+        self.assertIsInstance(payload["runtime"]["upstream_readers"]["heartbeats_total"], int)
+        self.assertEqual(
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS,
+            payload["runtime"]["sse_heartbeat"]["interval_seconds"],
+        )
+        self.assertIsInstance(payload["runtime"]["sse_heartbeat"]["sent_total"], int)
+        self.assertEqual(
+            app.CONTEXT_FILE_CACHE_MAX_ITEMS,
+            payload["runtime"]["context_cache"]["max_items"],
+        )
+        self.assertEqual(
+            app.CONTEXT_UPLOAD_STATE_MAX_ITEMS,
+            payload["runtime"]["context_cache"]["max_state_items"],
+        )
+        self.assertEqual(
+            app.LOG_MAX_BYTES * (app.LOG_BACKUP_COUNT + 1),
+            payload["logs"]["store"]["max_total_bytes"],
+        )
+        self.assertEqual(app.LOG_RECORD_MAX_CHARS, payload["logs"]["max_record_chars"])
+        self.assertIsInstance(payload["logs"]["truncated_total"], int)
 
     def test_log_events_do_not_emit_raw_account_or_chat_identifiers(self) -> None:
         tree = ast.parse((PROJECT_ROOT / "glm2api.py").read_text(encoding="utf-8"))
@@ -952,6 +1653,235 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 if keyword.arg in forbidden:
                     violations.append((node.lineno, keyword.arg))
         self.assertEqual([], violations)
+
+    def test_log_redaction_covers_structured_values_bearer_tokens_and_tracebacks(self) -> None:
+        jwt = "eyJheader123." + "payload456.signature789"
+        provider_key = "ghp_" + "abcdefghijklmnopqrstuvwxyz123456"
+        windows_path = "C:" + "\\Users\\log-user\\private.log"
+        source = (
+            f'Authorization: Bearer short-secret token={jwt} '
+            f'{{"api_key":"panel-secret","captcha_verify_param":"captcha-secret"}} {provider_key} '
+            f'at \'{windows_path}\' https://example.test/failure?token=query-secret'
+        )
+        redacted = app.redact_log_text(source)
+        for secret in ("short-secret", jwt, "panel-secret", "captcha-secret", provider_key):
+            self.assertNotIn(secret, redacted)
+        self.assertIn("<redacted>", redacted)
+
+        payload = app.sanitize_log_value(
+            {
+                "token": "raw-token",
+                "nested": {"current_key": "raw-current", "error": source},
+                "token_fp": "safe-fingerprint",
+            }
+        )
+        self.assertEqual("<redacted>", payload["token"])
+        self.assertEqual("<redacted>", payload["nested"]["current_key"])
+        self.assertEqual("safe-fingerprint", payload["token_fp"])
+        self.assertNotIn("panel-secret", payload["nested"]["error"])
+        self.assertNotIn("log-user", payload["nested"]["error"])
+        self.assertNotIn("query-secret", payload["nested"]["error"])
+
+        try:
+            raise RuntimeError(
+                f"upstream failed token={jwt} at '{windows_path}' "
+                "https://example.test/failure?token=query-secret"
+            )
+        except RuntimeError:
+            record = logging.LogRecord(
+                "redaction-test",
+                logging.ERROR,
+                __file__,
+                1,
+                f"request failed with Bearer {provider_key}",
+                (),
+                sys.exc_info(),
+            )
+        line = app.RedactingFormatter("%(message)s").format(record)
+        self.assertNotIn(jwt, line)
+        self.assertNotIn(provider_key, line)
+        self.assertNotIn("log-user", line)
+        self.assertNotIn("query-secret", line)
+        self.assertIn("<redacted", line)
+
+        app.setup_logging("INFO", console=False)
+        self.assertTrue(
+            all(isinstance(handler.formatter, app.RedactingFormatter) for handler in app.LOG.handlers)
+        )
+        app.log_event(
+            "redaction_probe",
+            error=source,
+            nested={"authorization": f"Bearer {provider_key}"},
+        )
+        entries, matched, _cursor = app.log_ring().query(limit=5, state="redaction_probe")
+        self.assertGreaterEqual(matched, 1)
+        latest = entries[-1]
+        self.assertNotIn(jwt, latest["message"])
+        self.assertNotIn(provider_key, latest["message"])
+        self.assertNotIn(provider_key, latest["line"])
+        self.assertNotIn("log-user", latest["line"])
+        self.assertNotIn("query-secret", latest["line"])
+        structured = json.loads(latest["message"])
+        self.assertEqual("<redacted>", structured["nested"]["authorization"])
+
+    def test_client_error_message_redacts_credentials_queries_paths_and_controls(self) -> None:
+        provider_key = "ghp_" + ("c" * 24)
+        windows_path = "D:" + "\\Users\\alice\\private file.txt"
+        raw = (
+            f"token={provider_key}\n"
+            "Cookie: session=super-secret\n"
+            f"open '{windows_path}' failed\n"
+            "GET https://example.test/private?signature=abc&token=query-secret failed\t"
+        )
+        cleaned = app.client_error_message(raw)
+        self.assertNotIn(provider_key, cleaned)
+        self.assertNotIn("super-secret", cleaned)
+        self.assertNotIn("alice", cleaned)
+        self.assertNotIn("signature=abc", cleaned)
+        self.assertNotIn("query-secret", cleaned)
+        self.assertNotRegex(cleaned, r"[\r\n\t]")
+        self.assertIn("<redacted", cleaned)
+
+        long_error = "x" * (app.CLIENT_ERROR_MAX_CHARS + 200)
+        truncated = app.client_error_message(long_error)
+        self.assertLessEqual(len(truncated), app.CLIENT_ERROR_MAX_CHARS)
+        self.assertTrue(truncated.endswith("[error truncated]"))
+
+    def test_json_error_boundary_redacts_exception_details(self) -> None:
+        provider_key = "ghp_" + ("d" * 24)
+        windows_path = "C:" + "\\Users\\bob\\secret.txt"
+        leaked = f"delete failed token={provider_key} at '{windows_path}'"
+        original_delete = app.delete_zai_chat
+
+        def failing_delete(*_args, **_kwargs):
+            raise RuntimeError(leaked)
+
+        app.delete_zai_chat = failing_delete
+        try:
+            status, raw = self.request(
+                "POST",
+                "/api/chat/delete",
+                {"chat_id": "00000000-0000-0000-0000-000000000081"},
+            )
+        finally:
+            app.delete_zai_chat = original_delete
+        self.assertEqual(400, status)
+        self.assertNotIn(provider_key, raw)
+        self.assertNotIn("bob", raw)
+        self.assertIn("redacted", raw)
+
+    def test_all_streaming_error_boundaries_redact_exception_details(self) -> None:
+        provider_key = "ghp_" + ("e" * 24)
+        windows_path = "C:" + "\\Users\\carol\\stream.txt"
+        leaked = f"stream failed token={provider_key} at '{windows_path}'"
+        original_stream = app.stream_zai_completion
+
+        def failing_stream(*_args, **_kwargs):
+            if False:
+                yield ""
+            raise RuntimeError(leaked)
+
+        app.stream_zai_completion = failing_stream
+        try:
+            requests = [
+                (
+                    "/v1/chat/completions",
+                    {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                ),
+                ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+                (
+                    "/v1/messages",
+                    {
+                        "model": "glm-5.2",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                ),
+                ("/api/chat", {"model": "glm-5.2", "message": "hi", "stream": True}),
+            ]
+            results = [self.request("POST", path, body) for path, body in requests]
+        finally:
+            app.stream_zai_completion = original_stream
+        for status, raw in results:
+            self.assertEqual(200, status, raw[:500])
+            self.assertNotIn(provider_key, raw)
+            self.assertNotIn("carol", raw)
+            self.assertIn("redacted", raw)
+
+    def test_success_status_payloads_redact_local_store_errors(self) -> None:
+        provider_key = "ghp_" + ("f" * 24)
+        windows_path = "C:" + "\\Users\\dora\\state.json"
+        leaked = f"store token={provider_key} path '{windows_path}'"
+        previous = (
+            QuietProxyHandler.profile_store_error,
+            QuietProxyHandler.settings_error,
+            QuietProxyHandler.api_key_store_error,
+            QuietProxyHandler.browser_login_progress,
+        )
+        try:
+            QuietProxyHandler.profile_store_error = leaked
+            QuietProxyHandler.settings_error = leaked
+            QuietProxyHandler.api_key_store_error = leaked
+            QuietProxyHandler.browser_login_progress = {
+                "running": False,
+                "mode": "",
+                "stage": "失败",
+                "updated_at": "",
+                "error": leaked,
+            }
+            responses = [
+                self.request("GET", "/api/status"),
+                self.request("GET", "/api/settings"),
+                self.request("GET", "/api/settings/api-key"),
+                self.request("GET", "/api/auth/profiles"),
+                self.request("GET", "/api/auth/browser-login/status"),
+            ]
+        finally:
+            (
+                QuietProxyHandler.profile_store_error,
+                QuietProxyHandler.settings_error,
+                QuietProxyHandler.api_key_store_error,
+                QuietProxyHandler.browser_login_progress,
+            ) = previous
+        for status, raw in responses:
+            self.assertEqual(200, status, raw[:500])
+            self.assertNotIn(provider_key, raw)
+            self.assertNotIn("dora", raw)
+            self.assertIn("redacted", raw)
+
+    def test_success_model_content_is_not_modified_by_error_sanitizer(self) -> None:
+        original_stream = app.stream_zai_completion
+        model_text = "示例路径 C:" + "\\Users\\example\\project 与 token=not-a-secret"
+
+        def content_stream(*_args, **_kwargs):
+            yield "data: " + json.dumps(
+                {"data": {"delta_content": model_text, "phase": "answer"}},
+                ensure_ascii=False,
+            )
+
+        app.stream_zai_completion = content_stream
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {"model": "glm-5.2", "messages": [{"role": "user", "content": "show example"}]},
+            )
+        finally:
+            app.stream_zai_completion = original_stream
+        self.assertEqual(200, status, raw[:500])
+        self.assertEqual(model_text, json.loads(raw)["choices"][0]["message"]["content"])
+
+    def test_access_log_target_drops_queries_and_normalizes_dynamic_ids(self) -> None:
+        self.assertEqual(
+            "/api/logs",
+            app.safe_access_log_target("/api/logs?token=secret&text=private-prompt"),
+        )
+        self.assertEqual(
+            "/v1/responses/:id",
+            app.safe_access_log_target("/v1/responses/resp_sensitive?api_key=secret"),
+        )
+        self.assertNotIn("\n", app.safe_access_log_target("/api/test\nforged?token=secret"))
 
     def test_request_id_scoped_to_dispatch(self) -> None:
         app.setup_logging("INFO", console=False)
@@ -980,10 +1910,59 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertTrue(app.is_transient_upstream_error(busy))
         self.assertTrue(app.is_transient_upstream_error("HTTP Error 429: too many requests"))
         self.assertTrue(app.is_transient_upstream_error("HTTP Error 502: bad gateway"))
+        self.assertTrue(app.is_transient_upstream_error("上游中断"))
         self.assertFalse(app.is_transient_upstream_error("AUTH_REQUIRED: unauthorized"))
         self.assertFalse(app.is_transient_upstream_error("FRONTEND_CAPTCHA_REQUIRED: missing captcha"))
         self.assertFalse(app.is_transient_upstream_error("上游未按 tool_choice 输出工具调用: get_weather"))
         self.assertFalse(app.is_transient_upstream_error(""))
+        before_delta = RuntimeError("上游中断")
+        self.assertTrue(app.is_retryable_protocol_exception(before_delta))
+        before_delta.protocol_content_emitted = True
+        self.assertFalse(app.is_retryable_protocol_exception(before_delta))
+
+    def test_stream_retries_upstream_interrupted_during_new_chat(self) -> None:
+        state = fake_state()
+        new_chat_calls = 0
+
+        def flaky_new_chat(_state, _prompt, options=None):
+            nonlocal new_chat_calls
+            new_chat_calls += 1
+            if new_chat_calls == 1:
+                raise RuntimeError("创建 chat 失败: 上游中断")
+            return "00000000-0000-0000-0000-000000000099", "user-message-2"
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(
+                    [
+                        b'data: {"data":{"delta_content":"RECOVERED","phase":"answer"}}\n\n',
+                        b'data: {"data":"[DONE]"}\n\n',
+                    ]
+                )
+
+        real = (app.new_chat, app.urlopen)
+        app.new_chat = flaky_new_chat
+        app.urlopen = lambda _request, timeout=None: FakeResp()
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "hi",
+                    options=app.ChatOptions(model="glm-5.2"),
+                    retry_wait_sec=0,
+                    retry_attempts=3,
+                )
+            )
+        finally:
+            app.new_chat, app.urlopen = real
+        self.assertEqual(2, new_chat_calls)
+        self.assertIn("RECOVERED", "".join(events))
 
     def test_stream_retries_transient_busy_before_first_delta(self) -> None:
         state = fake_state()
@@ -997,7 +1976,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             new_chat_calls.append(chat_id)
             return chat_id, user_msg
 
-        def fake_delete(_state, chat_id):
+        def fake_delete(_state, chat_id, **_kwargs):
             deleted.append(chat_id)
             return True
 
@@ -1094,6 +2073,288 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual("OK", "".join(app.extract_delta_from_event(event)[0] for event in events))
         self.assertEqual("OK", app.extract_delta_from_event(events[0])[0])
 
+    def test_upstream_terminal_event_detection_matches_captured_shapes(self) -> None:
+        self.assertTrue(app.is_upstream_terminal_event("data: [DONE]"))
+        self.assertTrue(app.is_upstream_terminal_event('data: {"data":"[DONE]"}'))
+        self.assertTrue(
+            app.is_upstream_terminal_event(
+                'data: {"type":"chat:completion","data":{"done":true,"phase":"answer"}}'
+            )
+        )
+        self.assertTrue(app.is_upstream_terminal_event('data: {"done":true}'))
+        self.assertFalse(
+            app.is_upstream_terminal_event(
+                'data: {"type":"chat:completion","data":{"delta_content":"partial","phase":"answer"}}'
+            )
+        )
+
+    def test_stream_retries_eof_before_terminal_when_no_content_was_emitted(self) -> None:
+        state = fake_state()
+        chats: list[str] = []
+        deleted: list[str] = []
+        attempts = [
+            [],
+            [
+                b'data: {"data":{"delta_content":"RECOVERED","phase":"answer"}}\n\n',
+                b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+            ],
+        ]
+
+        class FakeResp:
+            def __init__(self, chunks: list[bytes]):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+        def fake_new_chat(_state, _prompt, options=None):
+            index = len(chats)
+            chat_id = f"00000000-0000-0000-0000-{index:012d}"
+            chats.append(chat_id)
+            return chat_id, f"user-{index}"
+
+        before = app.upstream_response_status()["stream_incomplete_total"]
+        real = (app.new_chat, app.delete_zai_chat, app.urlopen)
+        app.new_chat = fake_new_chat
+        app.delete_zai_chat = lambda _state, chat_id, **_kwargs: deleted.append(chat_id) or True
+        app.urlopen = lambda _request, timeout=None: FakeResp(attempts[len(chats) - 1])
+        try:
+            events = list(
+                self.original_stream(
+                    state,
+                    "retry incomplete",
+                    options=app.ChatOptions(model="glm-5.2"),
+                    retry_wait_sec=0,
+                    retry_attempts=2,
+                )
+            )
+        finally:
+            app.new_chat, app.delete_zai_chat, app.urlopen = real
+        self.assertEqual(2, len(chats))
+        self.assertEqual([chats[0]], deleted)
+        self.assertIn("RECOVERED", "".join(events))
+        self.assertEqual(before + 1, app.upstream_response_status()["stream_incomplete_total"])
+
+    def test_stream_eof_after_partial_is_error_and_marks_cleanup_context(self) -> None:
+        state = fake_state()
+
+        class FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter([b'data: {"data":{"delta_content":"PARTIAL","phase":"answer"}}\n\n'])
+
+        context: dict[str, object] = {}
+        real = (app.new_chat, app.urlopen)
+        app.new_chat = lambda *_args, **_kwargs: (
+            "00000000-0000-0000-0000-000000000077",
+            "user-partial",
+        )
+        app.urlopen = lambda *_args, **_kwargs: FakeResp()
+        try:
+            with self.assertRaises(app.UpstreamStreamIncomplete) as raised:
+                list(
+                    self.original_stream(
+                        state,
+                        "partial eof",
+                        options=app.ChatOptions(model="glm-5.2", delete_chat_after_completion=False),
+                        context_out=context,
+                        retry_attempts=1,
+                        history_ctx={
+                            "surface": "openai_chat",
+                            "stream": True,
+                            "user_input": "partial eof",
+                            "messages": [{"role": "user", "content": "partial eof"}],
+                        },
+                    )
+                )
+        finally:
+            app.new_chat, app.urlopen = real
+        self.assertTrue(context["_stream_incomplete"])
+        self.assertTrue(raised.exception.protocol_content_emitted)
+        record = app.local_history_records()[0]
+        self.assertEqual("error", record["status"])
+        self.assertEqual("PARTIAL", record["content"])
+        self.assertIn("完成标记", record["error"])
+
+    def test_protocol_partial_eof_returns_502_and_forces_chat_cleanup(self) -> None:
+        original_stream = app.stream_zai_completion
+        chat_id = "00000000-0000-0000-0000-000000000078"
+
+        def incomplete_stream(_state, _prompt, **kwargs):
+            context = kwargs.get("context_out")
+            if isinstance(context, dict):
+                context.update({"chat_id": chat_id, "_stream_incomplete": True})
+            yield 'data: {"data":{"delta_content":"PARTIAL","phase":"answer"}}'
+            exc = app.UpstreamStreamIncomplete("上游中断：SSE 在完成标记前结束")
+            exc.protocol_content_emitted = True
+            raise exc
+
+        app.stream_zai_completion = incomplete_stream
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "partial eof"}],
+                    "stream": False,
+                    "delete_chat_after_completion": False,
+                },
+            )
+        finally:
+            app.stream_zai_completion = original_stream
+        self.assertEqual(502, status, raw)
+        self.assertIn("完成标记", raw)
+        self.assertEqual([chat_id], self.deleted_chats)
+
+    def test_upstream_silence_emits_heartbeat_then_resumes(self) -> None:
+        state = fake_state()
+        started = threading.Event()
+        release = threading.Event()
+        reader_threads: list[str] = []
+
+        class BlockingResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                release.set()
+                return False
+
+            def __iter__(self):
+                reader_threads.append(threading.current_thread().name)
+                started.set()
+                release.wait(timeout=2)
+                yield b'data: {"data":{"delta_content":"RESUMED","phase":"answer"}}\n\n'
+                yield b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n'
+
+            def close(self):
+                release.set()
+
+        real = (app.new_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS)
+        app.new_chat = lambda *_a, **_k: ("00000000-0000-0000-0000-000000000087", "u1")
+        app.urlopen = lambda *_a, **_k: BlockingResp()
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        events = None
+        try:
+            events = self.original_stream(
+                state,
+                "hi",
+                options=app.ChatOptions(model="glm-5.2"),
+                retry_wait_sec=0,
+                retry_attempts=1,
+            )
+            first = next(events)
+            self.assertTrue(started.is_set())
+            self.assertEqual(app.UPSTREAM_IDLE_HEARTBEAT_EVENT, first)
+            self.assertTrue(app.is_sse_comment_event(first))
+            release.set()
+            remaining = list(events)
+        finally:
+            release.set()
+            if events is not None:
+                events.close()
+            app.new_chat, app.urlopen, app.SSE_KEEPALIVE_INTERVAL_SECONDS = real
+        self.assertEqual(["upstream-sse-reader"], reader_threads)
+        self.assertIn("RESUMED", "".join(remaining))
+
+    def test_closing_heartbeat_iterator_unblocks_upstream_reader(self) -> None:
+        released = threading.Event()
+        finished = threading.Event()
+
+        class BlockingResp:
+            def __iter__(self):
+                try:
+                    released.wait(timeout=2)
+                    if not released.is_set():
+                        raise TimeoutError("test reader was not released")
+                finally:
+                    finished.set()
+                return
+                yield b""  # pragma: no cover - keeps this method an iterator
+
+            def close(self):
+                released.set()
+
+        chunks = app.iter_upstream_chunks_with_heartbeat(BlockingResp(), 0.02)
+        self.assertIsNone(next(chunks))
+        chunks.close()
+        self.assertTrue(released.is_set())
+        self.assertTrue(finished.wait(timeout=0.5))
+
+    def test_upstream_reader_propagates_transport_error_and_counts_it(self) -> None:
+        before = app.upstream_reader_status()["errors_total"]
+
+        class ErrorResp:
+            def __iter__(self):
+                raise OSError("simulated upstream read failure")
+                yield b""  # pragma: no cover - keeps this method an iterator
+
+        with self.assertRaisesRegex(OSError, "simulated upstream read failure"):
+            list(app.iter_upstream_chunks_with_heartbeat(ErrorResp(), 0.02))
+        status = app.upstream_reader_status()
+        self.assertEqual(before + 1, status["errors_total"])
+        self.assertEqual(0, status["active"])
+
+    def test_auto_visible_tool_free_decision_does_not_retry_hidden_call(self) -> None:
+        current_stream = app.stream_zai_completion
+        prompts: list[str] = []
+
+        def deciding_stream(_state, prompt, **kwargs):
+            prompts.append(prompt)
+            context = kwargs.get("context_out")
+            if isinstance(context, dict):
+                context["chat_id"] = f"00000000-0000-0000-0000-{len(prompts):012d}"
+            if len(prompts) == 1:
+                hidden_call = (
+                    "```xml\n<|DSML|tool_calls><|DSML|invoke name=\"get_weather\">"
+                    "<|DSML|parameter name=\"city\">北京</|DSML|parameter>"
+                    "</|DSML|invoke></|DSML|tool_calls>\n```"
+                )
+                yield "data: " + json.dumps(
+                    {"data": {"delta_content": hidden_call, "phase": "thinking"}}, ensure_ascii=False
+                )
+                yield 'data: {"data":{"delta_content":"接下来我会查询天气。","phase":"answer"}}'
+                return
+            yield 'data: {"data":{"delta_content":"现有信息已经足够，完整答案如下。","phase":"answer"}}'
+
+        app.stream_zai_completion = deciding_stream
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.3",
+                    "messages": [{"role": "user", "content": "是否需要查询天气由你判断"}],
+                    "tools": [
+                        {
+                            "type": "function",
+                            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+                        }
+                    ],
+                    "tool_choice": "auto",
+                    "stream": False,
+                },
+            )
+        finally:
+            app.stream_zai_completion = current_stream
+        self.assertEqual(200, status, raw)
+        self.assertEqual(1, len(prompts))
+        self.assertNotIn("tool_calls", json.loads(raw)["choices"][0]["message"])
+        self.assertEqual("接下来我会查询天气。", json.loads(raw)["choices"][0]["message"]["content"])
+        self.assertEqual(1, len(self.deleted_chats))
+
     def test_stream_tool_retry_hides_failed_attempt_and_sends_keepalive(self) -> None:
         current_stream = app.stream_zai_completion
         original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
@@ -1114,17 +2375,23 @@ class ProtocolAdaptersTest(unittest.TestCase):
             def __iter__(self):
                 return iter(self.chunks)
 
+        committed_thinking = "GOOD_THINKING\nI decided that this tool call is needed now."
+        visible_call = (
+            "接下来我会查询天气。\n"
+            '<|DSML|tool_calls><|DSML|invoke name="get_weather">'
+            '<|DSML|parameter name="city">北京</|DSML|parameter>'
+            '</|DSML|invoke></|DSML|tool_calls>'
+        )
         upstream_chunks = [
             [
                 b'data: {"data":{"delta_content":"FAILED_THINKING","phase":"thinking"}}\n\n',
                 b'data: {"data":{"delta_content":"<tool_calls><invoke name=bad>","phase":"answer"}}\n\n',
+                b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
             ],
             [
-                b'data: {"data":{"delta_content":"GOOD_THINKING","phase":"thinking"}}\n\n',
-                (
-                    'data: {"data":{"delta_content":"<tool_calls><invoke name=\\"get_weather\\">'
-                    '<parameter name=\\"city\\">北京</parameter></invoke></tool_calls>","phase":"answer"}}\n\n'
-                ).encode("utf-8"),
+                ("data: " + json.dumps({"data": {"delta_content": committed_thinking, "phase": "thinking"}}, ensure_ascii=False) + "\n\n").encode("utf-8"),
+                ("data: " + json.dumps({"data": {"delta_content": visible_call, "phase": "answer"}}, ensure_ascii=False) + "\n\n").encode("utf-8"),
+                b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
             ],
         ]
 
@@ -1154,7 +2421,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                             "function": {"name": "get_weather", "parameters": {"type": "object"}},
                         }
                     ],
-                    "tool_choice": "required",
+                    "tool_choice": "auto",
                     "include_thinking": True,
                     "stream": True,
                 },
@@ -1170,11 +2437,85 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertNotIn("FAILED_THINKING", raw)
         self.assertIn("GOOD_THINKING", raw)
         self.assertIn('"tool_calls"', raw)
+        self.assertIn("接下来我会查询天气", raw)
+        self.assertNotIn("<|DSML|tool_calls>", raw)
         self.assertEqual(2, len(self.deleted_chats), "失败首轮与成功重试会话都应清理")
         records = app.local_history_records()
         self.assertEqual(1, len(records), "一次客户端请求的格式纠错不应产生两条历史记录")
         detail = app.get_local_history_record(str(records[0]["id"])) or {}
+        self.assertEqual("success", detail["status"])
+        self.assertEqual("tool_calls", detail["finish_reason"])
+        self.assertEqual(1, detail["tool_calls_count"])
+        self.assertEqual(["get_weather"], detail["tool_call_names"])
+        self.assertEqual("output", detail["tool_calls_source"])
+        self.assertEqual(1, detail["tool_retry_count"])
+        self.assertEqual("", detail["tool_retry_error"])
         self.assertIn("Tool-call correction:", str(detail.get("final_prompt") or ""))
+
+    def test_exhausted_tool_format_retry_marks_history_error(self) -> None:
+        request = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.3",
+                "messages": [{"role": "user", "content": "检查文件"}],
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "Read", "parameters": {"type": "object"}},
+                    }
+                ],
+            },
+            True,
+        )
+        record_id = app.start_history_record(
+            surface=request.surface,
+            model=request.options.model,
+            stream=False,
+            user_input="检查文件",
+            messages=request.messages,
+            final_prompt=request.execution_prompt,
+        )
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        first_context = {
+            "_history_record_id": record_id,
+            "chat_id": "00000000-0000-0000-0000-0000000000d1",
+        }
+        malformed = '<tool_calls><invoke name="Read"><parameter name="file_path">'
+        released = False
+
+        def release_initial_output():
+            nonlocal released
+            released = True
+
+        def regenerate(retry_request):
+            self.assertTrue(released, "第二轮开始前必须先释放首轮输出缓冲")
+            app.restart_history_record(record_id, retry_request.execution_prompt)
+            return (
+                malformed,
+                "",
+                {
+                    "_history_record_id": record_id,
+                    "chat_id": "00000000-0000-0000-0000-0000000000d2",
+                },
+                fake_state(),
+            )
+
+        with self.assertRaises(app.ToolCallFormatError):
+            handler._complete_turn_with_tool_retry(
+                request,
+                fake_state(),
+                first_context,
+                malformed,
+                "",
+                regenerate,
+                release_initial_output,
+            )
+        self.assertTrue(released)
+        detail = app.get_local_history_record(record_id) or {}
+        self.assertEqual("error", detail["status"])
+        self.assertEqual(500, detail["status_code"])
+        self.assertEqual(1, detail["tool_retry_count"])
+        self.assertIn("无法转换", detail["tool_retry_error"])
+        self.assertEqual("", detail["finish_reason"])
 
     def test_stream_passes_through_non_transient_error(self) -> None:
         state = fake_state()
@@ -1205,7 +2546,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
 
         real = (app.new_chat, app.delete_zai_chat, app.urlopen)
         app.new_chat = fake_new_chat
-        app.delete_zai_chat = lambda _s, _c: True
+        app.delete_zai_chat = lambda _s, _c, **_kwargs: True
         app.urlopen = fake_urlopen
         try:
             events = list(
@@ -1259,11 +2600,227 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app.get_happydom_captcha = real_solver
             app._set_captcha_degraded(-3600)
 
+    def test_happydom_cancellation_terminates_owned_node_process(self) -> None:
+        original = (app.subprocess.Popen, app.shutil.which, app.happydom_captcha_available)
+        created = []
+
+        class FakeProcess:
+            def __init__(self, *_args, **_kwargs):
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                created.append(self)
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                if self.returncode is None:
+                    raise app.subprocess.TimeoutExpired("node", timeout)
+                return ("", "")
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        def cancel():
+            raise app.ServiceShuttingDown("test shutdown")
+
+        try:
+            app.subprocess.Popen = FakeProcess
+            app.shutil.which = lambda _name: "node"
+            app.happydom_captcha_available = lambda: True
+            with self.assertRaises(app.ServiceShuttingDown):
+                app.get_happydom_captcha(30_000, cancel_check=cancel)
+            self.assertEqual(1, len(created))
+            self.assertTrue(created[0].terminated or created[0].killed)
+        finally:
+            app.subprocess.Popen, app.shutil.which, app.happydom_captcha_available = original
+
+    def test_har_worker_cancellation_terminates_owned_process(self) -> None:
+        original = app.subprocess.Popen
+        created = []
+        checks = 0
+
+        class FakeProcess:
+            def __init__(self, *_args, **_kwargs):
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+                created.append(self)
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                if self.returncode is None:
+                    raise app.subprocess.TimeoutExpired("har-worker", timeout)
+                return ("", "")
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+        def cancel():
+            nonlocal checks
+            checks += 1
+            if checks >= 2:
+                raise app.ServiceShuttingDown("test shutdown")
+
+        try:
+            app.subprocess.Popen = FakeProcess
+            with self.assertRaises(app.ServiceShuttingDown):
+                app.extract_state_via_worker(Path("unused.har"), cancel_check=cancel)
+            self.assertEqual(1, len(created))
+            self.assertTrue(created[0].terminated or created[0].killed)
+        finally:
+            app.subprocess.Popen = original
+
+    def test_har_worker_timeout_terminates_owned_process(self) -> None:
+        original = app.subprocess.Popen
+        created = []
+
+        class FakeProcess:
+            def __init__(self, *_args, **_kwargs):
+                self.returncode = None
+                self.terminated = False
+                created.append(self)
+
+            def poll(self):
+                return self.returncode
+
+            def communicate(self, timeout=None):
+                if self.returncode is None:
+                    raise app.subprocess.TimeoutExpired("har-worker", timeout)
+                return ("", "")
+
+            def terminate(self):
+                self.terminated = True
+                self.returncode = -15
+
+            def kill(self):
+                self.returncode = -9
+
+        try:
+            app.subprocess.Popen = FakeProcess
+            with self.assertRaisesRegex(TimeoutError, "HAR 状态提取超时"):
+                app.extract_state_via_worker(Path("unused.har"), timeout_sec=0)
+            self.assertEqual(1, len(created))
+            self.assertTrue(created[0].terminated)
+        finally:
+            app.subprocess.Popen = original
+
+    def test_har_worker_real_success_path(self) -> None:
+        har = {
+            "log": {
+                "entries": [
+                    {
+                        "request": {"url": "https://chat.z.ai/api/v1/auths/signin"},
+                        "response": {
+                            "status": 200,
+                            "content": {
+                                "text": json.dumps(
+                                    {"token": "worker-token", "id": "worker-user", "name": "worker"}
+                                )
+                            },
+                        },
+                    },
+                    {
+                        "request": {
+                            "url": "https://chat.z.ai/api/v2/chat/completions?user_id=worker-user",
+                            "headers": [{"name": "user-agent", "value": "worker-agent"}],
+                            "postData": {"text": json.dumps({"model": "glm-5.2"})},
+                        },
+                        "response": {"status": 200},
+                    },
+                ]
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            har_path = Path(tmp) / "worker.har"
+            har_path.write_text(json.dumps(har), encoding="utf-8")
+            expected_fingerprint = app.file_sha16(har_path)
+            state, fingerprint = app.extract_state_via_worker(har_path, timeout_sec=10)
+        self.assertEqual("worker-token", state.token)
+        self.assertEqual("worker-user", state.user_id)
+        self.assertEqual("worker-agent", state.user_agent)
+        self.assertEqual(expected_fingerprint, fingerprint)
+
+    def test_captcha_prefetch_shutdown_cancels_background_solver(self) -> None:
+        original = (
+            app._CAPTCHA_PREFETCH_ENABLED,
+            app._CAPTCHA_MODE,
+            app.get_happydom_captcha,
+            app.happydom_captcha_available,
+        )
+        started = threading.Event()
+        cancelled = threading.Event()
+
+        def blocking_solver(_timeout_ms, *, cancel_check=None):
+            started.set()
+            while True:
+                try:
+                    if cancel_check is not None:
+                        cancel_check()
+                except app.ServiceShuttingDown:
+                    cancelled.set()
+                    raise
+                time.sleep(0.01)
+
+        try:
+            app._shutdown_captcha_prefetch(timeout=1)
+            app._CAPTCHA_PREFETCH_STOP.clear()
+            app._CAPTCHA_PREFETCH_ENABLED = True
+            app._CAPTCHA_MODE = "happydom"
+            app.get_happydom_captcha = blocking_solver
+            app.happydom_captcha_available = lambda: True
+            app._schedule_captcha_prefetch(30_000)
+            self.assertTrue(started.wait(timeout=1))
+            self.assertTrue(app._shutdown_captcha_prefetch(timeout=1))
+            self.assertTrue(cancelled.wait(timeout=1))
+            self.assertFalse(app._CAPTCHA_PREFETCHING)
+            self.assertIsNone(app._CAPTCHA_PREFETCH_THREAD)
+        finally:
+            app._shutdown_captcha_prefetch(timeout=1)
+            app._CAPTCHA_PREFETCH_STOP.clear()
+            (
+                app._CAPTCHA_PREFETCH_ENABLED,
+                app._CAPTCHA_MODE,
+                app.get_happydom_captcha,
+                app.happydom_captcha_available,
+            ) = original
+
     def test_captcha_pool_expiry(self) -> None:
         app._CAPTCHA_POOL.append(("stale-captcha", time.monotonic() - app.CAPTCHA_POOL_TTL_SEC - 1))
         app._CAPTCHA_POOL.append(("fresh-captcha", time.monotonic()))
         self.assertEqual("fresh-captcha", app._captcha_pool_take(), "过期条目应被跳过")
         self.assertEqual("", app._captcha_pool_take())
+
+    def test_browser_captcha_mode_does_not_consume_happydom_pool(self) -> None:
+        class BrowserWorker:
+            def solve(self, *_args, **_kwargs):
+                return "browser-captcha"
+
+        original_mode = app._CAPTCHA_MODE
+        app._CAPTCHA_POOL.append(("happydom-pooled-captcha", time.monotonic()))
+        try:
+            app._CAPTCHA_MODE = "browser"
+            app._set_captcha_degraded(-3600)
+            result = app.resolve_fresh_captcha(fake_state(), "glm-5.2", BrowserWorker(), timeout_ms=1000)
+            self.assertEqual("browser-captcha", result)
+            self.assertEqual(1, len(app._CAPTCHA_POOL), "browser 模式不能消费 happy-dom 预热池")
+        finally:
+            app._CAPTCHA_MODE = original_mode
+            app._CAPTCHA_POOL.clear()
+            app._set_captcha_degraded(-3600)
 
     def test_captcha_error_classification(self) -> None:
         # 2026-08-29 04:02 实测：超龄池码被上游拒绝，F018/F019 必须可识别且可重试。
@@ -1338,7 +2895,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
 
         real = (app.new_chat, app.delete_zai_chat, app.urlopen, app.resolve_fresh_captcha)
         app.new_chat = fake_new_chat
-        app.delete_zai_chat = lambda _s, chat_id: deleted.append(chat_id) or True
+        app.delete_zai_chat = lambda _s, chat_id, **_kwargs: deleted.append(chat_id) or True
         app.urlopen = fake_urlopen
         app.resolve_fresh_captcha = fake_resolve
         try:
@@ -1417,6 +2974,14 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 self.assertEqual(200, response.status, path)
                 self.assertEqual(b"", response.read(), "HEAD 响应不应包含响应体")
 
+    def test_health_endpoint_identifies_glm2api_service(self) -> None:
+        status, raw = self.request("GET", "/healthz")
+        self.assertEqual(200, status)
+        payload = json.loads(raw)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(app.SERVICE_ID, payload["service"])
+        self.assertIn("auth_ready", payload)
+
     def test_http_security_and_cache_headers(self) -> None:
         with urlopen(self.base_url + "/", timeout=8) as response:
             self.assertEqual("DENY", response.headers.get("X-Frame-Options"))
@@ -1427,6 +2992,85 @@ class ProtocolAdaptersTest(unittest.TestCase):
         with urlopen(self.base_url + "/api/status", timeout=8) as response:
             self.assertEqual("no-store", response.headers.get("Cache-Control"))
             self.assertIn("default-src 'self'", response.headers.get("Content-Security-Policy", ""))
+
+    def test_browser_origin_guard_blocks_simple_cross_site_requests(self) -> None:
+        original_cors = QuietProxyHandler.cors_origins
+        original_settings = dict(QuietProxyHandler.settings)
+        try:
+            QuietProxyHandler.cors_origins = ()
+            hostile = {"Origin": "http://hostile.example"}
+
+            status, raw = self.request("GET", "/api/hello", headers=hostile)
+            self.assertEqual(403, status)
+            self.assertEqual("origin_not_allowed", json.loads(raw)["error"]["code"])
+
+            status, raw = self.request(
+                "POST",
+                "/api/settings",
+                {"model": "glm-5.2"},
+                headers=hostile,
+            )
+            self.assertEqual(403, status)
+            self.assertEqual("origin_not_allowed", json.loads(raw)["error"]["code"])
+            self.assertEqual(original_settings, QuietProxyHandler.settings, "跨站简单 POST 不得执行任何设置变更")
+
+            local_origin = f"http://127.0.0.1:{self.server.server_port}"
+            status, raw = self.request("GET", "/api/hello", headers={"Origin": local_origin})
+            self.assertEqual(200, status)
+            self.assertTrue(json.loads(raw)["ok"])
+        finally:
+            QuietProxyHandler.cors_origins = original_cors
+            QuietProxyHandler.settings = original_settings
+
+    def test_management_query_limits_history_clamps_and_upload_connection_close(self) -> None:
+        too_many = "&".join(f"field{index}=x" for index in range(app.MAX_QUERY_FIELDS + 1))
+        status, raw = self.request("GET", f"/api/logs?{too_many}")
+        self.assertEqual(400, status, raw[:500])
+        self.assertEqual("invalid_query", json.loads(raw)["error"]["code"])
+
+        long_value = "x" * (app.MAX_QUERY_VALUE_CHARS + 1)
+        status, raw = self.request("GET", f"/api/metrics?hours={long_value}")
+        self.assertEqual(400, status, raw[:500])
+        self.assertEqual("invalid_query", json.loads(raw)["error"]["code"])
+
+        original_page = app.local_history_summary_page
+        captured: dict[str, object] = {}
+
+        def capture_page(**kwargs):
+            captured.update(kwargs)
+            return [], 0
+
+        try:
+            app.local_history_summary_page = capture_page
+            search = "s" * (app.MAX_HISTORY_SEARCH_CHARS + 20)
+            status, raw = self.request(
+                "GET",
+                f"/api/history/records?page={app.MAX_HISTORY_QUERY_PAGE + 99}&text={search}",
+            )
+        finally:
+            app.local_history_summary_page = original_page
+        self.assertEqual(200, status, raw[:500])
+        self.assertEqual(app.MAX_HISTORY_QUERY_PAGE, captured["page"])
+        self.assertEqual(app.MAX_HISTORY_SEARCH_CHARS, len(str(captured["text"])))
+
+        connection = app.http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=8)
+        try:
+            connection.request(
+                "POST",
+                f"/api/files/upload?{too_many}",
+                body=b"unread-upload-body",
+                headers={"Content-Type": "application/octet-stream"},
+            )
+            response = connection.getresponse()
+            body = response.read().decode("utf-8", errors="replace")
+            self.assertEqual(400, response.status, body[:500])
+            self.assertEqual("close", str(response.getheader("Connection") or "").lower())
+            self.assertEqual("invalid_query", json.loads(body)["error"]["code"])
+        finally:
+            connection.close()
+
+        html = app.WEB_INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="history-search-input" class="input-custom" type="text" maxlength="256"', html)
 
     def test_remote_bind_requires_explicit_permission_and_api_key(self) -> None:
         app.validate_server_bind("127.0.0.1", False, "")
@@ -1583,12 +3227,12 @@ class ProtocolAdaptersTest(unittest.TestCase):
         real = (app.list_zai_chats, app.get_zai_chat_detail)
 
         def boom(_state, page=1):
-            raise RuntimeError("获取对话列表失败: HTTP Error 500: upstream sad")
+            raise app.UpstreamRequestError("获取对话列表失败: HTTP Error 500: upstream sad")
 
         app.list_zai_chats = boom
         try:
             status, body = self.request("GET", "/api/history/chats")
-            self.assertEqual(400, status)
+            self.assertEqual(502, status)
             self.assertIn("获取对话列表失败", body)
         finally:
             app.list_zai_chats, app.get_zai_chat_detail = real
@@ -1668,6 +3312,176 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app._HISTORY_CONF.clear()
             app._HISTORY_CONF.update(original_conf)
 
+    def test_history_detail_byte_budget_evicts_oldest_and_keeps_newest(self) -> None:
+        app.HISTORY_MAX_DETAIL_BYTES = 2_200
+        record_ids = [
+            app.start_history_record(
+                surface="openai_chat",
+                model="glm-5.3",
+                user_input=f"第 {index} 条 " + (chr(96 + index) * 900),
+                messages=[],
+            )
+            for index in range(1, 4)
+        ]
+
+        records = app.local_history_records()
+        retained_ids = {record["id"] for record in records}
+        self.assertLess(len(records), 3)
+        self.assertNotIn(record_ids[0], retained_ids)
+        self.assertIn(record_ids[-1], retained_ids)
+        self.assertFalse((app.HISTORY_DETAIL_DIR / f"{record_ids[0]}.json").exists())
+        status = app.history_store_status()
+        self.assertLessEqual(status["detail_bytes"], app.HISTORY_MAX_DETAIL_BYTES)
+        self.assertEqual(len(records), status["records"])
+        self.assertEqual(len(records), status["detail_files"])
+
+        app.HISTORY_MAX_DETAIL_BYTES = 128
+        oversized_id = app.start_history_record(
+            surface="openai_chat",
+            model="glm-5.3",
+            user_input="latest " + ("z" * 1_000),
+            messages=[],
+        )
+        records = app.local_history_records()
+        self.assertEqual([oversized_id], [record["id"] for record in records])
+        self.assertTrue((app.HISTORY_DETAIL_DIR / f"{oversized_id}.json").exists())
+        self.assertTrue(app.history_store_status()["over_detail_budget"])
+
+    def test_history_load_recovers_detail_missing_from_index(self) -> None:
+        indexed_id = app.start_history_record(
+            surface="openai_chat",
+            model="glm-5.3",
+            user_input="索引内记录",
+            messages=[],
+        )
+        orphan_id = "req_unindexed_recoverable"
+        orphan = {
+            "id": orphan_id,
+            "status": "success",
+            "created_at": int(time.time() * 1000) + 1,
+            "title": "待恢复记录",
+            "user_input": "待恢复记录",
+            "messages": [],
+            "files": [],
+            "context_files": [],
+            "account": "legacy-account",
+        }
+        (app.HISTORY_DETAIL_DIR / f"{orphan_id}.json").write_text(
+            json.dumps({"schema": app.HISTORY_SCHEMA, "record": orphan}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        app._HISTORY_CACHE = None
+
+        records = app.local_history_records()
+        self.assertEqual([indexed_id, orphan_id], [record["id"] for record in records])
+        recovered = records[-1]
+        self.assertEqual(app.sha16("legacy-account"), recovered["account"])
+        self.assertEqual(1, recovered["account_fp_version"])
+        index = json.loads(app.HISTORY_STORE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual([indexed_id, orphan_id], [item["id"] for item in index["items"]])
+
+    def test_history_load_removes_unindexed_detail_older_than_index(self) -> None:
+        stale_id = app.start_history_record(
+            surface="openai_chat",
+            model="glm-5.3",
+            user_input="已从索引删除",
+            messages=[],
+        )
+        stale_path = app.HISTORY_DETAIL_DIR / f"{stale_id}.json"
+        app.HISTORY_STORE_PATH.write_text(
+            json.dumps(
+                {
+                    "schema": app.HISTORY_SCHEMA,
+                    "updated": int(time.time() * 1000) + 10_000,
+                    "items": [],
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        app._HISTORY_CACHE = None
+
+        self.assertEqual([], app.local_history_records())
+        self.assertFalse(stale_path.exists())
+
+    def test_history_store_budgets_ids_and_detail_integrity_are_enforced(self) -> None:
+        with self.assertRaisesRegex(ValueError, "storage id is invalid"):
+            app._history_detail_path("../outside")
+
+        app.HISTORY_STORE_PATH.write_bytes(b"x" * (app.MAX_HISTORY_INDEX_BYTES + 1))
+        app._HISTORY_CACHE = None
+        self.assertEqual([], app.local_history_records())
+
+        record_id = "req_0123456789abcdef"
+        app.HISTORY_STORE_PATH.write_text(
+            json.dumps({"schema": app.HISTORY_SCHEMA, "items": [{"id": record_id}]}),
+            encoding="utf-8",
+        )
+        app.HISTORY_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+        detail_path = app.HISTORY_DETAIL_DIR / f"{record_id}.json"
+        detail_path.write_bytes(b"x" * (app.MAX_HISTORY_DETAIL_FILE_BYTES + 1))
+        app._HISTORY_CACHE = None
+        self.assertEqual([], app.local_history_records())
+
+        detail_path.write_text(
+            json.dumps({"schema": app.HISTORY_SCHEMA, "record": {"id": "req_fedcba9876543210"}}),
+            encoding="utf-8",
+        )
+        app._HISTORY_CACHE = None
+        self.assertEqual([], app.local_history_records())
+
+        previous_scan_limit = app.MAX_HISTORY_DETAIL_SCAN_FILES
+        try:
+            app.MAX_HISTORY_DETAIL_SCAN_FILES = 1
+            (app.HISTORY_DETAIL_DIR / "req_11111111.json").write_text("{}", encoding="utf-8")
+            status = app.history_store_status()
+            self.assertEqual(1, status["detail_files"])
+            self.assertTrue(status["detail_scan_truncated"])
+        finally:
+            app.MAX_HISTORY_DETAIL_SCAN_FILES = previous_scan_limit
+
+    def test_history_account_is_fingerprinted_and_legacy_records_are_migrated(self) -> None:
+        raw_account = "raw-upstream-user-id"
+        record_id = app.start_history_record(
+            surface="openai_chat",
+            model="glm-5.3",
+            user_input="隐私检查",
+            messages=[],
+            account=raw_account,
+        )
+        created = next(item for item in app.local_history_records() if item["id"] == record_id)
+        self.assertEqual(app.sha16(raw_account), created["account"])
+        self.assertEqual(1, created["account_fp_version"])
+        self.assertNotIn(raw_account, (app.HISTORY_DETAIL_DIR / f"{record_id}.json").read_text(encoding="utf-8"))
+
+        legacy_id = "req_legacy_account_record"
+        legacy_record = {
+            "id": legacy_id,
+            "account": "legacy12",
+            "status": "success",
+            "title": "旧记录",
+            "user_input": "旧记录",
+            "messages": [],
+            "files": [],
+            "context_files": [],
+        }
+        app.HISTORY_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
+        (app.HISTORY_DETAIL_DIR / f"{legacy_id}.json").write_text(
+            json.dumps({"schema": app.HISTORY_SCHEMA, "record": legacy_record}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        app.HISTORY_STORE_PATH.write_text(
+            json.dumps({"schema": app.HISTORY_SCHEMA, "items": [{"id": legacy_id}]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        app._HISTORY_CACHE = None
+        app._HISTORY_DIRTY.clear()
+        migrated = app.local_history_records()
+        self.assertEqual(app.sha16("legacy12"), migrated[0]["account"])
+        persisted = json.loads((app.HISTORY_DETAIL_DIR / f"{legacy_id}.json").read_text(encoding="utf-8"))
+        self.assertEqual(app.sha16("legacy12"), persisted["record"]["account"])
+        self.assertEqual(1, persisted["record"]["account_fp_version"])
+
     def test_v4_store_reloads_from_index_and_detail(self) -> None:
         rid = self._make_record("00000000-0000-0000-0000-0000000000e1", "重载问", "重载答")
         app._HISTORY_CACHE = None
@@ -1735,12 +3549,19 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app._history_write_atomic_locked = fail_index
             app.update_history_progress(rid, content="可重试内容", elapsed_ms=100)
             self.assertIn(rid, app._HISTORY_DIRTY, "索引失败后不能丢弃待持久化标记")
+            failed_status = app.history_store_status()
+            self.assertFalse(failed_status["persisted"])
+            self.assertEqual(1, failed_status["pending_writes"])
+            self.assertIn("simulated index write failure", failed_status["error"])
         finally:
             app._history_write_atomic_locked = original_write
 
         with app._HISTORY_LOCK:
-            app._history_persist_locked()
+            self.assertTrue(app._history_persist_locked())
         self.assertNotIn(rid, app._HISTORY_DIRTY)
+        recovered_status = app.history_store_status()
+        self.assertTrue(recovered_status["persisted"])
+        self.assertEqual("", recovered_status["error"])
         index = json.loads(app.HISTORY_STORE_PATH.read_text(encoding="utf-8"))
         self.assertEqual("可重试内容", index["items"][0]["preview"])
 
@@ -1850,13 +3671,14 @@ class ProtocolAdaptersTest(unittest.TestCase):
 
         content = "x" * (app.HISTORY_CONTEXT_FILE_CHARS + 10)
         context_files = app.history_context_files_snapshot(
-            [{"kind": "tools", "name": "tools.txt", "content": content}]
+            [{"kind": "tools", "name": "tools.txt", "content": content, "part": 2, "parts": 3}]
         )
         self.assertEqual(1, len(context_files))
         self.assertEqual("tools", context_files[0]["kind"])
         self.assertEqual(app.HISTORY_CONTEXT_FILE_CHARS, len(context_files[0]["content"]))
         self.assertEqual(len(content), context_files[0]["original_chars"])
         self.assertTrue(context_files[0]["truncated"])
+        self.assertEqual((2, 3), (context_files[0]["part"], context_files[0]["parts"]))
 
     def test_history_record_preserves_upstream_delivery_manifest(self) -> None:
         rid = app.start_history_record(
@@ -1946,7 +3768,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self._make_record(chat_uuid, "本地问", "本地答")
 
         def boom(_state, chat_id):
-            raise RuntimeError("获取对话详情失败: HTTP Error 500: sad")
+            raise app.UpstreamRequestError("获取对话详情失败: HTTP Error 500: sad")
 
         real = (app.get_zai_chat_detail,)
         app.get_zai_chat_detail = boom
@@ -1958,7 +3780,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             self.assertEqual("本地答", data["messages"][1]["content"])
 
             status, body = self.request("GET", f"/api/history/chat?id={self.HISTORY_CHAT_ID}")
-            self.assertEqual(400, status)
+            self.assertEqual(502, status)
             self.assertIn("获取对话详情失败", body)
         finally:
             app.get_zai_chat_detail = real[0]
@@ -1997,16 +3819,78 @@ class ProtocolAdaptersTest(unittest.TestCase):
 
         status, body = self.request("POST", "/api/history/record/delete", {"id": record_id})
         self.assertEqual(200, status)
+        self.assertTrue(json.loads(body)["persisted"])
         status, body = self.request("GET", f"/api/history/record?id={record_id}")
-        self.assertEqual(400, status)
+        self.assertEqual(404, status)
+        self.assertEqual("history_record_not_found", json.loads(body)["error"]["code"])
         self.assertIn("不存在", body)
 
         self._make_record("00000000-0000-0000-0000-0000000000c2", "清空问", "清空答")
         status, body = self.request("POST", "/api/history/clear", {})
         self.assertEqual(200, status)
-        self.assertEqual(1, json.loads(body)["removed"])
+        clear_payload = json.loads(body)
+        self.assertEqual(1, clear_payload["removed"])
+        self.assertTrue(clear_payload["persisted"])
         status, body = self.request("GET", "/api/history/records")
         self.assertEqual(0, json.loads(body)["count"])
+
+    def test_history_delete_and_clear_report_persistence_failure(self) -> None:
+        provider_key = "ghp_" + ("h" * 24)
+        windows_path = "C:" + "\\Users\\history-user\\history.local.json"
+        leaked = f"index write failed token={provider_key} at '{windows_path}'"
+        original_write = app._history_write_atomic_locked
+
+        def fail_index(path: Path, body: str) -> None:
+            if path == app.HISTORY_STORE_PATH:
+                raise OSError(leaked)
+            original_write(path, body)
+
+        record_id = self._make_record(
+            "00000000-0000-0000-0000-0000000000c3",
+            "删除持久化失败",
+            "回答",
+        )
+        app._history_write_atomic_locked = fail_index
+        try:
+            status, raw = self.request("POST", "/api/history/record/delete", {"id": record_id})
+            self.assertEqual(200, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertEqual(1, payload["removed"])
+            self.assertFalse(payload["persisted"])
+            self.assertIn("重启后可能重新出现", payload["message"])
+            self.assertNotIn(provider_key, raw)
+            self.assertNotIn("history-user", raw)
+            store = app.history_store_status()
+            self.assertFalse(store["persisted"])
+            self.assertEqual(1, store["pending_deletes"])
+            self.assertIn("redacted", store["error"])
+        finally:
+            app._history_write_atomic_locked = original_write
+
+        with app._HISTORY_LOCK:
+            self.assertTrue(app._history_persist_locked())
+        self.assertTrue(app.history_store_status()["persisted"])
+
+        self._make_record(
+            "00000000-0000-0000-0000-0000000000c4",
+            "清空持久化失败",
+            "回答",
+        )
+        app._history_write_atomic_locked = fail_index
+        try:
+            status, raw = self.request("POST", "/api/history/clear", {})
+            self.assertEqual(200, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertEqual(1, payload["removed"])
+            self.assertFalse(payload["persisted"])
+            self.assertIn("重启后可能重新出现", payload["message"])
+            self.assertEqual(1, app.history_store_status()["pending_deletes"])
+        finally:
+            app._history_write_atomic_locked = original_write
+
+        with app._HISTORY_LOCK:
+            self.assertTrue(app._history_persist_locked())
+        self.assertTrue(app.history_store_status()["persisted"])
 
     def test_stream_success_records_local_mirror(self) -> None:
         state = fake_state()
@@ -2032,7 +3916,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         ]
         real = (app.new_chat, app.delete_zai_chat, app.urlopen)
         app.new_chat = lambda _s, _p, options=None: ("00000000-0000-0000-0000-0000000000aa", "u1")
-        app.delete_zai_chat = lambda _s, _c: True
+        app.delete_zai_chat = lambda _s, _c, **_kwargs: True
         app.urlopen = lambda _req, timeout=None: FakeResp(chunks)
         try:
             list(
@@ -2066,6 +3950,153 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertTrue(record["completed_at"] > 0)
         self.assertEqual(200, record["status_code"])
 
+    def test_complete_stream_output_budget_marks_history_error_and_cleans_chat(self) -> None:
+        class FakeResp:
+            def __init__(self, chunks: list[bytes]):
+                self._chunks = chunks
+                self.closed = False
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                self.closed = True
+                return False
+
+            def __iter__(self):
+                return iter(self._chunks)
+
+            def close(self):
+                self.closed = True
+
+        chat_id = "00000000-0000-0000-0000-0000000000ad"
+        response = FakeResp(
+            [
+                b'data: {"data":{"delta_content":"12345678","phase":"answer"}}\n\n',
+                b'data: {"data":{"delta_content":"ABCDE","phase":"answer"}}\n\n',
+            ]
+        )
+        previous = (
+            app.new_chat,
+            app.urlopen,
+            app.stream_zai_completion,
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+        )
+        try:
+            app.new_chat = lambda _state, _prompt, options=None: (chat_id, "user-message-id")
+            app.urlopen = lambda _request, timeout=None: response
+            app.stream_zai_completion = self.original_stream
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES = 10
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "输出预算"}],
+                    "stream": False,
+                },
+            )
+        finally:
+            (
+                app.new_chat,
+                app.urlopen,
+                app.stream_zai_completion,
+                app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+            ) = previous
+        self.assertEqual(502, status, raw[:500])
+        self.assertIn("超过 10", raw)
+        self.assertTrue(response.closed)
+        self.assertEqual([chat_id], self.deleted_chats)
+        records = app.local_history_records()
+        self.assertEqual(1, len(records))
+        self.assertEqual("error", records[0]["status"])
+        self.assertEqual("12345678", records[0]["content"])
+        self.assertIn("超过 10", records[0]["error"])
+
+    def test_protocol_stream_adapters_enforce_secondary_output_budget(self) -> None:
+        previous_stream = app.stream_zai_completion
+        previous_limit = app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES
+        stream_closed = 0
+        stream_calls = 0
+
+        def oversized_stream(_state, _prompt, **kwargs):
+            nonlocal stream_closed, stream_calls
+            stream_calls += 1
+            chat_id = f"00000000-0000-0000-0000-{stream_calls:012d}"
+            context = kwargs.get("context_out")
+            if isinstance(context, dict):
+                context["chat_id"] = chat_id
+            try:
+                yield 'data: {"data":{"delta_content":"12345678","phase":"answer"}}'
+                yield 'data: {"data":{"delta_content":"ABCDE","phase":"answer"}}'
+            finally:
+                stream_closed += 1
+
+        cases = [
+            (
+                "/v1/chat/completions",
+                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            ),
+            ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+            (
+                "/v1/messages",
+                {
+                    "model": "glm-5.2",
+                    "max_tokens": 32,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                    "include_thinking": False,
+                },
+            ),
+        ]
+        try:
+            app.stream_zai_completion = oversized_stream
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES = 10
+            results = [self.request("POST", path, body) for path, body in cases]
+        finally:
+            app.stream_zai_completion = previous_stream
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES = previous_limit
+        for status, raw in results:
+            self.assertEqual(200, status, raw[:500])
+            self.assertIn("超过 10", raw)
+        self.assertEqual(3, stream_closed)
+        self.assertEqual(3, len(self.deleted_chats))
+
+    def test_stream_budget_counts_utf8_wire_events_and_bounded_prefix(self) -> None:
+        previous = (
+            app.MAX_UPSTREAM_STREAM_WIRE_BYTES,
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+            app.MAX_UPSTREAM_STREAM_EVENTS,
+        )
+        try:
+            app.MAX_UPSTREAM_STREAM_WIRE_BYTES = 32
+            app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES = 32
+            app.MAX_UPSTREAM_STREAM_EVENTS = 1
+            budget = app.UpstreamStreamBudget()
+            budget.observe_event("四")
+            self.assertEqual(3, budget.wire_bytes)
+            with self.assertRaisesRegex(app.UpstreamResponseTooLarge, "事件数量"):
+                budget.observe_event("second")
+
+            app.MAX_UPSTREAM_STREAM_EVENTS = 10
+            app.MAX_UPSTREAM_STREAM_WIRE_BYTES = 3
+            budget = app.UpstreamStreamBudget()
+            budget.observe_event("四")
+            with self.assertRaisesRegex(app.UpstreamResponseTooLarge, "原始事件"):
+                budget.observe_event("x")
+        finally:
+            (
+                app.MAX_UPSTREAM_STREAM_WIRE_BYTES,
+                app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+                app.MAX_UPSTREAM_STREAM_EVENTS,
+            ) = previous
+
+        parts: list[str] = []
+        retained = app.append_text_prefix(parts, "abcdef", 0, 4)
+        retained = app.append_text_prefix(parts, "ignored", retained, 4)
+        self.assertEqual(4, retained)
+        self.assertEqual("abcd", "".join(parts))
+
     def test_stream_client_disconnect_still_records_partial(self) -> None:
         # ds2api 逻辑：客户端断开 / 停止生成时，已读取的部分内容（含思维链）也要落盘。
         state = fake_state()
@@ -2090,7 +4121,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         ]
         real = (app.new_chat, app.delete_zai_chat, app.urlopen)
         app.new_chat = lambda _s, _p, options=None: ("00000000-0000-0000-0000-0000000000bb", "u1")
-        app.delete_zai_chat = lambda _s, _c: True
+        app.delete_zai_chat = lambda _s, chat_id, **_kwargs: self.deleted_chats.append(chat_id) or True
         app.urlopen = lambda _req, timeout=None: FakeResp(chunks)
         try:
             gen = self.original_stream(
@@ -2116,6 +4147,11 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual("只读到一半就断开", record["user_input"])
         self.assertEqual("PARTIAL", record["content"])
         self.assertTrue(record["completed_at"] > 0)
+        self.assertEqual(
+            ["00000000-0000-0000-0000-0000000000bb"],
+            self.deleted_chats,
+            "直接关闭上游流时也应清理中断会话",
+        )
 
     def test_stream_upstream_error_records_error_status(self) -> None:
         # 上游失败也留痕：status=error + 错误摘要，镜像不丢这次请求的上下文。
@@ -2205,7 +4241,10 @@ class ProtocolAdaptersTest(unittest.TestCase):
             def __iter__(self):
                 return iter(self._chunks)
 
-        chunks = ['data: {"data":{"delta_content":"第二次成功","phase":"answer"}}\n\n'.encode("utf-8")]
+        chunks = [
+            'data: {"data":{"delta_content":"第二次成功","phase":"answer"}}\n\n'.encode("utf-8"),
+            b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+        ]
         real = (app.new_chat, app.delete_zai_chat, app.urlopen)
         calls: list[str] = []
 
@@ -2216,7 +4255,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             return ("00000000-0000-0000-0000-0000000000cc", "u2")
 
         app.new_chat = flaky_new_chat
-        app.delete_zai_chat = lambda _s, _c: True
+        app.delete_zai_chat = lambda _s, _c, **_kwargs: True
         app.urlopen = lambda _req, timeout=None: FakeResp(chunks)
         history_ctx = {
             "surface": "panel_chat",
@@ -2252,7 +4291,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         original_http_json = app.http_json
         state = fake_state()
 
-        def fake_http_json(_method, url, _headers, _payload=None):
+        def fake_http_json(_method, url, _headers, _payload=None, **_kwargs):
             raise app.HTTPError(url, 404, "Not Found", {}, io.BytesIO(b"gone"))
 
         try:
@@ -2279,7 +4318,12 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 return False
 
             def __iter__(self):
-                return iter([b'data: {"data":{"delta_content":"OK","phase":"answer"}}\n\n'])
+                return iter(
+                    [
+                        b'data: {"data":{"delta_content":"OK","phase":"answer"}}\n\n',
+                        b'data: {"data":{"done":true,"phase":"answer"},"type":"chat:completion"}\n\n',
+                    ]
+                )
 
         real = (app.new_chat, app.urlopen)
         app.new_chat = flaky_new_chat
@@ -2307,7 +4351,495 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app._submit_auto_delete(done.set)
             self.assertTrue(done.wait(timeout=5), "后台删除任务应在线程池中执行")
         finally:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
             app._AUTO_DELETE_INLINE = prev_inline
+
+    def test_auto_delete_shutdown_drains_tasks_already_in_queue(self) -> None:
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+        queued_done = threading.Event()
+        prev_inline = app._AUTO_DELETE_INLINE
+
+        def blocker() -> None:
+            blocker_started.set()
+            release_blocker.wait(timeout=5)
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_INLINE = False
+            self.assertTrue(app._submit_auto_delete(blocker))
+            self.assertTrue(blocker_started.wait(timeout=2))
+            self.assertTrue(app._submit_auto_delete(queued_done.set))
+            app._shutdown_auto_delete_executor()
+            release_blocker.set()
+            self.assertTrue(queued_done.wait(timeout=5), "服务关闭不能取消已接收的会话删除任务")
+        finally:
+            release_blocker.set()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_INLINE = prev_inline
+
+    def test_auto_delete_queue_uses_bounded_inline_backpressure(self) -> None:
+        blocker_started = threading.Event()
+        release_blocker = threading.Event()
+        inline_done = threading.Event()
+        prev_inline = app._AUTO_DELETE_INLINE
+        prev_limit = app.AUTO_DELETE_MAX_PENDING
+        before = app.auto_delete_executor_status()["backpressure_total"]
+
+        def blocker() -> None:
+            blocker_started.set()
+            release_blocker.wait(timeout=5)
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_INLINE = False
+            app.AUTO_DELETE_MAX_PENDING = 1
+            self.assertTrue(app._submit_auto_delete(blocker))
+            self.assertTrue(blocker_started.wait(timeout=2))
+            self.assertEqual(1, app.auto_delete_executor_status()["pending"])
+
+            caller_thread = threading.current_thread().name
+            executed_on: list[str] = []
+
+            def fallback() -> None:
+                executed_on.append(threading.current_thread().name)
+                inline_done.set()
+
+            self.assertTrue(app._submit_auto_delete(fallback))
+            self.assertTrue(inline_done.is_set())
+            self.assertEqual([caller_thread], executed_on)
+            status = app.auto_delete_executor_status()
+            self.assertEqual(1, status["pending"])
+            self.assertEqual(before + 1, status["backpressure_total"])
+            self.assertTrue(status["saturated"])
+        finally:
+            release_blocker.set()
+            deadline = time.time() + 5
+            while app.auto_delete_executor_status()["pending"] and time.time() < deadline:
+                time.sleep(0.01)
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_INLINE = prev_inline
+            app.AUTO_DELETE_MAX_PENDING = prev_limit
+
+    def test_journaled_file_cleanup_defers_instead_of_blocking_when_queue_is_full(self) -> None:
+        blocker_started = threading.Event()
+        release = threading.Event()
+        prev_inline = app._AUTO_DELETE_INLINE
+        prev_limit = app.AUTO_DELETE_MAX_PENDING
+        original_delete = app.delete_zai_file
+
+        def blocker() -> None:
+            blocker_started.set()
+            release.wait(timeout=5)
+
+        def must_not_run(*_args, **_kwargs):
+            raise AssertionError("full durable queue must not run cleanup inline")
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = False
+            app.AUTO_DELETE_MAX_PENDING = 1
+            app.delete_zai_file = must_not_run
+            self.assertTrue(app._submit_auto_delete(blocker))
+            self.assertTrue(blocker_started.wait(timeout=2))
+            started = time.monotonic()
+            scheduled = app._best_effort_delete_upstream_files(
+                fake_state(),
+                ["file_deferred_1"],
+                reason="failed_chat",
+            )
+            self.assertFalse(scheduled)
+            self.assertLess(time.monotonic() - started, 0.5)
+            status = app.auto_delete_executor_status()
+            self.assertEqual(1, status["pending"])
+            self.assertEqual(1, status["journal_file_pending"])
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while app.auto_delete_executor_status()["pending"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = prev_inline
+            app.AUTO_DELETE_MAX_PENDING = prev_limit
+            app.delete_zai_file = original_delete
+
+    def test_pending_delete_journal_persists_failure_and_removes_success(self) -> None:
+        state = fake_state()
+        chat_id = "00000000-0000-0000-0000-000000000091"
+        record_id = app.pending_chat_delete_add(state, chat_id, "client_disconnect")
+        self.assertTrue(record_id)
+        self.assertTrue(app.PENDING_DELETE_STORE_PATH.exists())
+        self.assertEqual(1, app.pending_chat_delete_status()["journal_pending"])
+
+        app.pending_chat_delete_failed(record_id, RuntimeError("temporary delete failure"))
+        stored = json.loads(app.PENDING_DELETE_STORE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(1, stored["items"][0]["attempts"])
+        self.assertIn("temporary delete failure", stored["items"][0]["last_error"])
+
+        app.pending_chat_delete_completed(record_id)
+        self.assertEqual(0, app.pending_chat_delete_status()["journal_pending"])
+        self.assertFalse(app.PENDING_DELETE_STORE_PATH.exists())
+
+    def test_pending_delete_store_read_budget_fails_closed(self) -> None:
+        app.PENDING_DELETE_STORE_PATH.write_bytes(b"x" * (app.MAX_PENDING_DELETE_STORE_BYTES + 1))
+        app._PENDING_DELETE_CACHE = None
+        status = app.pending_chat_delete_status()
+        self.assertEqual(0, status["journal_pending"])
+        self.assertTrue(status["journal_store_error"])
+        self.assertEqual(app.MAX_PENDING_DELETE_STORE_BYTES, status["journal_store_max_bytes"])
+
+    def test_pending_delete_replay_matches_account_and_clears_journal(self) -> None:
+        state = fake_state()
+        chat_id = "00000000-0000-0000-0000-000000000092"
+        app.pending_chat_delete_add(state, chat_id, "service_shutdown")
+        profile = app.make_profile(state, label="replay", source="test")
+        original_delete = app.delete_zai_chat
+        calls: list[tuple[str, bool]] = []
+
+        def fake_delete(_state, replay_chat_id, **kwargs):
+            cancel_check = kwargs.get("cancel_check")
+            calls.append((replay_chat_id, callable(cancel_check)))
+            return True
+
+        try:
+            app.delete_zai_chat = fake_delete
+            result = app.replay_pending_chat_deletes({profile.id: profile})
+        finally:
+            app.delete_zai_chat = original_delete
+        self.assertEqual({"retained": 1, "scheduled": 1, "unmatched": 0}, result)
+        self.assertEqual([(chat_id, True)], calls)
+        self.assertEqual(0, app.pending_chat_delete_status()["journal_pending"])
+
+    def test_pending_delete_replay_retains_unmatched_account(self) -> None:
+        state = fake_state()
+        chat_id = "00000000-0000-0000-0000-000000000093"
+        app.pending_chat_delete_add(state, chat_id, "auto_delete")
+        result = app.replay_pending_chat_deletes({})
+        self.assertEqual({"retained": 1, "scheduled": 0, "unmatched": 1}, result)
+        self.assertEqual(1, app.pending_chat_delete_status()["journal_pending"])
+
+    def test_pending_file_delete_replay_uses_same_durable_journal(self) -> None:
+        state = fake_state()
+        file_id = "file_replay_1"
+        app.pending_file_delete_add(state, file_id, "failed_chat")
+        profile = app.make_profile(state, label="file-replay", source="test")
+        original_delete = app.delete_zai_file
+        calls: list[tuple[str, bool]] = []
+
+        def fake_delete(_state, replay_file_id, **kwargs):
+            calls.append((replay_file_id, callable(kwargs.get("cancel_check"))))
+            return True
+
+        try:
+            app.delete_zai_file = fake_delete
+            result = app.replay_pending_deletes({profile.id: profile})
+        finally:
+            app.delete_zai_file = original_delete
+        self.assertEqual({"retained": 1, "scheduled": 1, "unmatched": 0}, result)
+        self.assertEqual([(file_id, True)], calls)
+        status = app.pending_chat_delete_status()
+        self.assertEqual(0, status["journal_pending"])
+        self.assertEqual(0, status["journal_file_pending"])
+
+    def test_pending_delete_replay_feeder_processes_more_than_queue_capacity(self) -> None:
+        state = fake_state()
+        app.pending_resource_deletes_add(
+            state,
+            [("file", f"file_feeder_{index}") for index in range(3)],
+            "failed_chat",
+        )
+        profile = app.make_profile(state, label="feeder", source="test")
+        original_delete = app.delete_zai_file
+        original_inline = app._AUTO_DELETE_INLINE
+        original_limit = app.AUTO_DELETE_MAX_PENDING
+        first_started = threading.Event()
+        release_first = threading.Event()
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+
+        def fake_delete(_state, file_id, **_kwargs):
+            with calls_lock:
+                calls.append(file_id)
+                first = len(calls) == 1
+            if first:
+                first_started.set()
+                release_first.wait(timeout=5)
+            return True
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = False
+            app.AUTO_DELETE_MAX_PENDING = 1
+            app.delete_zai_file = fake_delete
+            result = app.replay_pending_deletes({profile.id: profile})
+            self.assertEqual({"retained": 3, "scheduled": 0, "unmatched": 0}, result)
+            self.assertTrue(first_started.wait(timeout=2))
+            counter_deadline = time.monotonic() + 2
+            status = app.pending_chat_delete_status()
+            while status["replay_deferred"] == 3 and time.monotonic() < counter_deadline:
+                time.sleep(0.01)
+                status = app.pending_chat_delete_status()
+            self.assertTrue(status["replay_active"])
+            self.assertEqual(2, status["replay_deferred"])
+            release_first.set()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                status = app.pending_chat_delete_status()
+                if status["journal_pending"] == 0 and not status["replay_active"]:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(0, status["journal_pending"])
+            self.assertFalse(status["replay_active"])
+            self.assertEqual(0, status["replay_deferred"])
+            self.assertEqual(3, status["replay_scheduled"])
+            self.assertEqual(
+                {"file_feeder_0", "file_feeder_1", "file_feeder_2"},
+                set(calls),
+            )
+        finally:
+            release_first.set()
+            app._shutdown_auto_delete_executor(1.0, cancel_pending=True)
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = original_inline
+            app.AUTO_DELETE_MAX_PENDING = original_limit
+            app.delete_zai_file = original_delete
+
+    def test_auto_delete_shutdown_stops_waiting_replay_feeder(self) -> None:
+        state = fake_state()
+        app.pending_resource_deletes_add(
+            state,
+            [("file", "file_shutdown_feeder_1"), ("file", "file_shutdown_feeder_2")],
+            "failed_chat",
+        )
+        profile = app.make_profile(state, label="shutdown-feeder", source="test")
+        original_inline = app._AUTO_DELETE_INLINE
+        original_limit = app.AUTO_DELETE_MAX_PENDING
+        blocker_started = threading.Event()
+        release = threading.Event()
+
+        def blocker() -> None:
+            blocker_started.set()
+            release.wait(timeout=5)
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = False
+            app.AUTO_DELETE_MAX_PENDING = 1
+            self.assertTrue(app._submit_auto_delete(blocker))
+            self.assertTrue(blocker_started.wait(timeout=2))
+            app.replay_pending_deletes({profile.id: profile})
+            active_deadline = time.monotonic() + 2
+            status = app.pending_chat_delete_status()
+            while not status["replay_active"] and time.monotonic() < active_deadline:
+                time.sleep(0.01)
+                status = app.pending_chat_delete_status()
+            self.assertTrue(status["replay_active"])
+            self.assertEqual(2, status["replay_deferred"])
+            result = app._shutdown_auto_delete_executor()
+            self.assertTrue(result["replay_stopped"])
+            status = app.pending_chat_delete_status()
+            self.assertFalse(status["replay_active"])
+            self.assertEqual(2, status["replay_deferred"])
+            self.assertEqual(2, status["journal_file_pending"])
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while app.auto_delete_executor_status()["pending"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = original_inline
+            app.AUTO_DELETE_MAX_PENDING = original_limit
+
+    def test_pending_delete_v1_chat_store_migrates_to_v2_resource_schema(self) -> None:
+        state = fake_state()
+        chat_id = "00000000-0000-0000-0000-000000000095"
+        legacy = {
+            "schema": app.PENDING_DELETE_LEGACY_SCHEMA,
+            "items": [
+                {
+                    "id": "legacy-id-is-recomputed",
+                    "account_fp": app.sha16(state.user_id),
+                    "chat_id": chat_id,
+                    "reason": "service_shutdown",
+                    "created_at": int(time.time() * 1000),
+                }
+            ],
+        }
+        app.PENDING_DELETE_STORE_PATH.write_text(json.dumps(legacy), encoding="utf-8")
+        app._PENDING_DELETE_CACHE = None
+        status = app.pending_chat_delete_status()
+        self.assertEqual(1, status["journal_chat_pending"])
+        self.assertEqual(0, status["journal_file_pending"])
+
+        app.pending_file_delete_add(state, "file_migration_1", "failed_chat")
+        migrated = json.loads(app.PENDING_DELETE_STORE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual(app.PENDING_DELETE_SCHEMA, migrated["schema"])
+        self.assertEqual({"chat", "file"}, {item["kind"] for item in migrated["items"]})
+        self.assertTrue(all("resource_id" in item for item in migrated["items"]))
+
+    def test_pending_file_batch_uses_one_atomic_journal_write(self) -> None:
+        original_persist = app._pending_delete_persist_locked
+        writes = 0
+
+        def counted_persist() -> bool:
+            nonlocal writes
+            writes += 1
+            return original_persist()
+
+        try:
+            app._pending_delete_persist_locked = counted_persist
+            added = app.pending_resource_deletes_add(
+                fake_state(),
+                [("file", "file_batch_1"), ("file", "file_batch_2"), ("file", "file_batch_3")],
+                "failed_chat",
+            )
+        finally:
+            app._pending_delete_persist_locked = original_persist
+        self.assertEqual(3, len(added))
+        self.assertEqual(1, writes)
+        self.assertEqual(3, app.pending_chat_delete_status()["journal_file_pending"])
+
+    def test_pending_delete_capacity_preserves_chat_before_orphan_files(self) -> None:
+        original_limit = app.PENDING_DELETE_MAX_RECORDS
+        state = fake_state()
+        try:
+            app.PENDING_DELETE_MAX_RECORDS = 2
+            app.pending_file_delete_add(state, "file_evict_first", "failed_chat")
+            app.pending_chat_delete_add(
+                state,
+                "00000000-0000-0000-0000-000000000096",
+                "service_shutdown",
+            )
+            app.pending_chat_delete_add(
+                state,
+                "00000000-0000-0000-0000-000000000097",
+                "service_shutdown",
+            )
+            status = app.pending_chat_delete_status()
+            self.assertEqual(2, status["journal_chat_pending"])
+            self.assertEqual(0, status["journal_file_pending"])
+        finally:
+            app.PENDING_DELETE_MAX_RECORDS = original_limit
+
+    def test_failed_orphan_file_cleanup_remains_in_restart_journal(self) -> None:
+        original_delete = app.delete_zai_file
+        state = fake_state()
+
+        def failing_delete(_state, _file_id, **_kwargs):
+            raise app.UpstreamRequestError("temporary file cleanup outage")
+
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        try:
+            app.delete_zai_file = failing_delete
+            handler._cleanup_failed_upstream_files(
+                state,
+                [{"id": "file_orphan_1"}, {"file": {"id": "file_orphan_2"}}],
+            )
+        finally:
+            app.delete_zai_file = original_delete
+        status = app.pending_chat_delete_status()
+        self.assertEqual(2, status["journal_pending"])
+        self.assertEqual(2, status["journal_file_pending"])
+        stored = json.loads(app.PENDING_DELETE_STORE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual({1}, {item["attempts"] for item in stored["items"]})
+
+    def test_auto_delete_bounded_shutdown_cancels_only_queued_tasks(self) -> None:
+        prev_inline = app._AUTO_DELETE_INLINE
+        started = threading.Barrier(app.AUTO_DELETE_WORKERS + 1)
+        release = threading.Event()
+        queued_ran = threading.Event()
+        cancelled_before = app.auto_delete_executor_status()["cancelled_total"]
+
+        def blocker() -> None:
+            started.wait(timeout=2)
+            release.wait(timeout=5)
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = False
+            for _ in range(app.AUTO_DELETE_WORKERS):
+                self.assertTrue(app._submit_auto_delete(blocker))
+            started.wait(timeout=2)
+            self.assertTrue(app._submit_auto_delete(queued_ran.set))
+            result = app._shutdown_auto_delete_executor(0.05, cancel_pending=True)
+            self.assertFalse(result["drained"])
+            self.assertFalse(queued_ran.is_set())
+            self.assertGreaterEqual(
+                app.auto_delete_executor_status()["cancelled_total"],
+                cancelled_before + 1,
+            )
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while app.auto_delete_executor_status()["pending"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = prev_inline
+
+    def test_delete_chat_uses_short_timeout_and_stops_before_retry(self) -> None:
+        original_http_json = app.http_json
+        calls: list[float] = []
+        checks = 0
+
+        def fake_http_json(_method, _url, _headers, _payload=None, **kwargs):
+            calls.append(float(kwargs.get("timeout") or 0))
+            raise app.URLError(TimeoutError("delete timeout"))
+
+        def cancelled() -> bool:
+            nonlocal checks
+            checks += 1
+            return checks >= 2
+
+        try:
+            app.http_json = fake_http_json
+            with self.assertRaises(app.ServiceShuttingDown):
+                self.original_delete(
+                    fake_state(),
+                    "00000000-0000-0000-0000-000000000094",
+                    cancel_check=cancelled,
+                )
+        finally:
+            app.http_json = original_http_json
+        self.assertEqual([app.AUTO_DELETE_REQUEST_TIMEOUT_SECONDS], calls)
+
+    def test_delete_file_uses_short_timeout_and_honors_shutdown(self) -> None:
+        original_http_json = app.http_json
+        calls: list[float] = []
+
+        def fake_http_json(_method, _url, _headers, _payload=None, **kwargs):
+            calls.append(float(kwargs.get("timeout") or 0))
+            raise app.URLError(TimeoutError("file delete timeout"))
+
+        try:
+            app.http_json = fake_http_json
+            with self.assertRaises(app.URLError):
+                app.delete_zai_file(fake_state(), "file_timeout_1")
+            with self.assertRaises(app.ServiceShuttingDown):
+                app.delete_zai_file(
+                    fake_state(),
+                    "file_timeout_2",
+                    cancel_check=lambda: True,
+                )
+        finally:
+            app.http_json = original_http_json
+        self.assertEqual([app.AUTO_DELETE_REQUEST_TIMEOUT_SECONDS], calls)
 
     def test_api_surfaces_return_thinking_by_default(self) -> None:
         """API 协议面默认回传思维链；请求体 include_thinking:false 可显式关闭。"""
@@ -2526,7 +5058,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
         )
 
-        def fake_http_json(_method, url, headers, _payload=None):
+        def fake_http_json(_method, url, headers, _payload=None, **_kwargs):
             calls.append(dict(headers))
             if len(calls) == 1:
                 raise app.HTTPError(url, 403, "Forbidden", {}, io.BytesIO(b"blocked"))
@@ -2559,6 +5091,19 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual("har", summary["source_type"])
         self.assertTrue(summary["duplicate_user"])
         self.assertEqual(app.sha16("same-user"), summary["user_id_fp"])
+        self.assertNotIn("user_id", summary)
+        for field in (
+            "source",
+            "har_fp",
+            "loaded_at",
+            "device_id_fp",
+            "captcha_fp",
+            "chat_id",
+            "default_model",
+            "supported_models",
+        ):
+            self.assertNotIn(field, summary)
+        self.assertNotIn("open-reverselab", json.dumps(summary, ensure_ascii=False))
 
         profiles = {p1.id: p1, p2.id: p2, p3.id: p3}
         incoming_other = app.make_profile(
@@ -2578,12 +5123,161 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn(p2.id, profiles)
         self.assertIn(p3.id, profiles)
 
+    def test_profile_capacity_allows_refresh_but_rejects_new_account(self) -> None:
+        previous_limit = app.MAX_ACCOUNT_PROFILES
+        try:
+            app.MAX_ACCOUNT_PROFILES = 2
+            first = app.make_profile(
+                replace(fake_state(), user_id="capacity-a", token="capacity-token-a"),
+                "A",
+                "test",
+            )
+            second = app.make_profile(
+                replace(fake_state(), user_id="capacity-b", token="capacity-token-b"),
+                "B",
+                "test",
+            )
+            profiles = {first.id: first, second.id: second}
+            refreshed = app.make_profile(
+                replace(fake_state(), user_id="capacity-b", token="capacity-token-b2"),
+                "B refreshed",
+                "test",
+            )
+            self.assertEqual(second.id, app.merge_profile(profiles, refreshed))
+            self.assertEqual(2, len(profiles))
+            incoming = app.make_profile(
+                replace(fake_state(), user_id="capacity-c", token="capacity-token-c"),
+                "C",
+                "test",
+            )
+            with self.assertRaisesRegex(app.ProfileCapacityError, "账号池已达到 2"):
+                app.merge_profile(profiles, incoming)
+            self.assertEqual(2, len(profiles))
+        finally:
+            app.MAX_ACCOUNT_PROFILES = previous_limit
+
+    def test_login_state_fields_are_bounded_before_profile_retention(self) -> None:
+        with self.assertRaisesRegex(ValueError, "token 超过"):
+            app.jwt_payload_claims("x" * (app.MAX_SESSION_TOKEN_CHARS + 1))
+        oversized = replace(
+            fake_state(),
+            user_agent="u" * (app.MAX_PROFILE_STATE_FIELD_CHARS + 1),
+        )
+        with self.assertRaisesRegex(ValueError, "user_agent"):
+            app.make_profile(oversized, "oversized", "test")
+
+    def test_token_auth_returns_conflict_when_profile_pool_is_full(self) -> None:
+        previous_limit = app.MAX_ACCOUNT_PROFILES
+        try:
+            app.MAX_ACCOUNT_PROFILES = 1
+            existing = app.make_profile(
+                replace(fake_state(), user_id="capacity-existing", token="capacity-existing-token"),
+                "existing",
+                "test",
+            )
+            QuietProxyHandler.profiles = {existing.id: existing}
+            QuietProxyHandler.active_profile_id = existing.id
+            QuietProxyHandler.state = existing.state
+            claims = app.base64.urlsafe_b64encode(
+                json.dumps({"id": "capacity-new", "name": "new"}).encode("utf-8")
+            ).decode("ascii").rstrip("=")
+            status, raw = self.request(
+                "POST",
+                "/api/auth/token",
+                {"token": f"e30.{claims}.signature", "label": "new"},
+            )
+            self.assertEqual(409, status, raw[:500])
+            error = json.loads(raw)["error"]
+            self.assertEqual("profile_capacity_reached", error["code"])
+            self.assertEqual(1, error["max_profiles"])
+            self.assertEqual(1, len(QuietProxyHandler.profiles))
+        finally:
+            app.MAX_ACCOUNT_PROFILES = previous_limit
+
+    def test_profiles_api_does_not_expose_internal_auth_or_chat_metadata(self) -> None:
+        state = replace(
+            fake_state(),
+            chat_id="00000000-0000-0000-0000-000000000080",
+            device_id="private-device-id",
+            captcha_verify_param="private-captcha",
+        )
+        source_path = "D:" + "\\private-workspace\\captures\\account.har"
+        profile = app.make_profile(state, "managed account", source_path, har_fp="private-har-fingerprint")
+        QuietProxyHandler.profiles = {profile.id: profile}
+        QuietProxyHandler.active_profile_id = profile.id
+        QuietProxyHandler.state = state
+        status, raw = self.request("GET", "/api/auth/profiles")
+        self.assertEqual(200, status, raw[:500])
+        payload = json.loads(raw)
+        self.assertEqual(1, payload["profile_count"])
+        self.assertEqual(app.MAX_ACCOUNT_PROFILES, payload["max_profiles"])
+        self.assertEqual(app.MAX_ACCOUNT_PROFILES - 1, payload["profile_slots_available"])
+        self.assertFalse(payload["profile_limit_reached"])
+        summary = payload["profiles"][0]
+        self.assertEqual("本地 HAR: account.har", summary["source_display"])
+        for forbidden in (
+            state.chat_id,
+            state.device_id,
+            state.captcha_verify_param,
+            profile.har_fp,
+            "private-workspace",
+        ):
+            self.assertNotIn(forbidden, raw)
+        self.assertNotIn("source", summary)
+        self.assertNotIn("chat_id", summary)
+        self.assertNotIn("supported_models", summary)
+
+    def test_profile_switch_reports_encrypted_store_write_failure(self) -> None:
+        profile_a = app.make_profile(
+            replace(fake_state(), user_id="persist-a", token="persist-token-a"),
+            "persist A",
+            "test",
+        )
+        profile_b = app.make_profile(
+            replace(fake_state(), user_id="persist-b", token="persist-token-b"),
+            "persist B",
+            "test",
+        )
+        QuietProxyHandler.profiles = {profile_a.id: profile_a, profile_b.id: profile_b}
+        QuietProxyHandler.active_profile_id = profile_a.id
+        QuietProxyHandler.state = profile_a.state
+        provider_key = "ghp_" + ("p" * 24)
+        windows_path = "C:" + "\\Users\\persist-user\\profiles.local.json"
+        original_save = app.save_profile_store
+
+        def failing_save(*_args, **_kwargs):
+            raise OSError(f"disk full token={provider_key} at '{windows_path}'")
+
+        app.save_profile_store = failing_save
+        try:
+            status, raw = self.request("POST", "/api/auth/switch", {"profile_id": profile_b.id})
+            self.assertEqual(200, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertTrue(payload["ok"])
+            self.assertFalse(payload["persisted"])
+            self.assertFalse(payload["profile_store"]["persisted"])
+            self.assertIn("保存失败", payload["message"])
+            self.assertIn("redacted", payload["profile_store_error"])
+            self.assertEqual(profile_b.id, QuietProxyHandler.active_profile_id)
+            self.assertIs(profile_b.state, QuietProxyHandler.state)
+            self.assertNotIn(provider_key, raw)
+            self.assertNotIn("persist-user", raw)
+
+            profiles_status, profiles_raw = self.request("GET", "/api/auth/profiles")
+            self.assertEqual(200, profiles_status, profiles_raw[:500])
+            profiles_payload = json.loads(profiles_raw)
+            self.assertFalse(profiles_payload["profile_store"]["persisted"])
+            self.assertIn("redacted", profiles_payload["profile_store"]["error"])
+        finally:
+            app.save_profile_store = original_save
+
     def test_api_key_can_be_configured_from_panel(self) -> None:
         status, raw = self.request("POST", "/api/settings/api-key", {"api_key": "panel-secret-1"})
         self.assertEqual(200, status)
         data = json.loads(raw)
         self.assertTrue(data["ok"])
         self.assertTrue(data["enabled"])
+        self.assertTrue(data["persisted"])
         self.assertEqual("store", data["source"])
 
         status, raw = self.request("GET", "/api/settings/api-key")
@@ -2619,6 +5313,211 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertFalse(json.loads(raw)["enabled"])
         self.assertEqual(QuietProxyHandler.api_key, "")
 
+    def test_api_key_configuration_rejects_oversize_and_control_characters(self) -> None:
+        oversized = "k" * (app.MAX_LOCAL_API_KEY_CHARS + 1)
+        for invalid in (oversized, "valid-prefix\u0000invalid-suffix"):
+            status, raw = self.request("POST", "/api/settings/api-key", {"api_key": invalid})
+            self.assertEqual(400, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertEqual("invalid_api_key_config", payload["error"]["code"])
+            self.assertFalse(QuietProxyHandler.api_key)
+            self.assertFalse(QuietProxyHandler.api_key_store_path.exists())
+
+        self.assertEqual("short-key", app.normalize_local_api_key("  short-key  "))
+        self.assertTrue(app.local_api_keys_match("short-key", "short-key"))
+        self.assertFalse(app.local_api_keys_match(oversized, "short-key"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store_path = Path(tmp) / "apikey.local.json"
+            with self.assertRaisesRegex(ValueError, "4096"):
+                app.save_api_key_store(oversized, store_path)
+            self.assertFalse(store_path.exists())
+
+            store_path.write_bytes(b"x" * (app.MAX_API_KEY_STORE_BYTES + 1))
+            loaded, saved_at, error = app.load_api_key_store(store_path)
+            self.assertEqual(("", ""), (loaded, saved_at))
+            self.assertIn("store exceeds", error)
+
+            store_path.write_text(
+                json.dumps(
+                    {
+                        "encryption": "windows-dpapi-current-user",
+                        "saved_at": "2026-09-02T00:00:00+08:00",
+                        "payload": app.base64.b64encode(b"encrypted").decode("ascii"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original_unprotect = app.dpapi_unprotect
+            app.dpapi_unprotect = lambda _raw: json.dumps({"api_key": oversized}).encode("utf-8")
+            try:
+                loaded, saved_at, error = app.load_api_key_store(store_path)
+            finally:
+                app.dpapi_unprotect = original_unprotect
+            self.assertEqual("", loaded)
+            self.assertEqual("", saved_at)
+            self.assertIn("已保存 API Key 超过", error)
+
+    def test_config_store_write_failures_are_server_errors_and_observable(self) -> None:
+        provider_key = "ghp_" + ("w" * 24)
+        windows_path = "C:" + "\\Users\\config-user\\local-state.json"
+        leaked = f"disk full token={provider_key} at '{windows_path}'"
+        original_settings = dict(QuietProxyHandler.settings)
+        original_save_settings = app.save_local_settings
+        original_save_api_key = app.save_api_key_store
+
+        def failing_save(*_args, **_kwargs):
+            raise OSError(leaked)
+
+        app.save_local_settings = failing_save
+        app.save_api_key_store = failing_save
+        try:
+            status, raw = self.request(
+                "POST",
+                "/api/settings",
+                {"settings": {"model": "glm-5.2", "include_thinking": True}},
+            )
+            self.assertEqual(500, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertEqual("settings_store_write_failed", payload["error"]["code"])
+            self.assertEqual(original_settings, QuietProxyHandler.settings)
+            self.assertNotIn(provider_key, raw)
+            self.assertNotIn("config-user", raw)
+
+            get_status, get_raw = self.request("GET", "/api/settings")
+            self.assertEqual(200, get_status, get_raw[:500])
+            settings_payload = json.loads(get_raw)
+            self.assertFalse(settings_payload["persisted"])
+            self.assertIn("redacted", settings_payload["error"])
+
+            status_status, status_raw = self.request("GET", "/api/status")
+            self.assertEqual(200, status_status, status_raw[:500])
+            status_payload = json.loads(status_raw)
+            self.assertFalse(status_payload["settings_store"]["persisted"])
+            self.assertIn("redacted", status_payload["settings_store"]["error"])
+
+            status, raw = self.request(
+                "POST",
+                "/api/settings/api-key",
+                {"api_key": "new-local-key"},
+            )
+            self.assertEqual(500, status, raw[:500])
+            payload = json.loads(raw)
+            self.assertEqual("api_key_store_write_failed", payload["error"]["code"])
+            self.assertEqual("", QuietProxyHandler.api_key)
+            self.assertNotIn(provider_key, raw)
+            self.assertNotIn("config-user", raw)
+
+            get_status, get_raw = self.request("GET", "/api/settings/api-key")
+            self.assertEqual(200, get_status, get_raw[:500])
+            api_key_payload = json.loads(get_raw)
+            self.assertFalse(api_key_payload["persisted"])
+            self.assertIn("redacted", api_key_payload["error"])
+        finally:
+            app.save_local_settings = original_save_settings
+            app.save_api_key_store = original_save_api_key
+
+    def test_concurrent_settings_saves_publish_in_disk_commit_order(self) -> None:
+        handler = object.__new__(QuietProxyHandler)
+        original_save = app.save_local_settings
+        tracking_lock = threading.Lock()
+        start = threading.Event()
+        writes: list[str] = []
+        errors: list[BaseException] = []
+        active = 0
+        peak = 0
+
+        def fake_save(settings, _path):
+            nonlocal active, peak
+            model = str(settings["model"])
+            with tracking_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with tracking_lock:
+                writes.append(model)
+                active -= 1
+            return f"saved:{model}"
+
+        def worker(model: str) -> None:
+            start.wait(timeout=1)
+            try:
+                handler._save_settings({"model": model})
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        app.save_local_settings = fake_save
+        threads = [
+            threading.Thread(target=worker, args=("glm-5.2",)),
+            threading.Thread(target=worker, args=("glm-5.3",)),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual([], errors)
+            self.assertEqual(1, peak)
+            self.assertEqual(2, len(writes))
+            self.assertEqual(writes[-1], QuietProxyHandler.settings["model"])
+            self.assertEqual(f"saved:{writes[-1]}", QuietProxyHandler.settings_saved_at)
+        finally:
+            app.save_local_settings = original_save
+
+    def test_concurrent_api_key_initialization_allows_only_one_winner(self) -> None:
+        handler = object.__new__(QuietProxyHandler)
+        original_save = app.save_api_key_store
+        tracking_lock = threading.Lock()
+        start = threading.Event()
+        writes: list[str] = []
+        successes: list[str] = []
+        errors: list[BaseException] = []
+        active = 0
+        peak = 0
+
+        def fake_save(api_key, _path):
+            nonlocal active, peak
+            with tracking_lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with tracking_lock:
+                writes.append(api_key)
+                active -= 1
+            return f"saved:{api_key}"
+
+        def worker(api_key: str) -> None:
+            start.wait(timeout=1)
+            try:
+                handler._save_api_key_from_panel(api_key, "")
+                successes.append(api_key)
+            except BaseException as exc:
+                errors.append(exc)
+
+        app.save_api_key_store = fake_save
+        threads = [
+            threading.Thread(target=worker, args=("concurrent-key-a",)),
+            threading.Thread(target=worker, args=("concurrent-key-b",)),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join(timeout=2)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(1, peak)
+            self.assertEqual(1, len(writes))
+            self.assertEqual(1, len(successes))
+            self.assertEqual(1, len(errors))
+            self.assertIsInstance(errors[0], PermissionError)
+            self.assertEqual(writes[0], QuietProxyHandler.api_key)
+            self.assertEqual(successes[0], QuietProxyHandler.api_key)
+        finally:
+            app.save_api_key_store = original_save
+
     def test_api_key_protection_covers_status_and_api_routes(self) -> None:
         original_api_key = QuietProxyHandler.api_key
         try:
@@ -2650,13 +5549,22 @@ class ProtocolAdaptersTest(unittest.TestCase):
             self.assertEqual(200, status)
             data = json.loads(raw)
             self.assertTrue(data["api_key_valid"])
-            self.assertEqual("test-user", data["user_name"])
+            self.assertNotIn("user_name", data)
+            self.assertNotIn("profile_label", data)
+            self.assertEqual(app.sha16("test-user"), data["user_id_fp"])
 
             status, raw = self.request("GET", "/api/auth/profiles", headers={"Authorization": "Bearer test-api-key"})
             self.assertEqual(200, status)
             self.assertTrue(json.loads(raw)["ok"])
 
             status, raw = self.request("GET", "/api/auth/profiles", headers={"X-API-Key": "wrong-key"})
+            self.assertEqual(401, status)
+
+            status, raw = self.request(
+                "GET",
+                "/api/auth/profiles",
+                headers={"X-API-Key": "x" * (app.MAX_LOCAL_API_KEY_CHARS + 1)},
+            )
             self.assertEqual(401, status)
         finally:
             QuietProxyHandler.api_key = original_api_key
@@ -2684,6 +5592,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual(200, status)
         data = json.loads(raw)
         self.assertTrue(data["ok"])
+        self.assertTrue(data["persisted"])
         self.assertEqual("glm-5.2", data["settings"]["model"])
         self.assertTrue(data["settings"]["auto_web_search"])
         self.assertFalse(data["settings"]["enable_thinking"])
@@ -2691,6 +5600,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertTrue(data["settings"]["include_thinking"])
         self.assertFalse(data["settings"]["delete_chat_after_completion"])
         self.assertEqual(600, data["settings"]["upstream_timeout_sec"])
+        self.assertEqual(app.MAX_SETTINGS_STORE_BYTES, data["max_bytes"])
 
         status, raw = self.request("GET", "/api/status")
         self.assertEqual(200, status)
@@ -2699,6 +5609,8 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertEqual("glm-5.2", defaults["model"])
         self.assertTrue(defaults["include_thinking"])
         self.assertEqual(600, status_data["upstream_timeout_sec"])
+        self.assertTrue(status_data["settings_store"]["persisted"])
+        self.assertEqual("", status_data["settings_store"]["error"])
 
     def test_local_settings_roundtrip_and_partial_normalization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2739,6 +5651,59 @@ class ProtocolAdaptersTest(unittest.TestCase):
         invalid = app.normalize_local_settings({"upstream_timeout_sec": "abc"})
         self.assertEqual(app.UPSTREAM_STREAM_TIMEOUT_SEC, invalid["upstream_timeout_sec"])
 
+    def test_settings_store_read_budget_falls_back_to_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "settings.local.json"
+            path.write_bytes(b"x" * (app.MAX_SETTINGS_STORE_BYTES + 1))
+            loaded, saved_at, error = app.load_local_settings(path)
+            self.assertEqual(app.local_settings_defaults(), loaded)
+            self.assertEqual("", saved_at)
+            self.assertIn("settings store exceeds", error)
+
+    def test_profile_store_rejects_oversize_capacity_and_invalid_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "profiles.local.json"
+            path.write_bytes(b"x" * (app.MAX_PROFILE_STORE_BYTES + 1))
+            with self.assertRaisesRegex(ValueError, "profile store exceeds"):
+                app.load_profile_store(path)
+
+            path.write_text(
+                json.dumps(
+                    {
+                        "encryption": "windows-dpapi-current-user",
+                        "payload": app.base64.b64encode(b"encrypted").decode("ascii"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            original_unprotect = app.dpapi_unprotect
+            try:
+                app.dpapi_unprotect = lambda _raw: b"x" * (app.MAX_PROFILE_STORE_PAYLOAD_BYTES + 1)
+                with self.assertRaisesRegex(ValueError, "profile store payload exceeds"):
+                    app.load_profile_store(path)
+
+                too_many = {"profiles": [{} for _ in range(app.MAX_ACCOUNT_PROFILES + 1)]}
+                app.dpapi_unprotect = lambda _raw: json.dumps(too_many).encode("utf-8")
+                with self.assertRaisesRegex(app.ProfileCapacityError, "64 profiles"):
+                    app.load_profile_store(path)
+
+                profile = app.make_profile(fake_state(), "valid", "test")
+                invalid_item = app.profile_to_dict(profile)
+                invalid_item["id"] = "profile_bad\r\nX-Injected"
+                app.dpapi_unprotect = lambda _raw: json.dumps({"profiles": [invalid_item]}).encode("utf-8")
+                with self.assertRaisesRegex(ValueError, "profile id is invalid"):
+                    app.load_profile_store(path)
+
+                valid_item = app.profile_to_dict(profile)
+                app.dpapi_unprotect = lambda _raw: json.dumps(
+                    {"profiles": [valid_item], "active_profile_id": profile.id}
+                ).encode("utf-8")
+                loaded, active, _saved_at = app.load_profile_store(path)
+                self.assertEqual([profile.id], list(loaded))
+                self.assertEqual(profile.id, active)
+            finally:
+                app.dpapi_unprotect = original_unprotect
+
     def test_streaming_responses_and_anthropic_events(self) -> None:
         response_tools = [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]
         status, stream = self.request(
@@ -2769,6 +5734,304 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn('"type": "tool_use"', stream)
         self.assertIn("event: message_stop", stream)
         self.assertEqual(2, len(self.deleted_chats))
+
+    def test_all_streaming_surfaces_forward_upstream_idle_heartbeat(self) -> None:
+        original_stream = app.stream_zai_completion
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+
+        def heartbeat_stream(_state, _prompt, **kwargs):
+            context = kwargs.get("context_out")
+            if isinstance(context, dict):
+                context["chat_id"] = "00000000-0000-0000-0000-000000000086"
+            yield app.UPSTREAM_IDLE_HEARTBEAT_EVENT
+            yield 'data: {"data":{"delta_content":"ok","phase":"answer"}}'
+
+        app.stream_zai_completion = heartbeat_stream
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0
+        try:
+            requests = [
+                ("/v1/chat/completions", {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+                ("/v1/messages", {"model": "glm-5.2", "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}], "stream": True}),
+                ("/api/chat", {"model": "glm-5.2", "message": "hi", "stream": True}),
+            ]
+            results = [self.request("POST", path, body) for path, body in requests]
+        finally:
+            app.stream_zai_completion = original_stream
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        for status, raw in results:
+            self.assertEqual(200, status, raw[:500])
+            self.assertIn(": keep-alive\n\n", raw)
+
+    def test_heartbeat_pump_covers_block_before_first_upstream_event(self) -> None:
+        original_stream = app.stream_zai_completion
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+        before = app.sse_heartbeat_status()
+
+        def delayed_stream(_state, _prompt, **kwargs):
+            context = kwargs.get("context_out")
+            if isinstance(context, dict):
+                context["chat_id"] = "00000000-0000-0000-0000-000000000085"
+            time.sleep(0.07)
+            yield 'data: {"data":{"delta_content":"PUMP_RESUMED","phase":"answer"}}'
+
+        app.stream_zai_completion = delayed_stream
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        try:
+            requests = [
+                (
+                    "/v1/chat/completions",
+                    {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                ),
+                ("/v1/responses", {"model": "glm-5.2", "input": "hi", "stream": True}),
+                (
+                    "/v1/messages",
+                    {
+                        "model": "glm-5.2",
+                        "max_tokens": 32,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                ),
+                ("/api/chat", {"model": "glm-5.2", "message": "hi", "stream": True}),
+            ]
+            results = [self.request("POST", path, body) for path, body in requests]
+        finally:
+            app.stream_zai_completion = original_stream
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        for status, raw in results:
+            self.assertEqual(200, status, raw[:500])
+            self.assertIn(": keep-alive\n\n", raw)
+            self.assertLess(raw.index(": keep-alive"), raw.index("PUMP_RESUMED"))
+        after = app.sse_heartbeat_status()
+        self.assertGreaterEqual(after["started_total"] - before["started_total"], 4)
+        self.assertGreaterEqual(after["sent_total"] - before["sent_total"], 4)
+        self.assertEqual(0, after["active"])
+
+    def test_heartbeat_pump_starts_before_protocol_attachment_preparation(self) -> None:
+        original_prepare = app.prepare_protocol_upstream_request
+        original_stream = app.stream_zai_completion
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+
+        def delayed_prepare(state, request, trace_out=None):
+            time.sleep(0.07)
+            return original_prepare(state, request, trace_out=trace_out)
+
+        def immediate_stream(_state, _prompt, **kwargs):
+            context = kwargs.get("context_out")
+            if isinstance(context, dict):
+                context["chat_id"] = "00000000-0000-0000-0000-000000000084"
+            yield 'data: {"data":{"delta_content":"PREPARED","phase":"answer"}}'
+
+        app.prepare_protocol_upstream_request = delayed_prepare
+        app.stream_zai_completion = immediate_stream
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            )
+        finally:
+            app.prepare_protocol_upstream_request = original_prepare
+            app.stream_zai_completion = original_stream
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        self.assertEqual(200, status, raw[:500])
+        self.assertIn(": keep-alive\n\n", raw)
+        self.assertLess(raw.index(": keep-alive"), raw.index("PREPARED"))
+
+    def test_streaming_setup_failure_stays_inside_sse_protocol(self) -> None:
+        original_prepare = app.prepare_protocol_upstream_request
+
+        def failing_prepare(*_args, **_kwargs):
+            raise RuntimeError("simulated protocol preparation failure")
+
+        app.prepare_protocol_upstream_request = failing_prepare
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {"model": "glm-5.2", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            )
+        finally:
+            app.prepare_protocol_upstream_request = original_prepare
+        self.assertEqual(200, status, raw[:500])
+        self.assertIn("simulated protocol preparation failure", raw)
+        self.assertIn('"object": "error"', raw)
+        self.assertTrue(raw.endswith("data: [DONE]\n\n"), raw[-300:])
+
+    def test_heartbeat_pump_write_failure_is_surfaced_and_stops(self) -> None:
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+        before_errors = app.sse_heartbeat_status()["errors_total"]
+
+        class FailingWriter:
+            def write(self, raw):
+                if raw.startswith(b": keep-alive"):
+                    raise BrokenPipeError("simulated downstream disconnect")
+                return len(raw)
+
+            def flush(self):
+                return None
+
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        handler.wfile = FailingWriter()
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0.02
+        try:
+            handler._ensure_sse_state()
+            handler._start_sse_heartbeat_pump()
+            deadline = time.time() + 1
+            while handler._sse_heartbeat_error is None and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertIsNotNone(handler._sse_heartbeat_error)
+            with self.assertRaisesRegex(ConnectionResetError, "downstream SSE heartbeat failed"):
+                handler._sse_write("delta", {"delta": "late"})
+            with self.assertRaisesRegex(ConnectionResetError, "downstream SSE heartbeat failed"):
+                handler._check_sse_heartbeat()
+        finally:
+            handler._stop_sse_heartbeat_pump()
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        status = app.sse_heartbeat_status()
+        self.assertEqual(before_errors + 1, status["errors_total"])
+        self.assertEqual(0, status["active"])
+
+    def test_sse_write_lock_keeps_concurrent_frames_atomic(self) -> None:
+        original_interval = app.SSE_KEEPALIVE_INTERVAL_SECONDS
+
+        class SlowWriter:
+            def __init__(self):
+                self.data = bytearray()
+
+            def write(self, raw):
+                for value in raw:
+                    self.data.append(value)
+                    time.sleep(0)
+                return len(raw)
+
+            def flush(self):
+                return None
+
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        writer = SlowWriter()
+        handler.wfile = writer
+        handler._ensure_sse_state()
+        app.SSE_KEEPALIVE_INTERVAL_SECONDS = 0
+        barrier = threading.Barrier(3)
+
+        def write_events():
+            barrier.wait()
+            for index in range(20):
+                handler._sse_write("delta", {"index": index, "text": "x" * 8})
+
+        def write_heartbeats():
+            barrier.wait()
+            for _ in range(20):
+                handler._sse_keepalive()
+
+        workers = [threading.Thread(target=write_events), threading.Thread(target=write_heartbeats)]
+        try:
+            for worker in workers:
+                worker.start()
+            barrier.wait()
+            for worker in workers:
+                worker.join(timeout=3)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+        finally:
+            app.SSE_KEEPALIVE_INTERVAL_SECONDS = original_interval
+        frames = writer.data.decode("utf-8").split("\n\n")
+        frames = [frame for frame in frames if frame]
+        self.assertEqual(40, len(frames))
+        self.assertEqual(20, sum(frame == ": keep-alive" for frame in frames))
+        event_frames = [frame for frame in frames if frame != ": keep-alive"]
+        for frame in event_frames:
+            event_line, data_line = frame.split("\n", 1)
+            self.assertEqual("event: delta", event_line)
+            json.loads(data_line.removeprefix("data: "))
+
+    def test_stream_cancel_check_stops_between_upstream_phases(self) -> None:
+        state = fake_state()
+        original_new_chat = app.new_chat
+        original_urlopen = app.urlopen
+        urlopen_calls = 0
+
+        def fake_new_chat(*_args, **_kwargs):
+            return "00000000-0000-0000-0000-000000000083", "u1"
+
+        def forbidden_urlopen(*_args, **_kwargs):
+            nonlocal urlopen_calls
+            urlopen_calls += 1
+            raise AssertionError("completion request must not start after cancellation")
+
+        checks = 0
+
+        def cancel_after_chat():
+            nonlocal checks
+            checks += 1
+            if checks >= 2:
+                raise ConnectionResetError("cancelled after chat creation")
+
+        app.new_chat = fake_new_chat
+        app.urlopen = forbidden_urlopen
+        context: dict = {}
+        try:
+            with self.assertRaisesRegex(ConnectionResetError, "cancelled after chat creation"):
+                list(
+                    self.original_stream(
+                        state,
+                        "hi",
+                        options=app.ChatOptions(model="glm-5.2"),
+                        context_out=context,
+                        cancel_check=cancel_after_chat,
+                    )
+                )
+        finally:
+            app.new_chat = original_new_chat
+            app.urlopen = original_urlopen
+        self.assertEqual(0, urlopen_calls)
+        self.assertEqual("00000000-0000-0000-0000-000000000083", context["chat_id"])
+
+    def test_stream_cancel_after_connect_closes_unconsumed_response(self) -> None:
+        state = fake_state()
+        original_new_chat = app.new_chat
+        original_urlopen = app.urlopen
+        checks = 0
+
+        class FakeResp:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            def __enter__(self):
+                raise AssertionError("cancelled response must not be consumed")
+
+            def __exit__(self, *_args):
+                return False
+
+        response = FakeResp()
+
+        def cancel_after_connect():
+            nonlocal checks
+            checks += 1
+            if checks >= 4:
+                raise ConnectionResetError("cancelled after connect")
+
+        app.new_chat = lambda *_a, **_k: ("00000000-0000-0000-0000-000000000082", "u1")
+        app.urlopen = lambda *_a, **_k: response
+        try:
+            with self.assertRaisesRegex(ConnectionResetError, "cancelled after connect"):
+                list(
+                    self.original_stream(
+                        state,
+                        "hi",
+                        options=app.ChatOptions(model="glm-5.2"),
+                        cancel_check=cancel_after_connect,
+                    )
+                )
+        finally:
+            app.new_chat = original_new_chat
+            app.urlopen = original_urlopen
+        self.assertTrue(response.closed)
 
 
     def test_web_history_from_body_normalizes_and_truncates(self) -> None:
@@ -2897,6 +6160,205 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("上游爆炸了", raw)
         self.assertEqual(["00000000-0000-0000-0000-0000000000dd"], self.deleted_chats)
 
+    def test_cancel_stream_also_deletes_interrupted_upstream_chat(self) -> None:
+        original_stop = app.stop_zai_task
+        try:
+            app.stop_zai_task = lambda _state, _assistant_id: {"status": True}
+            status, raw = self.request(
+                "POST",
+                "/api/chat/cancel",
+                {
+                    "assistant_message_id": "00000000-0000-0000-0000-0000000000de",
+                    "chat_id": "00000000-0000-0000-0000-0000000000df",
+                },
+            )
+        finally:
+            app.stop_zai_task = original_stop
+        self.assertEqual(200, status)
+        data = json.loads(raw)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["upstream_stopped"])
+        self.assertEqual("00000000-0000-0000-0000-0000000000df", data["chat_id"])
+        self.assertTrue(data["chat_delete_pending"])
+        self.assertEqual(["00000000-0000-0000-0000-0000000000df"], self.deleted_chats)
+
+    def test_stop_task_accepts_captured_empty_ack_variants(self) -> None:
+        original_http_json = app.http_json
+        assistant_id = "00000000-0000-0000-0000-0000000000e1"
+        try:
+            for upstream in ({}, "", None, True, {"success": True}, {"ok": True}, {"status": True}):
+                app.http_json = lambda *_args, _value=upstream, **_kwargs: _value
+                result = app.stop_zai_task(fake_state(), assistant_id)
+                self.assertTrue(result["status"], upstream)
+        finally:
+            app.http_json = original_http_json
+
+    def test_stop_task_rejects_explicit_negative_ack(self) -> None:
+        original_http_json = app.http_json
+        try:
+            app.http_json = lambda *_args, **_kwargs: {"status": False}
+            with self.assertRaisesRegex(app.UpstreamRequestError, "停止生成失败"):
+                app.stop_zai_task(
+                    fake_state(),
+                    "00000000-0000-0000-0000-0000000000e2",
+                )
+        finally:
+            app.http_json = original_http_json
+
+    def test_stop_task_uses_short_timeout_and_auth_fallback(self) -> None:
+        original_http_json = app.http_json
+        calls: list[tuple[float, bool]] = []
+        errors: list[HTTPError] = []
+
+        def fake_http_json(_method, url, headers, _payload=None, **kwargs):
+            calls.append((float(kwargs.get("timeout") or 0), "Authorization" in headers))
+            if len(calls) == 1:
+                error = HTTPError(url, 403, "Forbidden", None, io.BytesIO(b"auth required"))
+                errors.append(error)
+                raise error
+            return {}
+
+        try:
+            app.http_json = fake_http_json
+            result = app.stop_zai_task(
+                fake_state(),
+                "00000000-0000-0000-0000-0000000000e3",
+            )
+        finally:
+            app.http_json = original_http_json
+        self.assertTrue(result["status"])
+        self.assertEqual(
+            [(app.UPSTREAM_STOP_TIMEOUT_SECONDS, False), (app.UPSTREAM_STOP_TIMEOUT_SECONDS, True)],
+            calls,
+        )
+        self.assertTrue(errors[0].closed)
+
+    def test_stop_task_404_is_already_stopped(self) -> None:
+        original_http_json = app.http_json
+        errors: list[HTTPError] = []
+
+        def fake_http_json(_method, url, _headers, _payload=None, **_kwargs):
+            error = HTTPError(url, 404, "Not Found", None, io.BytesIO(b"gone"))
+            errors.append(error)
+            raise error
+
+        try:
+            app.http_json = fake_http_json
+            result = app.stop_zai_task(
+                fake_state(),
+                "00000000-0000-0000-0000-0000000000e4",
+            )
+        finally:
+            app.http_json = original_http_json
+        self.assertTrue(result["status"])
+        self.assertTrue(result["already_stopped"])
+        self.assertTrue(errors[0].closed)
+
+    def test_cancel_stop_failure_still_journals_and_deletes_known_chat(self) -> None:
+        original_stop = app.stop_zai_task
+
+        def failing_stop(_state, _assistant_id):
+            raise app.UpstreamRequestError("stop endpoint temporarily unavailable")
+
+        try:
+            app.stop_zai_task = failing_stop
+            status, raw = self.request(
+                "POST",
+                "/api/chat/cancel",
+                {
+                    "assistant_message_id": "00000000-0000-0000-0000-0000000000e5",
+                    "chat_id": "00000000-0000-0000-0000-0000000000e6",
+                },
+            )
+        finally:
+            app.stop_zai_task = original_stop
+        self.assertEqual(202, status)
+        payload = json.loads(raw)
+        self.assertTrue(payload["ok"])
+        self.assertFalse(payload["upstream_stopped"])
+        self.assertTrue(payload["chat_delete_pending"])
+        self.assertIn("temporarily unavailable", payload["stop_error"])
+        self.assertEqual(["00000000-0000-0000-0000-0000000000e6"], self.deleted_chats)
+
+    def test_cancel_stop_failure_without_chat_preserves_transport_error(self) -> None:
+        original_stop = app.stop_zai_task
+        try:
+            app.stop_zai_task = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                app.UpstreamRequestError("stop failed without chat")
+            )
+            status, raw = self.request(
+                "POST",
+                "/api/chat/cancel",
+                {"assistant_message_id": "00000000-0000-0000-0000-0000000000e7"},
+            )
+        finally:
+            app.stop_zai_task = original_stop
+        self.assertEqual(502, status)
+        self.assertFalse(json.loads(raw)["ok"])
+
+    def test_interrupted_chat_reports_pending_when_executor_is_full_but_journaled(self) -> None:
+        previous_inline = app._AUTO_DELETE_INLINE
+        previous_limit = app.AUTO_DELETE_MAX_PENDING
+        blocker_started = threading.Event()
+        release = threading.Event()
+
+        def blocker() -> None:
+            blocker_started.set()
+            release.wait(timeout=5)
+
+        try:
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = False
+            app.AUTO_DELETE_MAX_PENDING = 1
+            self.assertTrue(app._submit_auto_delete(blocker))
+            self.assertTrue(blocker_started.wait(timeout=2))
+            handler = QuietProxyHandler.__new__(QuietProxyHandler)
+            accepted = handler._schedule_interrupted_upstream_chat_delete(
+                fake_state(),
+                "00000000-0000-0000-0000-0000000000e8",
+                reason="client_cancel",
+            )
+            self.assertTrue(accepted)
+            status = app.pending_chat_delete_status()
+            self.assertEqual(1, status["journal_chat_pending"])
+            self.assertNotIn("00000000-0000-0000-0000-0000000000e8", self.deleted_chats)
+        finally:
+            release.set()
+            deadline = time.monotonic() + 5
+            while app.auto_delete_executor_status()["pending"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            app._shutdown_auto_delete_executor()
+            app._DELETE_EXECUTOR_CLOSED = False
+            app._AUTO_DELETE_STOP.clear()
+            app._AUTO_DELETE_INLINE = previous_inline
+            app.AUTO_DELETE_MAX_PENDING = previous_limit
+
+    def test_forced_interrupted_cleanup_ignores_auto_delete_setting(self) -> None:
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        chat_id = "00000000-0000-0000-0000-0000000000e0"
+        scheduled = handler._cleanup_failed_upstream_chat(
+            fake_state(),
+            {"chat_id": chat_id},
+            app.ChatOptions(delete_chat_after_completion=False),
+            force=True,
+            reason="client_disconnect",
+        )
+        self.assertTrue(scheduled)
+        self.assertEqual([chat_id], self.deleted_chats)
+
+    def test_stream_incomplete_cleanup_ignores_auto_delete_setting(self) -> None:
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        chat_id = "00000000-0000-0000-0000-0000000000e1"
+        scheduled = handler._cleanup_failed_upstream_chat(
+            fake_state(),
+            {"chat_id": chat_id, "_stream_incomplete": True},
+            app.ChatOptions(delete_chat_after_completion=False),
+        )
+        self.assertTrue(scheduled)
+        self.assertEqual([chat_id], self.deleted_chats)
+
     def test_direct_prompt_cleans_up_created_chat(self) -> None:
         original_stream = app.stream_zai_completion
         original_delete = app.delete_zai_chat
@@ -2908,7 +6370,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 context.update({"chat_id": "00000000-0000-0000-0000-0000000000cd"})
             yield 'data: {"data":{"delta_content":"ok","phase":"answer"}}'
 
-        def fake_delete(_state, chat_id):
+        def fake_delete(_state, chat_id, **_kwargs):
             deleted.append(chat_id)
             return True
 
@@ -3030,6 +6492,887 @@ class ProtocolAdaptersTest(unittest.TestCase):
             release.set()
             app.stream_zai_completion = original_stream
 
+    def test_concurrent_generations_fail_over_to_next_profile(self) -> None:
+        original_stream = app.stream_zai_completion
+        original_profiles = QuietProxyHandler.profiles
+        original_active = QuietProxyHandler.active_profile_id
+        original_state = QuietProxyHandler.state
+        first_state = replace(fake_state(), user_id="pool-user-a", user_name="pool-a", token="pool-token-a")
+        second_state = replace(fake_state(), user_id="pool-user-b", user_name="pool-b", token="pool-token-b")
+        first = app.make_profile(first_state, "账号 A", "test")
+        second = app.make_profile(second_state, "账号 B", "test")
+        QuietProxyHandler.profiles = {first.id: first, second.id: second}
+        QuietProxyHandler.active_profile_id = first.id
+        QuietProxyHandler.state = first.state
+        QuietProxyHandler.chat_inflight = {}
+        release = threading.Event()
+        calls: list[str] = []
+        calls_lock = threading.Lock()
+        results: list[tuple[int, str]] = []
+
+        def blocking_stream(stream_state, _prompt, **kwargs):
+            context = kwargs.get("context_out")
+            with calls_lock:
+                calls.append(stream_state.user_id)
+                sequence = len(calls)
+            if isinstance(context, dict):
+                context.update({"chat_id": f"00000000-0000-0000-0000-{sequence:012d}"})
+            release.wait(timeout=8)
+            yield 'data: {"data":{"delta_content":"完成","phase":"answer"}}'
+
+        def worker(message: str):
+            results.append(self.request("POST", "/api/chat", {"message": message, "stream": True}))
+
+        workers: list[threading.Thread] = []
+        try:
+            app.stream_zai_completion = blocking_stream
+            for message in ("A1", "A2", "A3", "B1"):
+                thread = threading.Thread(target=worker, args=(message,))
+                thread.start()
+                workers.append(thread)
+                for _ in range(100):
+                    with calls_lock:
+                        if len(calls) >= len(workers):
+                            break
+                    time.sleep(0.02)
+            with calls_lock:
+                self.assertEqual(4, len(calls))
+                self.assertEqual(3, calls.count("pool-user-a"))
+                self.assertEqual(1, calls.count("pool-user-b"))
+
+            status, raw = self.request("GET", "/api/status")
+            self.assertEqual(200, status, raw[:300])
+            data = json.loads(raw)
+            pool = data["concurrency"]
+            self.assertEqual(2, pool["profile_count"])
+            self.assertEqual(6, pool["capacity"])
+            self.assertEqual(4, pool["inflight"])
+            self.assertEqual(3, pool["active_profile_inflight"])
+            self.assertEqual({3, 1}, {row["inflight"] for row in pool["profiles"]})
+
+            release.set()
+            for thread in workers:
+                thread.join(timeout=8)
+            self.assertEqual(4, len(results))
+            self.assertTrue(all(status_code == 200 for status_code, _body in results))
+        finally:
+            release.set()
+            for thread in workers:
+                thread.join(timeout=8)
+            app.stream_zai_completion = original_stream
+            QuietProxyHandler.profiles = original_profiles
+            QuietProxyHandler.active_profile_id = original_active
+            QuietProxyHandler.state = original_state
+
+    def test_profile_pool_routes_to_third_profile_when_first_two_are_full(self) -> None:
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        state_a = replace(fake_state(), user_id="pool-a", token="pool-a-token")
+        state_b = replace(fake_state(), user_id="pool-b", token="pool-b-token")
+        state_c = replace(fake_state(), user_id="pool-c", token="pool-c-token")
+        profile_a = app.make_profile(state_a, "A", "test")
+        profile_b = app.make_profile(state_b, "B", "test")
+        profile_c = app.make_profile(state_c, "C", "test")
+        handler.profiles = {profile_a.id: profile_a, profile_b.id: profile_b, profile_c.id: profile_c}
+        handler.active_profile_id = profile_a.id
+        handler.state = profile_a.state
+        handler.chat_inflight = {profile_a.id: 3, profile_b.id: 3}
+        handler.chat_inflight_lock = threading.RLock()
+        self.assertEqual(profile_c.id, handler._try_acquire_chat_slot())
+        self.assertEqual(profile_c.id, handler._try_acquire_chat_slot())
+        self.assertEqual(profile_c.id, handler._try_acquire_chat_slot())
+        self.assertIsNone(handler._try_acquire_chat_slot())
+        for _ in range(3):
+            handler._release_chat_slot(profile_c.id)
+        self.assertEqual({profile_a.id: 3, profile_b.id: 3}, handler.chat_inflight)
+
+    def test_profile_pool_payload_order_busy_scope_and_response_affinity(self) -> None:
+        original_profiles = QuietProxyHandler.profiles
+        original_active = QuietProxyHandler.active_profile_id
+        original_state = QuietProxyHandler.state
+        original_inflight = QuietProxyHandler.chat_inflight
+        original_cors = QuietProxyHandler.cors_origins
+        state_a = replace(fake_state(), user_id="route-a", user_name="route-a", token="route-token-a")
+        state_b = replace(fake_state(), user_id="route-b", user_name="route-b", token="route-token-b")
+        profile_a = app.make_profile(state_a, "A", "test")
+        profile_b = app.make_profile(state_b, "B", "test")
+        try:
+            # Preserve insertion A -> B while making B the default. API/UI order
+            # must reflect actual routing B -> A, not dictionary insertion.
+            QuietProxyHandler.profiles = {profile_a.id: profile_a, profile_b.id: profile_b}
+            QuietProxyHandler.active_profile_id = profile_b.id
+            QuietProxyHandler.state = profile_b.state
+            QuietProxyHandler.chat_inflight = {profile_b.id: app.MAX_CONCURRENT_GENERATIONS_PER_PROFILE}
+            QuietProxyHandler.cors_origins = ("http://client.test",)
+
+            status, raw = self.request("GET", "/api/auth/profiles")
+            self.assertEqual(200, status, raw[:300])
+            payload = json.loads(raw)
+            self.assertEqual([profile_b.id, profile_a.id], [item["id"] for item in payload["profiles"]])
+            self.assertEqual([1, 2], [item["routing_order"] for item in payload["profiles"]])
+            self.assertEqual([profile_b.id, profile_a.id], [item["id"] for item in payload["concurrency"]["profiles"]])
+
+            # A continued chat is pinned to B. Even though A is free, it must
+            # receive a profile-scoped 429 rather than silently cross accounts.
+            status, raw = self.request(
+                "POST",
+                "/api/chat",
+                {"message": "pinned", "stream": False},
+                {app.PROFILE_ROUTING_HEADER: profile_b.id},
+            )
+            self.assertEqual(429, status, raw[:300])
+            error = json.loads(raw)["error"]
+            self.assertEqual("chat_slot_busy", error["type"])
+            self.assertEqual("profile", error["scope"])
+
+            # A new unpinned request fails over to A, and the response exposes
+            # the selected profile so external clients can pin continuations.
+            body = json.dumps(
+                {
+                    "message": "new request",
+                    "stream": False,
+                    "delete_chat_after_completion": False,
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+            request = Request(
+                self.base_url + "/api/chat",
+                data=body,
+                headers={"Content-Type": "application/json", "Origin": "http://client.test"},
+                method="POST",
+            )
+            with urlopen(request, timeout=8) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+                self.assertEqual(profile_a.id, response.headers.get(app.PROFILE_ROUTING_HEADER))
+                self.assertIn(app.PROFILE_ROUTING_HEADER, response.headers.get("Access-Control-Expose-Headers", ""))
+            self.assertEqual(profile_a.id, response_payload["profile_id"])
+            self.assertEqual(
+                app.MAX_CONCURRENT_GENERATIONS_PER_PROFILE,
+                QuietProxyHandler.chat_inflight[profile_b.id],
+            )
+        finally:
+            QuietProxyHandler.profiles = original_profiles
+            QuietProxyHandler.active_profile_id = original_active
+            QuietProxyHandler.state = original_state
+            QuietProxyHandler.chat_inflight = original_inflight
+            QuietProxyHandler.cors_origins = original_cors
+
+    def test_invalid_profile_header_is_not_misreported_as_capacity_busy(self) -> None:
+        invalid_headers = {app.PROFILE_ROUTING_HEADER: "profile_missing"}
+        cases = [
+            ("/api/chat", {"message": "hello", "stream": False}, 404),
+            (
+                "/v1/chat/completions",
+                {"model": "glm-5.3", "messages": [{"role": "user", "content": "hello"}]},
+                400,
+            ),
+            (
+                "/v1/messages",
+                {"model": "glm-5.3", "max_tokens": 64, "messages": [{"role": "user", "content": "hello"}]},
+                400,
+            ),
+        ]
+        for path, body, expected_status in cases:
+            status, raw = self.request("POST", path, body, invalid_headers)
+            self.assertEqual(expected_status, status, (path, raw[:300]))
+            self.assertIn("profile_not_found", raw, path)
+            self.assertNotIn("chat_slot_busy", raw, path)
+
+        status, raw = self.request(
+            "POST",
+            "/api/files/upload?filename=test.txt",
+            b"hello",
+            {**invalid_headers, "Content-Type": "text/plain"},
+        )
+        self.assertEqual(404, status, raw[:300])
+        self.assertEqual("profile_not_found", json.loads(raw)["error"]["code"])
+        self.assertEqual({}, QuietProxyHandler.chat_inflight)
+
+    def test_busy_profile_cannot_be_removed(self) -> None:
+        original_profiles = QuietProxyHandler.profiles
+        original_active = QuietProxyHandler.active_profile_id
+        original_state = QuietProxyHandler.state
+        original_inflight = QuietProxyHandler.chat_inflight
+        profile = app.make_profile(fake_state(), "busy", "test")
+        try:
+            QuietProxyHandler.profiles = {profile.id: profile}
+            QuietProxyHandler.active_profile_id = profile.id
+            QuietProxyHandler.state = profile.state
+            QuietProxyHandler.chat_inflight = {profile.id: 1}
+            status, raw = self.request("POST", "/api/auth/remove", {"profile_id": profile.id})
+            self.assertEqual(409, status, raw[:300])
+            error = json.loads(raw)["error"]
+            self.assertEqual("profile_busy", error["code"])
+            self.assertEqual(1, error["inflight"])
+            self.assertIn(profile.id, QuietProxyHandler.profiles)
+            self.assertEqual(profile.id, QuietProxyHandler.active_profile_id)
+        finally:
+            QuietProxyHandler.profiles = original_profiles
+            QuietProxyHandler.active_profile_id = original_active
+            QuietProxyHandler.state = original_state
+            QuietProxyHandler.chat_inflight = original_inflight
+
+    def test_duplicate_compaction_preserves_busy_profiles(self) -> None:
+        original_profiles = QuietProxyHandler.profiles
+        original_active = QuietProxyHandler.active_profile_id
+        original_state = QuietProxyHandler.state
+        original_inflight = QuietProxyHandler.chat_inflight
+        state_a = replace(fake_state(), user_id="duplicate-user", token="duplicate-a")
+        state_b = replace(fake_state(), user_id="duplicate-user", token="duplicate-b")
+        state_c = replace(fake_state(), user_id="active-other", token="active-other")
+        profile_a = app.make_profile(state_a, "duplicate A", "test")
+        profile_b = app.make_profile(state_b, "duplicate B", "test")
+        profile_c = app.make_profile(state_c, "active", "test")
+        profile_a.loaded_at = "2026-08-30T10:00:00+08:00"
+        profile_b.loaded_at = "2026-08-30T11:00:00+08:00"
+        try:
+            QuietProxyHandler.profiles = {
+                profile_a.id: profile_a,
+                profile_b.id: profile_b,
+                profile_c.id: profile_c,
+            }
+            QuietProxyHandler.active_profile_id = profile_c.id
+            QuietProxyHandler.state = profile_c.state
+            QuietProxyHandler.chat_inflight = {profile_a.id: 1, profile_b.id: 1}
+            status, raw = self.request("POST", "/api/auth/compact", {})
+            self.assertEqual(200, status, raw[:300])
+            payload = json.loads(raw)
+            self.assertEqual(0, len(payload["removed_profiles"]))
+            self.assertEqual(1, payload["skipped_busy_count"])
+            self.assertIn("正在生成", payload["message"])
+            self.assertIn(profile_a.id, QuietProxyHandler.profiles)
+            self.assertIn(profile_b.id, QuietProxyHandler.profiles)
+        finally:
+            QuietProxyHandler.profiles = original_profiles
+            QuietProxyHandler.active_profile_id = original_active
+            QuietProxyHandler.state = original_state
+            QuietProxyHandler.chat_inflight = original_inflight
+
+    def test_local_proxy_server_rejects_duplicate_live_bind(self) -> None:
+        server = app.LocalProxyServer(("127.0.0.1", 0), QuietProxyHandler)
+        try:
+            with self.assertRaises(OSError):
+                app.LocalProxyServer(("127.0.0.1", server.server_port), QuietProxyHandler)
+        finally:
+            server.server_close()
+
+    def test_local_proxy_server_bounds_handler_threads(self) -> None:
+        previous_limit = app.MAX_HTTP_HANDLER_THREADS
+        release = threading.Event()
+        started = app.queue.Queue()
+        client_errors: list[str] = []
+        client_statuses: list[int] = []
+        overload_responses: list[tuple[str, dict]] = []
+
+        class BlockingHandler(app.BaseHTTPRequestHandler):
+            timeout = 3
+
+            def log_message(self, *_args):
+                pass
+
+            def do_GET(self) -> None:
+                started.put(True)
+                release.wait(timeout=3)
+                raw = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        server = None
+        serve_thread = None
+        clients: list[threading.Thread] = []
+        try:
+            app.MAX_HTTP_HANDLER_THREADS = 2
+            server = app.LocalProxyServer(("127.0.0.1", 0), BlockingHandler)
+            serve_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            serve_thread.start()
+            url = f"http://127.0.0.1:{server.server_port}/"
+
+            def call() -> None:
+                try:
+                    with urlopen(url, timeout=5) as response:
+                        response.read()
+                        client_statuses.append(response.status)
+                except HTTPError as exc:
+                    try:
+                        client_statuses.append(exc.code)
+                        if exc.code == 503:
+                            overload_responses.append(
+                                (
+                                    str(exc.headers.get("Retry-After") or ""),
+                                    json.loads(exc.read().decode("utf-8")),
+                                )
+                            )
+                    finally:
+                        exc.close()
+                except Exception as exc:
+                    client_errors.append(str(exc))
+
+            clients = [threading.Thread(target=call, daemon=True) for _ in range(3)]
+            for client in clients:
+                client.start()
+            started.get(timeout=2)
+            started.get(timeout=2)
+            deadline = time.time() + 2
+            while server.handler_status()["rejected_total"] < 1 and time.time() < deadline:
+                time.sleep(0.01)
+
+            saturated = server.handler_status()
+            self.assertEqual(2, saturated["active"])
+            self.assertEqual(2, saturated["max_active"])
+            self.assertEqual(2, saturated["peak"])
+            self.assertEqual(0, saturated["waiting"])
+            self.assertGreaterEqual(saturated["wait_total"], 1)
+            self.assertGreaterEqual(saturated["rejected_total"], 1)
+            self.assertEqual(app.HTTP_HANDLER_OVERLOAD_RETRY_SECONDS, saturated["overload_retry_seconds"])
+            self.assertTrue(saturated["saturated"])
+
+            shutdown_thread = threading.Thread(target=server.shutdown, daemon=True)
+            shutdown_thread.start()
+            shutdown_thread.join(timeout=2)
+            self.assertFalse(shutdown_thread.is_alive(), "accept loop must not wait for a handler slot during shutdown")
+            serve_thread.join(timeout=2)
+            self.assertFalse(serve_thread.is_alive())
+
+            release.set()
+            for client in clients:
+                client.join(timeout=5)
+            deadline = time.time() + 2
+            while server.handler_status()["active"] and time.time() < deadline:
+                time.sleep(0.01)
+            drained = server.handler_status()
+            self.assertEqual(0, drained["active"])
+            self.assertEqual(0, drained["waiting"])
+            self.assertEqual([], client_errors)
+            self.assertCountEqual([200, 200, 503], client_statuses)
+            self.assertEqual(1, len(overload_responses))
+            retry_after, overload = overload_responses[0]
+            self.assertEqual(str(app.HTTP_HANDLER_OVERLOAD_RETRY_SECONDS), retry_after)
+            self.assertEqual("server_overloaded", overload["error"]["type"])
+            self.assertEqual("handler_capacity_exhausted", overload["error"]["code"])
+        finally:
+            release.set()
+            if server is not None:
+                server.shutdown()
+                server.server_close()
+            if serve_thread is not None:
+                serve_thread.join(timeout=5)
+            for client in clients:
+                client.join(timeout=5)
+            app.MAX_HTTP_HANDLER_THREADS = previous_limit
+
+    def test_graceful_shutdown_force_closes_stalled_handler_and_drains(self) -> None:
+        entered = threading.Event()
+        exited = threading.Event()
+        server = None
+        serve_thread = None
+        client = None
+
+        class StalledBodyHandler(app.BaseHTTPRequestHandler):
+            timeout = 0.2
+
+            def log_message(self, *_args):
+                pass
+
+            def do_POST(self):
+                entered.set()
+                try:
+                    self.rfile.read(1)
+                finally:
+                    exited.set()
+
+        try:
+            server = app.LocalProxyServer(("127.0.0.1", 0), StalledBodyHandler)
+            serve_thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+            serve_thread.start()
+            client = app.socket.create_connection(("127.0.0.1", server.server_port), timeout=2)
+            client.sendall(
+                b"POST /stalled HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Length: 1\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+            )
+            self.assertTrue(entered.wait(timeout=2))
+            self.assertEqual(1, server.handler_status()["active"])
+            server.shutdown()
+            result = app.graceful_shutdown_server(server, graceful_timeout=0.05, forced_timeout=1.0)
+            self.assertTrue(result["drained"])
+            self.assertEqual(1, result["forced_sockets"])
+            self.assertEqual(0, result["remaining_handlers"])
+            self.assertTrue(server.handler_status()["shutting_down"])
+            self.assertTrue(exited.wait(timeout=1))
+        finally:
+            if client is not None:
+                client.close()
+            if server is not None:
+                server.force_close_active_requests()
+                server.server_close()
+            if serve_thread is not None:
+                serve_thread.join(timeout=2)
+
+    def test_request_cancel_check_observes_service_shutdown(self) -> None:
+        class FakeServer:
+            shutdown_event = threading.Event()
+
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        handler.server = FakeServer()
+        handler._check_request_cancelled()
+        handler.server.shutdown_event.set()
+        with self.assertRaises(app.ServiceShuttingDown):
+            handler._check_request_cancelled()
+        self.assertEqual("service_shutdown", app.interruption_reason(app.ServiceShuttingDown()))
+
+    def test_upstream_chunk_loop_checks_service_shutdown(self) -> None:
+        original_urlopen = app.urlopen
+        checks = 0
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter([b'data: {"data":{"delta_content":"never emitted","phase":"answer"}}\n\n'])
+
+            def close(self):
+                pass
+
+        def cancel_check():
+            nonlocal checks
+            checks += 1
+            if checks >= 5:
+                raise app.ServiceShuttingDown("test shutdown")
+
+        try:
+            app.urlopen = lambda *_args, **_kwargs: FakeResponse()
+            with self.assertRaises(app.ServiceShuttingDown):
+                list(
+                    self.original_stream(
+                        fake_state(),
+                        "shutdown test",
+                        create_chat=False,
+                        chat_id="00000000-0000-0000-0000-000000000001",
+                        user_msg_id="00000000-0000-0000-0000-000000000002",
+                        options=app.ChatOptions(model="glm-5.2", delete_chat_after_completion=False),
+                        cancel_check=cancel_check,
+                    )
+                )
+            self.assertGreaterEqual(checks, 5)
+        finally:
+            app.urlopen = original_urlopen
+
+    def test_partial_request_body_timeout_returns_408_without_chat_slot(self) -> None:
+        previous_timeout = QuietProxyHandler.timeout
+        previous_inflight = QuietProxyHandler.chat_inflight
+        before_timeouts = app.RUNTIME_METRICS.snapshot()["request_timeouts"]
+        sock = None
+        try:
+            QuietProxyHandler.timeout = 0.2
+            QuietProxyHandler.chat_inflight = {}
+            sock = app.socket.create_connection(("127.0.0.1", self.server.server_port), timeout=2)
+            sock.sendall(
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 512\r\n"
+                b"Connection: close\r\n\r\n"
+                b'{"model":"glm-5.3",'
+            )
+            sock.settimeout(2)
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            header, body = raw.split(b"\r\n\r\n", 1)
+            self.assertTrue(header.startswith(b"HTTP/1.0 408"), header[:100])
+            payload = json.loads(body.decode("utf-8"))
+            self.assertEqual("request_timeout", payload["error"]["code"])
+            self.assertEqual({}, QuietProxyHandler.chat_inflight)
+
+            deadline = time.time() + 2
+            while self.server.handler_status()["active"] and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(0, self.server.handler_status()["active"])
+            self.assertGreaterEqual(app.RUNTIME_METRICS.snapshot()["request_timeouts"], before_timeouts + 1)
+        finally:
+            if sock is not None:
+                sock.close()
+            QuietProxyHandler.timeout = previous_timeout
+            QuietProxyHandler.chat_inflight = previous_inflight
+
+    def test_partial_management_body_timeout_uses_generic_408_shape(self) -> None:
+        previous_timeout = QuietProxyHandler.timeout
+        sock = None
+        try:
+            QuietProxyHandler.timeout = 0.2
+            sock = app.socket.create_connection(("127.0.0.1", self.server.server_port), timeout=2)
+            sock.sendall(
+                b"POST /api/settings HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 128\r\n"
+                b"Connection: close\r\n\r\n{"
+            )
+            sock.settimeout(2)
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            header, body = raw.split(b"\r\n\r\n", 1)
+            self.assertTrue(header.startswith(b"HTTP/1.0 408"), header[:100])
+            payload = json.loads(body.decode("utf-8"))
+            self.assertFalse(payload["ok"])
+            self.assertEqual("request_timeout", payload["error"]["type"])
+            self.assertEqual("request_timeout", payload["error"]["code"])
+        finally:
+            if sock is not None:
+                sock.close()
+            QuietProxyHandler.timeout = previous_timeout
+
+    def test_chunked_json_body_and_ambiguous_framing_rejection(self) -> None:
+        payload = json.dumps(
+            {"model": "glm-5.3", "messages": [{"role": "user", "content": "chunked-body-visible"}]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        parts = [payload[:17], payload[17:43], payload[43:]]
+        chunked = b""
+        for index, part in enumerate(parts):
+            extension = b";part=first" if index == 0 else b""
+            chunked += f"{len(part):X}".encode("ascii") + extension + b"\r\n" + part + b"\r\n"
+        chunked += b"0\r\nX-Chunk-Test: accepted\r\n\r\n"
+        request_head = (
+            b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: chunked\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        status, body = self.raw_http_request(request_head + chunked)
+        self.assertEqual(200, status)
+        self.assertGreater(json.loads(body.decode("utf-8"))["input_tokens"], 0)
+
+        ambiguous_head = (
+            b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(chunked)}\r\n".encode("ascii")
+            + b"Transfer-Encoding: chunked\r\nConnection: close\r\n\r\n"
+        )
+        status, body = self.raw_http_request(ambiguous_head + chunked)
+        self.assertEqual(400, status)
+        self.assertIn("cannot be combined", json.loads(body.decode("utf-8"))["error"]["message"])
+
+        duplicate_length_head = (
+            b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(payload)}\r\nContent-Length: {len(payload)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+        )
+        status, body = self.raw_http_request(duplicate_length_head + payload)
+        self.assertEqual(400, status)
+        self.assertIn("multiple Content-Length", json.loads(body.decode("utf-8"))["error"]["message"])
+
+        unsupported_head = (
+            b"POST /v1/messages/count_tokens HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Transfer-Encoding: gzip\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        status, body = self.raw_http_request(unsupported_head + payload)
+        self.assertEqual(400, status)
+        self.assertIn("only chunked", json.loads(body.decode("utf-8"))["error"]["message"])
+
+    def test_chunked_raw_body_spools_incrementally_and_enforces_limit(self) -> None:
+        content = (b"A" * 1500) + (b"B" * 2300)
+        wire = b"5DC\r\n" + content[:1500] + b"\r\n8FC\r\n" + content[1500:] + b"\r\n0\r\n\r\n"
+
+        def handler_for(raw: bytes) -> QuietProxyHandler:
+            handler = QuietProxyHandler.__new__(QuietProxyHandler)
+            handler.rfile = io.BytesIO(raw)
+            handler.headers = app.http.client.parse_headers(io.BytesIO(b"Transfer-Encoding: chunked\r\n\r\n"))
+            handler.path = "/unit/chunked"
+            handler.close_connection = False
+            return handler
+
+        path = handler_for(wire)._spool_raw_body(
+            max_bytes=len(content),
+            prefix="glm2api-test-chunk-",
+            suffix=".bin",
+        )
+        try:
+            self.assertEqual(content, path.read_bytes())
+        finally:
+            path.unlink(missing_ok=True)
+
+        oversized_wire = b"5\r\n12345\r\n0\r\n\r\n"
+        with self.assertRaisesRegex(ValueError, "request body too large"):
+            handler_for(oversized_wire)._read_raw_body(max_bytes=4)
+
+    def test_request_body_limit_returns_413_for_fixed_and_chunked_framing(self) -> None:
+        previous_inflight = QuietProxyHandler.chat_inflight
+        before = app.RUNTIME_METRICS.snapshot()["request_too_large"]
+        QuietProxyHandler.chat_inflight = {}
+        try:
+            oversized = app.MAX_JSON_BODY_BYTES + 1
+            fixed_request = (
+                b"POST /v1/chat/completions HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                + f"Content-Length: {oversized}\r\n".encode("ascii")
+                + b"Connection: keep-alive\r\n\r\n"
+            )
+            status, body = self.raw_http_request(fixed_request)
+            self.assertEqual(413, status)
+            openai_error = json.loads(body.decode("utf-8"))["error"]
+            self.assertEqual("invalid_request_error", openai_error["type"])
+            self.assertEqual("request_too_large", openai_error["code"])
+
+            chunked_request = (
+                b"POST /api/settings HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Transfer-Encoding: chunked\r\n"
+                b"Connection: keep-alive\r\n\r\n"
+                + f"{oversized:X}\r\n".encode("ascii")
+            )
+            status, body = self.raw_http_request(chunked_request)
+            self.assertEqual(413, status)
+            generic_error = json.loads(body.decode("utf-8"))["error"]
+            self.assertEqual("request_too_large", generic_error["type"])
+            self.assertEqual("request_too_large", generic_error["code"])
+            self.assertEqual({}, QuietProxyHandler.chat_inflight)
+
+            deadline = time.time() + 2
+            while app.RUNTIME_METRICS.snapshot()["request_too_large"] < before + 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertGreaterEqual(app.RUNTIME_METRICS.snapshot()["request_too_large"], before + 2)
+        finally:
+            QuietProxyHandler.chat_inflight = previous_inflight
+
+    def test_upstream_non_stream_reads_and_error_summaries_are_bounded(self) -> None:
+        class FakeResponse:
+            def __init__(self, data: bytes, declared: int = 0):
+                self._stream = io.BytesIO(data)
+                self.headers = {"Content-Length": str(declared)} if declared else {}
+
+            def read(self, size: int = -1) -> bytes:
+                return self._stream.read(size)
+
+        self.assertEqual(
+            b'{"ok":true}',
+            app.read_limited_upstream_response(FakeResponse(b'{"ok":true}'), 32, kind="test"),
+        )
+        with self.assertRaises(app.UpstreamResponseTooLarge):
+            app.read_limited_upstream_response(FakeResponse(b"x" * 65), 64, kind="test")
+        with self.assertRaises(app.UpstreamResponseTooLarge):
+            app.read_limited_upstream_response(FakeResponse(b"", declared=65), 64, kind="test")
+
+        error = HTTPError(
+            "https://upstream.invalid/test",
+            502,
+            "synthetic",
+            {},
+            io.BytesIO(b"E" * (app.MAX_UPSTREAM_ERROR_RESPONSE_BYTES + 128)),
+        )
+        summary = app.http_error_summary(error)
+        self.assertIn("HTTP Error 502", summary)
+        self.assertIn("[error body truncated]", summary)
+        self.assertLess(len(summary), 600)
+
+    def test_nonretryable_upstream_transport_failure_maps_to_502_on_all_protocols(self) -> None:
+        original_stream = app.stream_zai_completion
+
+        def fail_stream(*_args, **_kwargs):
+            raise app.UpstreamRequestError("synthetic bounded upstream response failure")
+            yield ""  # pragma: no cover - preserve generator shape
+
+        cases = [
+            (
+                "/v1/chat/completions",
+                {"model": "glm-5.3", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+            ),
+            ("/v1/responses", {"model": "glm-5.3", "stream": False, "input": "hi"}),
+            (
+                "/v1/messages",
+                {"model": "glm-5.3", "stream": False, "max_tokens": 32, "messages": [{"role": "user", "content": "hi"}]},
+            ),
+            ("/api/chat", {"model": "glm-5.3", "stream": False, "message": "hi"}),
+        ]
+        app.stream_zai_completion = fail_stream
+        try:
+            for path, body in cases:
+                status, raw = self.request("POST", path, body)
+                self.assertEqual(502, status, (path, raw[:300]))
+            self.assertEqual({}, QuietProxyHandler.chat_inflight)
+        finally:
+            app.stream_zai_completion = original_stream
+
+    def test_upload_activity_limiter_is_nonblocking_bounded_and_observable(self) -> None:
+        limiter = app.ActivityLimiter(2)
+        self.assertTrue(limiter.try_acquire())
+        self.assertTrue(limiter.try_acquire())
+        self.assertFalse(limiter.try_acquire())
+        self.assertEqual(
+            {
+                "active": 2,
+                "max_active": 2,
+                "peak": 2,
+                "started_total": 2,
+                "rejected_total": 1,
+            },
+            limiter.status(),
+        )
+        limiter.release()
+        limiter.release()
+        limiter.release()
+        self.assertEqual(0, limiter.status()["active"])
+
+    def test_file_and_har_upload_backpressure_rejects_before_body_processing(self) -> None:
+        previous_file = app._CHAT_FILE_UPLOAD_LIMITER
+        previous_har = app._HAR_UPLOAD_LIMITER
+        file_limiter = app.ActivityLimiter(1)
+        har_limiter = app.ActivityLimiter(1)
+        app._CHAT_FILE_UPLOAD_LIMITER = file_limiter
+        app._HAR_UPLOAD_LIMITER = har_limiter
+        self.assertTrue(file_limiter.try_acquire())
+        self.assertTrue(har_limiter.try_acquire())
+        try:
+            status, raw = self.request(
+                "POST",
+                "/api/files/upload?filename=busy.txt",
+                b"body-must-not-be-processed",
+                {"Content-Type": "text/plain", "Connection": "keep-alive"},
+            )
+            self.assertEqual(429, status, raw[:300])
+            error = json.loads(raw)["error"]
+            self.assertEqual("upload_capacity_busy", error["type"])
+            self.assertEqual("file", error["scope"])
+
+            status, raw = self.request(
+                "POST",
+                "/api/auth/har",
+                {"har_text": "body-must-not-be-processed"},
+                {"Connection": "keep-alive"},
+            )
+            self.assertEqual(429, status, raw[:300])
+            error = json.loads(raw)["error"]
+            self.assertEqual("upload_capacity_busy", error["type"])
+            self.assertEqual("har", error["scope"])
+            self.assertEqual(1, file_limiter.status()["rejected_total"])
+            self.assertEqual(1, har_limiter.status()["rejected_total"])
+        finally:
+            file_limiter.release()
+            har_limiter.release()
+            app._CHAT_FILE_UPLOAD_LIMITER = previous_file
+            app._HAR_UPLOAD_LIMITER = previous_har
+
+    def test_file_upload_releases_capacity_after_upstream_failure(self) -> None:
+        previous_limiter = app._CHAT_FILE_UPLOAD_LIMITER
+        previous_upload = app.upload_file_path_to_zai
+        limiter = app.ActivityLimiter(1)
+        app._CHAT_FILE_UPLOAD_LIMITER = limiter
+
+        def fail_upload(*_args, **_kwargs):
+            raise app.UpstreamRequestError("synthetic upload failure")
+
+        app.upload_file_path_to_zai = fail_upload
+        try:
+            status, raw = self.request(
+                "POST",
+                "/api/files/upload?filename=failure.txt",
+                b"hello",
+                {"Content-Type": "text/plain"},
+            )
+            self.assertEqual(502, status, raw[:300])
+            self.assertEqual("upstream_upload_error", json.loads(raw)["error"]["code"])
+            for _ in range(100):
+                if limiter.status()["active"] == 0:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(0, limiter.status()["active"])
+            self.assertTrue(limiter.try_acquire(), "失败路径必须归还上传槽位")
+            limiter.release()
+        finally:
+            app.upload_file_path_to_zai = previous_upload
+            app._CHAT_FILE_UPLOAD_LIMITER = previous_limiter
+
+    def test_streaming_file_upload_stops_between_chunks_on_service_shutdown(self) -> None:
+        original_base_url = app.BASE_URL
+        original_connection = app.http.client.HTTPConnection
+        instances = []
+        checks = 0
+
+        class FakeConnection:
+            def __init__(self, *_args, **_kwargs):
+                self.sent = []
+                self.closed = False
+                instances.append(self)
+
+            def putrequest(self, *_args, **_kwargs):
+                pass
+
+            def putheader(self, *_args, **_kwargs):
+                pass
+
+            def endheaders(self):
+                pass
+
+            def send(self, data):
+                self.sent.append(data)
+
+            def getresponse(self):
+                raise AssertionError("shutdown must stop before waiting for the response")
+
+            def close(self):
+                self.closed = True
+
+        def cancel_check():
+            nonlocal checks
+            checks += 1
+            if checks >= 3:
+                raise app.ServiceShuttingDown("test shutdown")
+
+        try:
+            app.BASE_URL = "http://upstream.test"
+            app.http.client.HTTPConnection = FakeConnection
+            with self.assertRaises(app.ServiceShuttingDown):
+                app._upload_file_stream_to_zai(
+                    fake_state(),
+                    "test.bin",
+                    "application/octet-stream",
+                    2,
+                    lambda: iter((b"a", b"b")),
+                    cancel_check=cancel_check,
+                )
+            self.assertEqual(1, len(instances))
+            self.assertTrue(instances[0].closed)
+            self.assertIn(b"a", instances[0].sent)
+            self.assertNotIn(b"b", instances[0].sent)
+        finally:
+            app.BASE_URL = original_base_url
+            app.http.client.HTTPConnection = original_connection
+
+    def test_web_file_uploads_use_bounded_workers_and_preserve_partial_cleanup(self) -> None:
+        html = (PROJECT_ROOT / "web" / "index.html").read_text(encoding="utf-8")
+        self.assertIn("const CHAT_FILE_UPLOAD_CONCURRENCY = 3", html)
+        self.assertIn("async function mapWithConcurrency", html)
+        self.assertIn("firstError.completedResults = results.filter(Boolean)", html)
+        self.assertIn("if (Array.isArray(err?.uploadedFiles)) uploadedZaiFiles = err.uploadedFiles", html)
+        self.assertNotIn("Promise.all(files.slice(1).map", html)
+        self.assertIn('id="info-upstream-responses"', html)
+        self.assertIn("runtime.request_too_large", html)
+
     def test_slot_release_tracks_acquired_profile(self) -> None:
         handler = QuietProxyHandler.__new__(QuietProxyHandler)
         handler.chat_inflight = {}
@@ -3065,7 +7408,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 context.update({"chat_id": "00000000-0000-0000-0000-0000000000cc"})
             yield 'data: {"data":{"delta_content":"完成","phase":"answer"}}'
 
-        def slow_delete(_state, chat_id):
+        def slow_delete(_state, chat_id, **_kwargs):
             delete_calls.append(chat_id)
             if len(delete_calls) == 1:
                 gate.set()
@@ -3112,6 +7455,9 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("Incorrect 5 — invocation rendered as JSON or Markdown", instructions)
         self.assertIn('Valid example:\n<|DSML|tool_calls>\n  <|DSML|invoke name="read_file"', instructions)
         self.assertIn("Read-style cache guard", instructions)
+        self.assertIn("decide for yourself whether a function is necessary", instructions)
+        self.assertIn("a progress update or a plan for later work is not a completed answer", instructions)
+        self.assertIn("finish normally without calling a function merely to satisfy this guard", instructions)
 
         required = app.build_tool_instruction(tools, app.ToolChoice(mode="required", forced_name="", disable_parallel=False))
         self.assertIn("MUST issue at least one call", required)
@@ -3153,7 +7499,8 @@ class ProtocolAdaptersTest(unittest.TestCase):
 
         prompt = app.file_mode_execution_prompt(tools, auto)
         self.assertIn("The attached file holds the earlier conversation. Read it and respond to the most recent user request directly.", prompt)
-        self.assertIn("The other attached file enumerates the available function definitions", prompt)
+        self.assertIn("The other attached file or files enumerate the available function definitions", prompt)
+        self.assertIn("read every segment in numeric header order", prompt)
         self.assertIn(app.MODE_B_TOOL_GUIDANCE, prompt)
         self.assertTrue(prompt.startswith(app.MODE_B_TOOL_GUIDANCE))
         self.assertTrue(prompt.endswith(app.current_input_file_prompt(True)))
@@ -3243,6 +7590,70 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
             app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
 
+    def test_context_file_cache_uses_exact_lru_and_global_expiry_sweep(self) -> None:
+        state = fake_state()
+        previous_cache = dict(app._CONTEXT_FILE_CACHE)
+        previous_max = app.CONTEXT_FILE_CACHE_MAX_ITEMS
+        try:
+            app._CONTEXT_FILE_CACHE.clear()
+            app.CONTEXT_FILE_CACHE_MAX_ITEMS = 3
+            for index in range(3):
+                app._context_file_cache_store(
+                    state,
+                    f"text-{index}",
+                    {"id": f"file-{index}", "meta": {"size": index + 1}},
+                )
+            self.assertEqual("file-0", app._context_file_cache_lookup(state, "text-0")["id"])
+            app._context_file_cache_store(state, "text-3", {"id": "file-3", "meta": {"size": 4}})
+            self.assertIsNone(app._context_file_cache_lookup(state, "text-1"), "最久未命中的条目应淘汰")
+            self.assertIsNotNone(app._context_file_cache_lookup(state, "text-0"), "刚命中的条目应保留")
+            self.assertEqual(3, len(app._CONTEXT_FILE_CACHE))
+
+            expired_key = (state.user_id, "expired-digest")
+            app._CONTEXT_FILE_CACHE[expired_key] = (
+                {"id": "expired", "meta": {"size": 99}},
+                time.monotonic() - app.CONTEXT_FILE_CACHE_TTL_SECONDS - 1,
+            )
+            cache_status = app.context_cache_status()
+            self.assertNotIn(expired_key, app._CONTEXT_FILE_CACHE)
+            self.assertEqual(3, cache_status["items"])
+            self.assertEqual(3, cache_status["max_items"])
+            self.assertLess(cache_status["bytes"], 99)
+        finally:
+            app.CONTEXT_FILE_CACHE_MAX_ITEMS = previous_max
+            app._CONTEXT_FILE_CACHE.clear()
+            app._CONTEXT_FILE_CACHE.update(previous_cache)
+
+    def test_context_upload_state_is_bounded_and_expired_globally(self) -> None:
+        previous_failures = dict(app._CONTEXT_UPLOAD_FAILURES)
+        previous_degraded = dict(app._CONTEXT_UPLOAD_DEGRADED_UNTIL)
+        previous_max = app.CONTEXT_UPLOAD_STATE_MAX_ITEMS
+        try:
+            app._CONTEXT_UPLOAD_FAILURES.clear()
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.clear()
+            app.CONTEXT_UPLOAD_STATE_MAX_ITEMS = 3
+            for index in range(10):
+                app.record_context_upload_failure(f"user-{index}")
+            self.assertEqual(3, len(app._CONTEXT_UPLOAD_FAILURES))
+            self.assertEqual({"user-7", "user-8", "user-9"}, set(app._CONTEXT_UPLOAD_FAILURES))
+
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL["expired-user"] = time.monotonic() - 1
+            app._CONTEXT_UPLOAD_FAILURES["expired-user"] = 1
+            cache_status = app.context_cache_status()
+            self.assertNotIn("expired-user", app._CONTEXT_UPLOAD_DEGRADED_UNTIL)
+            self.assertNotIn("expired-user", app._CONTEXT_UPLOAD_FAILURES)
+            self.assertLessEqual(
+                cache_status["failure_states"] + cache_status["degraded_states"],
+                app.CONTEXT_UPLOAD_STATE_MAX_ITEMS,
+            )
+            self.assertEqual(3, cache_status["max_state_items"])
+        finally:
+            app.CONTEXT_UPLOAD_STATE_MAX_ITEMS = previous_max
+            app._CONTEXT_UPLOAD_FAILURES.clear()
+            app._CONTEXT_UPLOAD_FAILURES.update(previous_failures)
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.clear()
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.update(previous_degraded)
+
     def test_context_upload_partial_failure_does_not_send_half_package(self) -> None:
         request = app.normalize_openai_chat_request(
             {
@@ -3265,7 +7676,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             return {"id": "tools-partial", "filename": "tools-random.txt", "meta": {"size": len(text)}}
 
         app.upload_context_package_to_zai = partial_upload
-        app.delete_zai_file = lambda _state, file_id: deleted.append(file_id) or True
+        app.delete_zai_file = lambda _state, file_id, **_kwargs: deleted.append(file_id) or True
         try:
             trace: dict[str, object] = {}
             prompt, files = app.prepare_protocol_upstream_request(state, request, trace_out=trace)
@@ -3324,6 +7735,33 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn('const defaultEffort = defaults.reasoning_effort || "max";', block)
         self.assertIn("reasoningEffortSelect.options", block)
 
+    def test_web_stream_requires_terminal_and_preserves_partial_output(self) -> None:
+        html = app.WEB_INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn("let terminalEventReceived = false;", html)
+        self.assertIn('sseEvent.event === "done"', html)
+        self.assertIn("if (!terminalEventReceived)", html)
+        self.assertIn('incomplete.code = "stream_incomplete";', html)
+        self.assertIn("const hasPartialOutput = Boolean(rawContentText.trim() || rawThinkingText.trim());", html)
+        self.assertIn("{ incomplete: true }", html)
+        self.assertIn("incomplete: Boolean(metadata.incomplete)", html)
+        self.assertIn("上一条助手回复因流中断，仅保留部分内容", html)
+        self.assertIn("const STREAM_MARKDOWN_MAX_CHARS = 250000;", html)
+        self.assertIn('contentEl.classList.toggle("stream-plain", plain);', html)
+        self.assertIn("contentEl.textContent = rawContentText;", html)
+
+    def test_web_local_sessions_use_recent_first_bounded_normalization(self) -> None:
+        html = app.WEB_INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn("const LOCAL_SESSION_MAX_TOTAL = 120;", html)
+        self.assertIn("const LOCAL_SESSION_MAX_PER_PROFILE = 30;", html)
+        self.assertIn("const LOCAL_SESSION_MAX_SCAN = 1000;", html)
+        self.assertIn("const LOCAL_SESSION_STORAGE_CHAR_BUDGET = 1500000;", html)
+        self.assertIn("function compactLocalSessions(values, options = {})", html)
+        self.assertIn(".slice(-maxMessages)", html)
+        self.assertIn("state.sessions.splice(existingIndex, 1);", html)
+        self.assertIn(".map(normalizeLocalAttachment)", html)
+        self.assertIn("state.sessions = compactLocalSessions(parsed);", html)
+        self.assertNotIn("arr.slice(-30)", html)
+
     def test_history_ui_separates_delivery_overview_and_exact_detail(self) -> None:
         html = app.WEB_INDEX_PATH.read_text(encoding="utf-8")
         self.assertIn('id="btn-record-view-overview"', html)
@@ -3334,7 +7772,9 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("function renderRecordOverview(r)", html)
         self.assertIn("function renderRecordDeliveryDetail(r)", html)
         self.assertIn("只有输入框承载上下文", html)
-        self.assertIn("附件 ${index + 1} · ${contextKindLabel(file.kind)}", html)
+        self.assertIn("function contextFileKindLabel(file)", html)
+        self.assertIn("match(/\\bsegment\\s+(\\d+)\\/(\\d+)\\b/i)", html)
+        self.assertIn("附件 ${index + 1} · ${contextFileKindLabel(file)}", html)
         self.assertNotIn('id="record-history-card"', html)
         self.assertNotIn('id="record-merged-view"', html)
         self.assertIn('label.textContent = String(text ?? "");', html)
@@ -3346,10 +7786,573 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn('format: "structured"', html)
         self.assertIn('params.set("after_seq", String(logLastSeq));', html)
         self.assertIn('document.addEventListener("visibilitychange"', html)
+        self.assertIn("async function fetchWithTimeout(resource, options = {}, timeoutMs = 10000)", html)
+        self.assertIn("if (document.hidden || statusAutoRefreshRunning) return;", html)
+        self.assertIn("statusAutoRefreshRunning = false;", html)
+        self.assertIn('fetchWithTimeout(`/api/metrics?hours=${metricHours}`', html)
+        self.assertIn('fetchWithTimeout("/api/logs?lines=8"', html)
         self.assertEqual(1, html.count('id="reasoning-effort-group"'))
         self.assertIn('id="reasoning-effort-settings-group"', html)
         self.assertEqual(0.75, app.HISTORY_PROGRESS_INTERVAL_SECONDS)
         self.assertIn("这里每 750ms 重取一次", html)
+
+    def test_web_uses_automatic_captcha_solver_without_manual_capture_controls(self) -> None:
+        html = app.WEB_INDEX_PATH.read_text(encoding="utf-8")
+        self.assertNotIn('id="btn-captcha-refresh"', html)
+        self.assertNotIn('data-profile-action="captcha"', html)
+        self.assertNotIn("手动采集验证码", html)
+        self.assertNotIn("验证码采集窗口", html)
+        self.assertIn("function formatCaptchaMode(data)", html)
+        self.assertIn("自动 · happy-dom / 浏览器回退", html)
+        self.assertIn("验证码按服务端模式自动处理", html)
+        self.assertIn("data.playwright_available !== false", html)
+        self.assertIn("浏览器登录组件未安装", html)
+        self.assertNotIn("data.user_id ||", html)
+        self.assertIn("data.user_id_fp ||", html)
+        self.assertNotIn("p.source ||", html)
+        self.assertIn("maxProfiles: 0", html)
+        self.assertIn("payload.max_profiles ?? state.maxProfiles", html)
+
+    def test_fresh_captcha_cli_is_solver_neutral_and_keeps_legacy_alias(self) -> None:
+        current = app.parse_args(["--fresh-captcha", "--captcha-mode", "happydom"])
+        legacy = app.parse_args(["--fresh-captcha-browser", "--captcha-mode", "browser"])
+        disabled = app.parse_args([])
+        self.assertTrue(current.fresh_captcha)
+        self.assertEqual("happydom", current.captcha_mode)
+        self.assertTrue(legacy.fresh_captcha)
+        self.assertEqual("browser", legacy.captcha_mode)
+        self.assertFalse(disabled.fresh_captcha)
+        self.assertFalse(hasattr(current, "fresh_captcha_browser"))
+
+    def test_start_script_prefers_happydom_without_playwright_dependency(self) -> None:
+        script = (PROJECT_ROOT / "start_glm2api.ps1").read_text(encoding="utf-8")
+        self.assertIn("if (Ensure-HappyDom)", script)
+        self.assertIn("captcha solver: happy-dom (no browser worker required)", script)
+        self.assertIn("'--fresh-captcha', '--captcha-mode', $CaptchaMode", script)
+        self.assertNotIn("'--fresh-captcha-browser', '--open-web'", script)
+
+    def test_public_release_check_passes_project_tree(self) -> None:
+        if not (PROJECT_ROOT / ".git").exists():
+            self.skipTest("release check requires a Git worktree")
+        completed = subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "public_release_check.py")],
+            cwd=PROJECT_ROOT,
+            text=True,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        payload = json.loads(completed.stdout)
+        self.assertEqual("PASS", payload["overall"])
+        self.assertGreater(payload["files_scanned"], 0)
+
+    def test_release_check_rejects_secret_shape_and_capture_name(self) -> None:
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT, prefix=".release-check-test-") as tmp:
+            tmp_path = Path(tmp)
+            secret_path = tmp_path / "fixture.txt"
+            capture_path = tmp_path / "capture.har"
+            secret_path.write_text('token = "' + "ghp_" + ("a" * 24) + '"\n', encoding="utf-8")
+            capture_path.write_text("{}", encoding="utf-8")
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "scripts" / "public_release_check.py"),
+                    str(secret_path.relative_to(PROJECT_ROOT)),
+                    str(capture_path.relative_to(PROJECT_ROOT)),
+                ],
+                cwd=PROJECT_ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(1, completed.returncode)
+        payload = json.loads(completed.stdout)
+        self.assertEqual("FAIL", payload["overall"])
+        self.assertTrue(any("GitHub token" in failure for failure in payload["failures"]))
+        self.assertTrue(any("capture/log artifact" in failure for failure in payload["failures"]))
+
+    def test_release_check_handles_unusual_git_candidate_names(self) -> None:
+        with tempfile.TemporaryDirectory(dir=PROJECT_ROOT, prefix=".release-check-test-") as tmp:
+            tmp_path = Path(tmp)
+            secret_path = tmp_path / "中文 空格片段.txt"
+            secret_path.write_text('token = "' + "ghp_" + ("b" * 24) + '"\n', encoding="utf-8")
+            completed = subprocess.run(
+                [sys.executable, str(PROJECT_ROOT / "scripts" / "public_release_check.py")],
+                cwd=PROJECT_ROOT,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(1, completed.returncode)
+        payload = json.loads(completed.stdout)
+        self.assertEqual("FAIL", payload["overall"])
+        self.assertTrue(any("GitHub token" in failure for failure in payload["failures"]))
+
+    def test_status_reports_effective_captcha_solver_capabilities(self) -> None:
+        previous_enabled = QuietProxyHandler.fresh_captcha_browser
+        previous_mode = app._CAPTCHA_MODE
+        try:
+            QuietProxyHandler.fresh_captcha_browser = True
+            app._CAPTCHA_MODE = "happydom"
+            status, raw = self.request("GET", "/api/status")
+            self.assertEqual(200, status)
+            payload = json.loads(raw)
+            self.assertEqual("browser_fresh", payload["captcha_mode"])
+            self.assertEqual("fresh", payload["captcha_strategy"])
+            self.assertTrue(payload["captcha_fresh_enabled"])
+            self.assertEqual("happydom", payload["captcha_solver"])
+            self.assertIsInstance(payload["captcha_happydom_available"], bool)
+            self.assertFalse(payload["captcha_browser_fallback_enabled"])
+            self.assertFalse(payload["legacy_browser_captcha_refresh_enabled"])
+            self.assertIsInstance(payload["playwright_available"], bool)
+            self.assertEqual(app.sha16("test-user"), payload["user_id_fp"])
+            self.assertNotIn("user_id", payload)
+            self.assertNotIn("user_name", payload)
+            self.assertNotIn("profile_label", payload)
+            self.assertNotIn("chrome_path", payload)
+            self.assertIsInstance(payload["browser_executable_available"], bool)
+            self.assertEqual(app.MAX_RESPONSE_STORE_ITEMS, payload["response_store"]["max_items"])
+            self.assertEqual(app.MAX_RESPONSE_STORE_BYTES, payload["response_store"]["max_bytes"])
+            self.assertEqual(app.MAX_STORED_RESPONSE_BYTES, payload["response_store"]["max_item_bytes"])
+            self.assertEqual(app.HISTORY_MAX_DETAIL_BYTES, payload["history_store"]["max_detail_bytes"])
+            self.assertEqual(app.MAX_HISTORY_INDEX_BYTES, payload["history_store"]["max_index_bytes"])
+            self.assertEqual(
+                app.MAX_HISTORY_DETAIL_FILE_BYTES,
+                payload["history_store"]["max_detail_file_bytes"],
+            )
+            self.assertEqual(app._HISTORY_CONF["max_records"], payload["history_store"]["max_records"])
+            self.assertEqual(app.HISTORY_MAX_DETAIL_BYTES, payload["limits"]["history_detail_bytes"])
+            self.assertEqual(app.MAX_HISTORY_INDEX_BYTES, payload["limits"]["history_index_bytes"])
+            self.assertEqual(
+                app.MAX_HISTORY_DETAIL_FILE_BYTES,
+                payload["limits"]["history_detail_file_bytes"],
+            )
+            self.assertEqual(app.LOG_MAX_BYTES * (app.LOG_BACKUP_COUNT + 1), payload["log_store"]["max_total_bytes"])
+            self.assertEqual(app.AUTO_DELETE_MAX_PENDING, payload["auto_delete"]["max_pending"])
+            self.assertEqual(0, payload["auto_delete"]["journal_pending"])
+            self.assertEqual(0, payload["auto_delete"]["journal_chat_pending"])
+            self.assertEqual(0, payload["auto_delete"]["journal_file_pending"])
+            self.assertFalse(payload["auto_delete"]["replay_active"])
+            self.assertEqual(0, payload["auto_delete"]["replay_deferred"])
+            self.assertEqual(
+                app.PENDING_DELETE_MAX_RECORDS,
+                payload["auto_delete"]["journal_max_records"],
+            )
+            self.assertFalse(payload["captcha_worker"]["enabled"])
+            self.assertEqual(app.CAPTCHA_WORKER_MAX_PENDING, payload["captcha_worker"]["max_pending"])
+            self.assertEqual(
+                app.CAPTCHA_WORKER_MAX_PENDING,
+                payload["limits"]["captcha_worker_pending"],
+            )
+            self.assertEqual(app.MAX_HTTP_HANDLER_THREADS, payload["http_handlers"]["max_active"])
+            self.assertEqual(app.MAX_HTTP_HANDLER_THREADS, payload["limits"]["http_handler_threads"])
+            self.assertEqual(app.MAX_QUERY_FIELDS, payload["limits"]["query_fields"])
+            self.assertEqual(app.MAX_QUERY_KEY_CHARS, payload["limits"]["query_key_chars"])
+            self.assertEqual(app.MAX_QUERY_VALUE_CHARS, payload["limits"]["query_value_chars"])
+            self.assertEqual(app.MAX_HISTORY_SEARCH_CHARS, payload["limits"]["history_search_chars"])
+            self.assertEqual(app.MAX_HISTORY_QUERY_PAGE, payload["limits"]["history_query_page"])
+            self.assertEqual(app.MAX_ACCOUNT_PROFILES, payload["limits"]["account_profiles"])
+            self.assertEqual(app.MAX_PROFILE_STORE_BYTES, payload["limits"]["profile_store_bytes"])
+            self.assertEqual(
+                app.MAX_PROFILE_STORE_PAYLOAD_BYTES,
+                payload["limits"]["profile_store_payload_bytes"],
+            )
+            self.assertEqual(app.MAX_SETTINGS_STORE_BYTES, payload["limits"]["settings_store_bytes"])
+            self.assertEqual(
+                app.MAX_PENDING_DELETE_STORE_BYTES,
+                payload["limits"]["pending_delete_store_bytes"],
+            )
+            self.assertEqual(app.MAX_LOCAL_API_KEY_CHARS, payload["limits"]["local_api_key_chars"])
+            self.assertEqual(app.MAX_API_KEY_STORE_BYTES, payload["limits"]["api_key_store_bytes"])
+            self.assertEqual(app.MAX_SESSION_TOKEN_CHARS, payload["limits"]["session_token_chars"])
+            self.assertEqual(
+                app.MAX_PROFILE_STATE_FIELD_CHARS,
+                payload["limits"]["profile_state_field_chars"],
+            )
+            self.assertEqual(app.MAX_TOOL_DEFINITIONS, payload["limits"]["tool_definitions"])
+            self.assertEqual(
+                app.MAX_TOOL_DEFINITIONS_BYTES,
+                payload["limits"]["tool_definitions_bytes"],
+            )
+            self.assertEqual(app.MAX_TOOL_CALLS_PER_TURN, payload["limits"]["tool_calls_per_turn"])
+            self.assertEqual(app.MAX_TOOL_ARGUMENTS_BYTES, payload["limits"]["tool_arguments_bytes"])
+            self.assertIsInstance(payload["http_handlers"]["rejected_total"], int)
+            self.assertEqual(
+                app.HTTP_HANDLER_OVERLOAD_RETRY_SECONDS,
+                payload["http_handlers"]["overload_retry_seconds"],
+            )
+            self.assertEqual(
+                app.GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+                payload["limits"]["graceful_shutdown_seconds"],
+            )
+            self.assertEqual(
+                app.FORCED_SHUTDOWN_TIMEOUT_SECONDS,
+                payload["limits"]["forced_shutdown_seconds"],
+            )
+            self.assertEqual(
+                app.REQUEST_SOCKET_IDLE_TIMEOUT_SECONDS,
+                payload["limits"]["request_socket_idle_seconds"],
+            )
+            self.assertEqual(
+                app.UPSTREAM_FILE_IDLE_TIMEOUT_SECONDS,
+                payload["limits"]["upstream_file_idle_seconds"],
+            )
+            self.assertEqual(
+                app.AUTO_DELETE_REQUEST_TIMEOUT_SECONDS,
+                payload["limits"]["auto_delete_request_seconds"],
+            )
+            self.assertEqual(
+                app.AUTO_DELETE_SHUTDOWN_TIMEOUT_SECONDS,
+                payload["limits"]["auto_delete_shutdown_seconds"],
+            )
+            self.assertEqual(
+                app.UPSTREAM_STOP_TIMEOUT_SECONDS,
+                payload["limits"]["upstream_stop_seconds"],
+            )
+            self.assertEqual(
+                app.PENDING_DELETE_MAX_RECORDS,
+                payload["limits"]["pending_delete_records"],
+            )
+            self.assertEqual(app.MAX_ACTIVE_CHAT_FILE_UPLOADS, payload["upload_slots"]["file"]["max_active"])
+            self.assertEqual(app.MAX_ACTIVE_HAR_UPLOADS, payload["upload_slots"]["har"]["max_active"])
+            self.assertEqual(
+                app.MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+                payload["upstream_responses"]["json_max_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_STREAM_WIRE_BYTES,
+                payload["upstream_responses"]["stream_wire_max_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+                payload["upstream_responses"]["stream_output_max_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_STREAM_EVENTS,
+                payload["upstream_responses"]["stream_max_events"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_ERROR_RESPONSE_BYTES,
+                payload["upstream_responses"]["error_max_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_LEGACY_JSON_HAR_BYTES,
+                payload["limits"]["legacy_json_har_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_ACTIVE_CHAT_FILE_UPLOADS,
+                payload["limits"]["active_chat_file_uploads"],
+            )
+            self.assertEqual(app.MAX_ACTIVE_HAR_UPLOADS, payload["limits"]["active_har_uploads"])
+            self.assertEqual(
+                app.MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+                payload["limits"]["upstream_json_response_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_STREAM_WIRE_BYTES,
+                payload["limits"]["upstream_stream_wire_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+                payload["limits"]["upstream_stream_output_bytes"],
+            )
+            self.assertEqual(app.MAX_UPSTREAM_STREAM_EVENTS, payload["limits"]["upstream_stream_events"])
+            self.assertEqual(
+                app.MAX_UPSTREAM_ERROR_RESPONSE_BYTES,
+                payload["limits"]["upstream_error_response_bytes"],
+            )
+            self.assertEqual(
+                app.MAX_UPSTREAM_UPLOAD_RESPONSE_BYTES,
+                payload["limits"]["upstream_upload_response_bytes"],
+            )
+            self.assertEqual(app.MAX_RUNTIME_METRIC_PATHS, payload["limits"]["runtime_metric_paths"])
+            self.assertEqual(
+                app.MAX_RUNTIME_METRIC_PATH_CHARS,
+                payload["limits"]["runtime_metric_path_chars"],
+            )
+            self.assertEqual(app.LOG_RECORD_MAX_CHARS, payload["limits"]["log_record_chars"])
+            self.assertEqual(app.UPSTREAM_READER_QUEUE_SIZE, payload["upstream_readers"]["queue_size"])
+            self.assertGreaterEqual(payload["upstream_readers"]["peak"], 0)
+            self.assertEqual(
+                app.SSE_KEEPALIVE_INTERVAL_SECONDS,
+                payload["sse_heartbeat"]["interval_seconds"],
+            )
+            self.assertGreaterEqual(payload["sse_heartbeat"]["peak"], 0)
+            self.assertEqual(app.CONTEXT_FILE_CACHE_MAX_ITEMS, payload["context_cache"]["max_items"])
+            self.assertEqual(
+                app.CONTEXT_UPLOAD_STATE_MAX_ITEMS,
+                payload["context_cache"]["max_state_items"],
+            )
+            self.assertTrue(payload["protocol_compatibility"]["chunked_request_body"])
+            self.assertTrue(payload["protocol_compatibility"]["upstream_idle_heartbeat"])
+            self.assertEqual(app.MAX_CHUNK_SIZE_LINE_BYTES, payload["limits"]["chunk_size_line_bytes"])
+            self.assertEqual(app.MAX_CHUNK_TRAILER_BYTES, payload["limits"]["chunk_trailer_bytes"])
+            self.assertEqual(app.HAR_EXTRACT_TIMEOUT_SECONDS, payload["limits"]["har_extract_seconds"])
+            self.assertEqual(app.HELPER_PROCESS_POLL_SECONDS, payload["limits"]["helper_process_poll_seconds"])
+            self.assertEqual(
+                app.BROWSER_LOGIN_LAUNCH_TIMEOUT_MS / 1000,
+                payload["limits"]["browser_login_launch_seconds"],
+            )
+            self.assertEqual(
+                app.BROWSER_LOGIN_NAVIGATION_SLICE_MS / 1000,
+                payload["limits"]["browser_login_navigation_slice_seconds"],
+            )
+            self.assertEqual(
+                app.BROWSER_LOGIN_AUTH_FETCH_TIMEOUT_MS / 1000,
+                payload["limits"]["browser_login_auth_fetch_seconds"],
+            )
+            app._CAPTCHA_MODE = "auto"
+            status, raw = self.request("GET", "/api/status")
+            self.assertEqual(200, status)
+            browser_capable = json.loads(raw)
+            self.assertTrue(browser_capable["captcha_browser_fallback_enabled"])
+            self.assertTrue(browser_capable["legacy_browser_captcha_refresh_enabled"])
+        finally:
+            QuietProxyHandler.fresh_captcha_browser = previous_enabled
+            app._CAPTCHA_MODE = previous_mode
+
+    def test_browser_login_navigation_retries_in_cancellable_slices(self) -> None:
+        class FakePage:
+            def __init__(self):
+                self.goto_calls: list[dict] = []
+                self.load_state_calls: list[tuple[str, int]] = []
+
+            def goto(self, _url, **kwargs):
+                self.goto_calls.append(kwargs)
+                if len(self.goto_calls) == 1:
+                    raise TimeoutError("first navigation slice timed out")
+
+            def is_closed(self):
+                return False
+
+            def wait_for_load_state(self, state, timeout):
+                self.load_state_calls.append((state, timeout))
+
+        page = FakePage()
+        cancellation_checks = 0
+
+        def cancel_check():
+            nonlocal cancellation_checks
+            cancellation_checks += 1
+
+        app._navigate_browser_login_page(
+            page,
+            deadline=time.monotonic() + 2,
+            cancel_check=cancel_check,
+        )
+        self.assertEqual(2, len(page.goto_calls))
+        self.assertTrue(all(call["wait_until"] == "commit" for call in page.goto_calls))
+        self.assertTrue(
+            all(0 < call["timeout"] <= app.BROWSER_LOGIN_NAVIGATION_SLICE_MS for call in page.goto_calls)
+        )
+        self.assertEqual("domcontentloaded", page.load_state_calls[0][0])
+        self.assertLessEqual(page.load_state_calls[0][1], app.BROWSER_LOGIN_DOM_READY_TIMEOUT_MS)
+        self.assertGreaterEqual(cancellation_checks, 4)
+
+    def test_browser_login_navigation_cancels_between_slices(self) -> None:
+        class FakePage:
+            goto_calls = 0
+
+            def goto(self, _url, **_kwargs):
+                self.goto_calls += 1
+                raise TimeoutError("navigation slice timed out")
+
+            def is_closed(self):
+                return False
+
+        page = FakePage()
+        checks = 0
+
+        def cancel_check():
+            nonlocal checks
+            checks += 1
+            if checks >= 2:
+                raise app.ServiceShuttingDown("test shutdown")
+
+        with self.assertRaises(app.ServiceShuttingDown):
+            app._navigate_browser_login_page(
+                page,
+                deadline=time.monotonic() + 30,
+                cancel_check=cancel_check,
+            )
+        self.assertEqual(1, page.goto_calls)
+
+    def test_browser_login_auth_probe_has_abort_timeout(self) -> None:
+        source = Path(app.__file__).read_text(encoding="utf-8")
+        self.assertIn('"timeout": BROWSER_LOGIN_LAUNCH_TIMEOUT_MS', source)
+        self.assertIn("const authController = new AbortController();", source)
+        self.assertIn("signal: authController.signal", source)
+        self.assertIn("clearTimeout(authTimer);", source)
+        self.assertIn("BROWSER_LOGIN_AUTH_FETCH_TIMEOUT_MS,", source)
+
+    def test_browser_login_fails_fast_when_optional_playwright_is_missing(self) -> None:
+        previous = app._PLAYWRIGHT_PACKAGE_AVAILABLE
+        try:
+            app._PLAYWRIGHT_PACKAGE_AVAILABLE = False
+            status, raw = self.request("POST", "/api/auth/browser-login", {"label": "unused"})
+            self.assertEqual(503, status)
+            payload = json.loads(raw)
+            self.assertEqual("browser_automation_unavailable", payload["error"]["code"])
+            self.assertIn("Token/HAR", payload["error"]["message"])
+        finally:
+            app._PLAYWRIGHT_PACKAGE_AVAILABLE = previous
+
+    def test_legacy_browser_captcha_route_is_disabled_in_happydom_mode(self) -> None:
+        previous = (
+            app._CAPTCHA_MODE,
+            app._PLAYWRIGHT_PACKAGE_AVAILABLE,
+            app.get_browser_captcha,
+            QuietProxyHandler.fresh_captcha_browser,
+            QuietProxyHandler.browser_flow_lock,
+        )
+
+        def unexpected_browser(*_args, **_kwargs):
+            raise AssertionError("happydom mode must not launch a browser captcha flow")
+
+        try:
+            app._CAPTCHA_MODE = "happydom"
+            app._PLAYWRIGHT_PACKAGE_AVAILABLE = True
+            app.get_browser_captcha = unexpected_browser
+            QuietProxyHandler.fresh_captcha_browser = True
+            QuietProxyHandler.browser_flow_lock = threading.Lock()
+            status, raw = self.request("POST", "/api/auth/captcha-refresh", {})
+            self.assertEqual(409, status)
+            payload = json.loads(raw)
+            self.assertEqual("legacy_browser_captcha_disabled", payload["error"]["code"])
+            self.assertEqual("feature_disabled", payload["error"]["type"])
+            self.assertFalse(QuietProxyHandler.browser_flow_lock.locked())
+        finally:
+            (
+                app._CAPTCHA_MODE,
+                app._PLAYWRIGHT_PACKAGE_AVAILABLE,
+                app.get_browser_captcha,
+                QuietProxyHandler.fresh_captcha_browser,
+                QuietProxyHandler.browser_flow_lock,
+            ) = previous
+
+    def test_browser_auth_flow_lock_prevents_duplicate_workers_and_progress_clobber(self) -> None:
+        previous_available = app._PLAYWRIGHT_PACKAGE_AVAILABLE
+        previous_login = app.get_browser_login_state
+        previous_mode = app._CAPTCHA_MODE
+        previous_fresh = QuietProxyHandler.fresh_captcha_browser
+        previous_flow_lock = QuietProxyHandler.browser_flow_lock
+        previous_progress_lock = QuietProxyHandler.browser_progress_lock
+        previous_progress = QuietProxyHandler.browser_login_progress
+        previous_profiles = QuietProxyHandler.profiles
+        previous_active = QuietProxyHandler.active_profile_id
+        previous_state = QuietProxyHandler.state
+        release = threading.Event()
+        entered = threading.Event()
+        entered_threads: list[str] = []
+        cancellation_callbacks: list[object] = []
+        sockets: list[app.socket.socket] = []
+
+        def fake_login(**kwargs):
+            entered_threads.append(threading.current_thread().name)
+            cancellation_callbacks.append(kwargs.get("cancel_check"))
+            entered.set()
+            release.wait(timeout=5)
+            return fake_state()
+
+        def read_response(sock: app.socket.socket) -> tuple[int, dict]:
+            sock.settimeout(5)
+            chunks: list[bytes] = []
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            raw = b"".join(chunks)
+            header, body = raw.split(b"\r\n\r\n", 1)
+            status = int(header.split(b"\r\n", 1)[0].split(b" ", 2)[1])
+            return status, json.loads(body.decode("utf-8"))
+
+        try:
+            app._PLAYWRIGHT_PACKAGE_AVAILABLE = True
+            app.get_browser_login_state = fake_login
+            app._CAPTCHA_MODE = "browser"
+            QuietProxyHandler.fresh_captcha_browser = True
+            QuietProxyHandler.browser_flow_lock = threading.Lock()
+            QuietProxyHandler.browser_progress_lock = threading.RLock()
+            QuietProxyHandler.browser_login_progress = {
+                "running": False,
+                "mode": "",
+                "stage": "空闲",
+                "updated_at": "",
+                "error": "",
+            }
+            QuietProxyHandler.profiles = {}
+            QuietProxyHandler.active_profile_id = ""
+            QuietProxyHandler.state = None
+
+            head = (
+                b"POST /api/auth/browser-login HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: 2\r\n"
+                b"Connection: close\r\n\r\n"
+            )
+            for _ in range(2):
+                sock = app.socket.create_connection(("127.0.0.1", self.server.server_port), timeout=2)
+                sock.sendall(head)
+                sockets.append(sock)
+            deadline = time.time() + 2
+            while self.server.handler_status()["active"] < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            for sock in sockets:
+                sock.sendall(b"{}")
+
+            self.assertTrue(entered.wait(timeout=2))
+            time.sleep(0.15)
+            self.assertEqual(1, len(entered_threads), "同一时刻只能有一个浏览器 worker")
+            self.assertEqual(1, len(cancellation_callbacks))
+            self.assertTrue(callable(cancellation_callbacks[0]))
+
+            status, raw = self.request("GET", "/api/auth/browser-login/status")
+            progress = json.loads(raw)
+            self.assertEqual(200, status)
+            self.assertTrue(progress["running"])
+            self.assertTrue(progress["locked"])
+            self.assertEqual("login", progress["mode"])
+
+            status, raw = self.request("POST", "/api/auth/captcha-refresh", {})
+            busy = json.loads(raw)
+            self.assertEqual(409, status)
+            self.assertEqual("auth_flow_busy", busy["error"]["code"])
+            self.assertTrue(busy["flow"]["running"])
+            self.assertTrue(busy["flow"]["locked"])
+            self.assertEqual("login", busy["flow"]["mode"])
+
+            release.set()
+            responses = [read_response(sock) for sock in sockets]
+            self.assertEqual([200, 409], sorted(status for status, _payload in responses))
+            rejected = next(payload for status, payload in responses if status == 409)
+            self.assertEqual("auth_flow_busy", rejected["error"]["code"])
+            with QuietProxyHandler.browser_progress_lock:
+                final_progress = dict(QuietProxyHandler.browser_login_progress)
+            self.assertFalse(final_progress["running"])
+            self.assertEqual("已保存并切换账号", final_progress["stage"])
+            self.assertFalse(QuietProxyHandler.browser_flow_lock.locked())
+        finally:
+            release.set()
+            for sock in sockets:
+                sock.close()
+            app._PLAYWRIGHT_PACKAGE_AVAILABLE = previous_available
+            app.get_browser_login_state = previous_login
+            app._CAPTCHA_MODE = previous_mode
+            QuietProxyHandler.fresh_captcha_browser = previous_fresh
+            QuietProxyHandler.browser_flow_lock = previous_flow_lock
+            QuietProxyHandler.browser_progress_lock = previous_progress_lock
+            QuietProxyHandler.browser_login_progress = previous_progress
+            QuietProxyHandler.profiles = previous_profiles
+            QuietProxyHandler.active_profile_id = previous_active
+            QuietProxyHandler.state = previous_state
 
     def test_response_store_never_exceeds_configured_cap(self) -> None:
         handler = QuietProxyHandler.__new__(QuietProxyHandler)
@@ -3365,6 +8368,51 @@ class ProtocolAdaptersTest(unittest.TestCase):
         newest = handler.response_store[f"resp_{total - 1}"]
         self.assertGreaterEqual(newest.expires_at, monotonic_before + app.RESPONSE_STORE_TTL_SECONDS)
         self.assertLessEqual(newest.expires_at, monotonic_after + app.RESPONSE_STORE_TTL_SECONDS)
+        self.assertGreater(newest.size_bytes, 0)
+
+    def test_response_store_enforces_total_and_per_item_byte_budgets(self) -> None:
+        handler = QuietProxyHandler.__new__(QuietProxyHandler)
+        QuietProxyHandler.response_store = {}
+        previous_total = app.MAX_RESPONSE_STORE_BYTES
+        previous_item = app.MAX_STORED_RESPONSE_BYTES
+        try:
+            app.MAX_RESPONSE_STORE_BYTES = 500
+            app.MAX_STORED_RESPONSE_BYTES = 400
+            for index in range(5):
+                self.assertTrue(handler._store_response(f"resp_bytes_{index}", {"text": "x" * 150}, []))
+
+            status = handler._response_store_status()
+            self.assertLessEqual(status["bytes"], 500)
+            self.assertLess(len(handler.response_store), 5)
+            self.assertNotIn("resp_bytes_0", handler.response_store)
+            self.assertIn("resp_bytes_4", handler.response_store)
+
+            app.MAX_STORED_RESPONSE_BYTES = 64
+            accepted = handler._store_response("resp_oversized", {"text": "y" * 500}, [])
+            self.assertFalse(accepted)
+            self.assertNotIn("resp_oversized", handler.response_store)
+        finally:
+            app.MAX_RESPONSE_STORE_BYTES = previous_total
+            app.MAX_STORED_RESPONSE_BYTES = previous_item
+            QuietProxyHandler.response_store = {}
+
+        html = app.WEB_INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn('id="info-response-store"', html)
+        self.assertIn("responseStore.max_items", html)
+        self.assertIn('id="info-history-store"', html)
+        self.assertIn("historyStore.max_records", html)
+        self.assertIn('id="info-log-store"', html)
+        self.assertIn('id="info-auto-delete"', html)
+        self.assertIn('id="stats-runtime-delete-queue"', html)
+        self.assertIn('id="info-http-handlers"', html)
+        self.assertIn('id="stats-runtime-http-handlers"', html)
+        self.assertIn('id="info-upstream-readers"', html)
+        self.assertIn('id="stats-runtime-upstream-readers"', html)
+        self.assertIn('id="info-sse-heartbeat"', html)
+        self.assertIn('id="stats-runtime-sse-heartbeat"', html)
+        self.assertIn('id="info-context-cache"', html)
+        self.assertIn('id="stats-runtime-context-cache"', html)
+        self.assertIn("runtime.request_timeouts", html)
 
     def test_claude_code_history_and_model_markers(self) -> None:
         # Claude Code serializes historical tool calls as <tool_call> text;
@@ -3409,11 +8457,11 @@ class ProtocolAdaptersTest(unittest.TestCase):
             # 冷却期内直接复用存储验证码，不再触发慢速浏览器流程。
             result = app.resolve_fresh_captcha(state, "glm-5.2", ExplodingWorker(), timeout_ms=1000)
             self.assertEqual("stored-captcha-280", result)
-            # 无存储验证码且 worker 失败 -> 明确提示重新授权。
+            # 无存储验证码且 solver 失败 -> 同时提示检查本地求解器和登录态。
             empty = fake_state()
             empty.captcha_verify_param = ""
             app._set_captcha_degraded(-3600)
-            with self.assertRaisesRegex(RuntimeError, "重新完成浏览器授权"):
+            with self.assertRaisesRegex(RuntimeError, "确认本地求解器可用"):
                 app.resolve_fresh_captcha(empty, "glm-5.2", BrokenWorker(), timeout_ms=1000)
         finally:
             app._CAPTCHA_MODE = original_mode
@@ -3494,6 +8542,26 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertTrue(data["chat_delete_pending"])
         self.assertEqual(["00000000-0000-0000-0000-0000000000bb"], self.deleted_chats)
 
+    def test_failed_background_chat_delete_remains_in_restart_journal(self) -> None:
+        original_delete = app.delete_zai_chat
+
+        def failing_delete(_state, _chat_id, **_kwargs):
+            raise app.UpstreamRequestError("temporary cleanup outage")
+
+        try:
+            app.delete_zai_chat = failing_delete
+            status, raw = self.request("POST", "/api/chat", {"message": "journal cleanup", "stream": False})
+        finally:
+            app.delete_zai_chat = original_delete
+        self.assertEqual(200, status)
+        payload = json.loads(raw)
+        self.assertTrue(payload["chat_delete_pending"])
+        journal_status = app.pending_chat_delete_status()
+        self.assertEqual(1, journal_status["journal_pending"])
+        stored = json.loads(app.PENDING_DELETE_STORE_PATH.read_text(encoding="utf-8"))
+        self.assertEqual("auto_delete", stored["items"][0]["reason"])
+        self.assertEqual(1, stored["items"][0]["attempts"])
+
     def test_file_upload_requires_active_state(self) -> None:
         original_state = QuietProxyHandler.state
         original_profiles = QuietProxyHandler.profiles
@@ -3516,6 +8584,124 @@ class ProtocolAdaptersTest(unittest.TestCase):
         data = json.loads(raw)
         self.assertIn("登录态", data["error"]["message"])
 
+
+    def test_captcha_worker_routes_concurrent_results_to_the_original_caller(self) -> None:
+        worker = app.CaptchaWorker(idle_timeout_sec=0)
+        first_taken = threading.Event()
+        errors: list[BaseException] = []
+        results: dict[str, str] = {}
+        results_lock = threading.Lock()
+
+        def fake_run() -> None:
+            first = worker._requests.get(timeout=2)
+            self.assertIsNotNone(first)
+            first_taken.set()
+            second = worker._requests.get(timeout=2)
+            self.assertIsNotNone(second)
+            assert first is not None and second is not None
+            # Deliberately complete in reverse order. A shared result queue can
+            # let each waiter consume and discard the other request's result.
+            worker._publish(second, f"captcha-{second.selected_model}")
+            worker._publish(first, f"captcha-{first.selected_model}")
+
+        worker._run = fake_run  # type: ignore[method-assign]
+
+        def solve(model: str) -> None:
+            try:
+                value = worker.solve(fake_state(), model, timeout_ms=10_000)
+                with results_lock:
+                    results[model] = value
+            except BaseException as exc:
+                errors.append(exc)
+
+        first_thread = threading.Thread(target=solve, args=("model-a",), daemon=True)
+        second_thread = threading.Thread(target=solve, args=("model-b",), daemon=True)
+        try:
+            first_thread.start()
+            self.assertTrue(first_taken.wait(timeout=2))
+            second_thread.start()
+            first_thread.join(timeout=3)
+            second_thread.join(timeout=3)
+            self.assertFalse(first_thread.is_alive())
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual([], errors)
+            self.assertEqual(
+                {"model-a": "captcha-model-a", "model-b": "captcha-model-b"},
+                results,
+            )
+        finally:
+            worker.close()
+
+    def test_captcha_worker_startup_failure_reaches_waiter_immediately(self) -> None:
+        class BrokenPlaywrightFactory:
+            def __call__(self):
+                return self
+
+            def start(self):
+                raise RuntimeError("playwright startup failed")
+
+        original_loader = app._captcha_playwright
+        worker = app.CaptchaWorker(idle_timeout_sec=0)
+        try:
+            app._captcha_playwright = lambda: BrokenPlaywrightFactory()
+            started = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "playwright startup failed"):
+                worker.solve(fake_state(), "glm-5.2", timeout_ms=10_000)
+            self.assertLess(time.monotonic() - started, 2.0)
+            status = worker.status()
+            self.assertFalse(status["thread_alive"])
+            self.assertEqual(0, status["pending"])
+        finally:
+            worker.close()
+            app._captcha_playwright = original_loader
+
+    def test_captcha_worker_backpressure_is_bounded(self) -> None:
+        worker = app.CaptchaWorker(idle_timeout_sec=0, max_pending=1)
+        worker._start_locked = lambda: None  # type: ignore[method-assign]
+        parked = app._CaptchaWorkItem(
+            request_id="parked",
+            state=fake_state(),
+            selected_model="glm-5.2",
+            timeout_ms=10_000,
+            deadline=time.monotonic() + 10,
+        )
+        worker._requests.put_nowait(parked)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "backlog is full"):
+                worker.solve(fake_state(), "glm-5.2", timeout_ms=10_000)
+            status = worker.status()
+            self.assertEqual(1, status["pending"])
+            self.assertEqual(1, status["max_pending"])
+            self.assertEqual(1, status["backpressure_total"])
+        finally:
+            worker.close()
+
+    def test_captcha_worker_cancellation_marks_queued_task_abandoned(self) -> None:
+        worker = app.CaptchaWorker(idle_timeout_sec=0)
+        worker._start_locked = lambda: None  # type: ignore[method-assign]
+        checks = 0
+
+        def cancel_check() -> None:
+            nonlocal checks
+            checks += 1
+            if checks >= 2:
+                raise app.ServiceShuttingDown("test shutdown")
+
+        try:
+            with self.assertRaises(app.ServiceShuttingDown):
+                worker.solve(
+                    fake_state(),
+                    "glm-5.2",
+                    timeout_ms=10_000,
+                    cancel_check=cancel_check,
+                )
+            item = worker._requests.get_nowait()
+            self.assertIsNotNone(item)
+            assert item is not None
+            self.assertTrue(item.cancelled.is_set())
+            self.assertTrue(item.result.empty())
+        finally:
+            worker.close()
 
     def test_captcha_worker_reuses_page_and_retries_once(self) -> None:
         class FakePage:
@@ -3712,6 +8898,30 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("上游中断", raw)
         self.assertEqual(["00000000-0000-0000-0000-0000000000cc"], self.deleted_chats)
 
+    def test_zero_delta_upstream_interrupt_is_exposed_as_retryable(self) -> None:
+        original_stream = app.stream_zai_completion
+
+        def failing_before_delta(_state, _prompt, **_kwargs):
+            if False:
+                yield ""
+            raise RuntimeError("上游中断")
+
+        try:
+            app.stream_zai_completion = failing_before_delta
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.2",
+                    "messages": [{"role": "user", "content": "你好"}],
+                    "stream": False,
+                },
+            )
+        finally:
+            app.stream_zai_completion = original_stream
+        self.assertEqual(503, status)
+        self.assertIn("上游中断", raw)
+
     def test_tool_parser_xml_fallback_for_unescaped_text(self) -> None:
         tools = [{"name": "search", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}]
         policy = app.ToolChoice()
@@ -3742,8 +8952,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             '</|DSML|invoke></|DSML|tool_calls>'
         )
         turn = app.finalize_protocol_turn(request, "", markup)
-        self.assertEqual(1, len(turn.tool_calls))
-        self.assertEqual("get_weather", turn.tool_calls[0].name)
+        self.assertEqual([], turn.tool_calls)
         self.assertEqual("", turn.text)
         self.assertNotIn("DSML", turn.thinking)
 

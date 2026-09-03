@@ -266,6 +266,103 @@
     .btn-secondary.active { color: var(--cyan-core); border-color: var(--cyan-border); background: var(--cyan-subtle); }
     .btn-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
+    /* ------------------------------------------------------------------
+       账号池：把“当前账号”变成可观察、可接管的容量池
+       ------------------------------------------------------------------ */
+    .account-pool-card { border-color: rgba(34, 211, 238, 0.22); }
+    .account-pool-head {
+      display: flex; align-items: center; gap: 12px; padding: 16px;
+      background:
+        linear-gradient(90deg, rgba(34, 211, 238, 0.08), transparent 48%),
+        repeating-linear-gradient(135deg, rgba(148, 163, 184, 0.035) 0, rgba(148, 163, 184, 0.035) 1px, transparent 1px, transparent 12px);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    .account-pool-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+    .account-kicker { color: var(--cyan-core); font: 800 9px var(--font-mono); letter-spacing: 0.16em; }
+    .account-routing-pill {
+      flex: none; display: inline-flex; align-items: center; gap: 6px; padding: 5px 9px;
+      border: 1px solid var(--border-subtle); border-radius: 999px;
+      color: var(--text-muted); background: rgba(7, 10, 16, 0.5); font: 700 10px var(--font-mono);
+    }
+    .account-routing-pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--text-dim); }
+    .account-routing-pill.ready { color: var(--emerald-core); border-color: rgba(52, 211, 153, 0.28); }
+    .account-routing-pill.ready::before { background: var(--emerald-core); box-shadow: 0 0 6px rgba(52, 211, 153, 0.65); }
+    .account-routing-pill.busy { color: var(--amber-core); border-color: rgba(251, 191, 36, 0.28); }
+    .account-routing-pill.busy::before { background: var(--amber-core); }
+    .account-routing-pill.error { color: var(--rose-core); border-color: rgba(251, 113, 133, 0.28); }
+    .account-routing-pill.error::before { background: var(--rose-core); }
+    .account-pool-metrics { display: grid; grid-template-columns: repeat(4, 1fr); border-bottom: 1px solid var(--border-subtle); }
+    .account-pool-metric { min-width: 0; padding: 14px 16px; border-right: 1px solid var(--border-subtle); background: rgba(7, 10, 16, 0.36); }
+    .account-pool-metric:last-child { border-right: 0; }
+    .account-pool-metric span { display: block; color: var(--text-dim); font-size: 10px; }
+    .account-pool-metric strong { display: block; margin-top: 4px; color: var(--text-main); font: 700 24px var(--font-display); letter-spacing: -0.02em; }
+    .account-pool-metric small { display: block; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font: 9.5px var(--font-mono); }
+    .account-pool-metric-accent strong { color: var(--cyan-core); }
+    .account-routing-status { display: flex; align-items: center; gap: 8px; min-height: 38px; padding: 10px 16px; color: var(--text-muted); font-size: 11px; background: rgba(10, 13, 19, 0.5); }
+    .account-routing-dot { width: 7px; height: 7px; flex: none; border-radius: 2px; background: var(--text-dim); transform: rotate(45deg); }
+    .account-routing-status.ready { color: var(--emerald-core); }
+    .account-routing-status.ready .account-routing-dot { background: var(--emerald-core); }
+    .account-routing-status.busy { color: var(--amber-core); }
+    .account-routing-status.busy .account-routing-dot { background: var(--amber-core); }
+    .account-routing-status.error { color: var(--rose-core); }
+    .account-routing-status.error .account-routing-dot { background: var(--rose-core); }
+    .account-profile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; }
+    .account-profile-card { min-width: 0; padding: 13px; border: 1px solid var(--border-subtle); border-radius: var(--radius-md); background: var(--bg-input); transition: border-color 0.15s, background 0.15s, transform 0.15s; }
+    .account-profile-card:hover { border-color: var(--border-medium); background: var(--bg-surface-elevated); transform: translateY(-1px); }
+    .account-profile-card.active { border-color: var(--cyan-border); background: linear-gradient(135deg, var(--cyan-subtle), rgba(7, 10, 16, 0.44) 58%); }
+    .account-profile-card.selected { box-shadow: inset 0 0 0 1px rgba(192, 132, 252, 0.46); }
+    .account-profile-card.full { border-color: rgba(251, 191, 36, 0.3); }
+    .account-profile-head { display: flex; align-items: flex-start; gap: 8px; }
+    .account-profile-ident { min-width: 0; flex: 1; }
+    .account-profile-name { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--text-main); font-size: 12.5px; font-weight: 700; }
+    .account-profile-name-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .account-route-index {
+      flex: none; display: inline-flex; align-items: center; justify-content: center;
+      width: 22px; height: 18px; border: 1px solid var(--border-medium); border-radius: 4px;
+      color: var(--text-dim); background: rgba(7, 10, 16, 0.55); font: 800 9px var(--font-mono);
+    }
+    .account-profile-card.active .account-route-index { color: var(--cyan-core); border-color: var(--cyan-border); }
+    .account-profile-user { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); font: 10px var(--font-mono); }
+    .account-profile-badge { flex: none; padding: 3px 6px; border: 1px solid var(--border-subtle); border-radius: 4px; color: var(--text-dim); font: 700 9px var(--font-mono); }
+    .account-profile-badge.active { color: var(--cyan-core); border-color: var(--cyan-border); background: var(--cyan-subtle); }
+    .account-profile-badge.available { color: var(--emerald-core); border-color: rgba(52, 211, 153, 0.25); background: var(--emerald-subtle); }
+    .account-profile-badge.busy { color: var(--amber-core); border-color: rgba(251, 191, 36, 0.25); background: var(--amber-subtle); }
+    .account-profile-meta { display: flex; gap: 7px; margin-top: 11px; color: var(--text-dim); font-size: 10px; }
+    .account-profile-meta span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .account-profile-meta span:first-child { color: var(--text-muted); }
+    .account-profile-slot { margin-top: 12px; }
+    .account-profile-slot-head { display: flex; justify-content: space-between; gap: 8px; color: var(--text-dim); font: 10px var(--font-mono); }
+    .account-profile-slot-head strong { color: var(--text-main); font-weight: 700; }
+    .account-slot-track { height: 7px; margin-top: 6px; overflow: hidden; border-radius: 999px; background: rgba(148, 163, 184, 0.11); }
+    .account-slot-fill { height: 100%; width: 0; border-radius: inherit; background: linear-gradient(90deg, var(--cyan-core), var(--violet-light)); transition: width 0.25s ease, background 0.2s; }
+    .account-slot-fill.full { background: var(--amber-core); }
+    .account-profile-actions { display: flex; gap: 6px; margin-top: 12px; }
+    .account-profile-actions .tool-btn { flex: 1; justify-content: center; min-width: 0; padding: 5px 7px; font-size: 10.5px; }
+    .account-profile-actions .tool-btn[data-profile-action="remove"] { color: var(--rose-core); }
+    .account-empty { grid-column: 1 / -1; padding: 24px 14px; border: 1px dashed var(--border-medium); border-radius: var(--radius-md); color: var(--text-muted); text-align: center; line-height: 1.8; }
+    .account-empty span { color: var(--text-dim); font-size: 11px; }
+    .account-default-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 0.9fr) auto; align-items: end; gap: 10px; padding-top: 4px; }
+    .account-default-copy { min-width: 0; }
+    .account-default-copy .field-label { color: var(--text-main); }
+    .account-default-copy .control-desc { display: block; margin-top: 4px; color: var(--text-dim); font-size: 10.5px; line-height: 1.5; }
+    .account-security-note { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--text-dim); font-size: 10.5px; line-height: 1.45; }
+    .account-captcha-note { margin-top: 10px; }
+    .account-security-mark { flex: none; padding: 3px 5px; border: 1px solid var(--border-medium); border-radius: 4px; color: var(--text-muted); font: 700 9px var(--font-mono); }
+    @media (max-width: 850px) {
+      .account-pool-head { flex-wrap: wrap; }
+      .account-routing-pill { margin-left: auto; }
+      .account-pool-metrics { grid-template-columns: repeat(2, 1fr); }
+      .account-pool-metric:nth-child(2) { border-right: 0; }
+      .account-pool-metric:nth-child(-n+2) { border-bottom: 1px solid var(--border-subtle); }
+      .account-default-row { grid-template-columns: 1fr; align-items: stretch; }
+      .account-default-row .btn-secondary { width: 100%; }
+    }
+    @media (max-width: 520px) {
+      .account-pool-metrics { grid-template-columns: 1fr 1fr; }
+      .account-pool-metric { padding: 12px; }
+      .account-pool-metric strong { font-size: 21px; }
+    }
+
     .tool-btn {
       display: inline-flex; align-items: center; gap: 5px;
       padding: 5px 10px;
@@ -277,7 +374,8 @@
       cursor: pointer;
       transition: all 0.15s;
     }
-    .tool-btn:hover { color: var(--text-main); border-color: var(--border-medium); }
+    .tool-btn:hover:not(:disabled) { color: var(--text-main); border-color: var(--border-medium); }
+    .tool-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
     .toggle-row {
       display: flex; align-items: center; gap: 10px;
@@ -929,6 +1027,7 @@
     }
 
     .msg-content { overflow-wrap: break-word; }
+    .msg-content.stream-plain { white-space: pre-wrap; }
     .msg-content p { margin: 0.4em 0; }
     .msg-content h1, .msg-content h2, .msg-content h3 { margin: 0.7em 0 0.35em; line-height: 1.4; }
     .msg-content h1 { font-size: 1.25em; } .msg-content h2 { font-size: 1.15em; } .msg-content h3 { font-size: 1.05em; }
@@ -1351,9 +1450,9 @@
                   <span class="tile-hint" id="dash-models-count">- 个可用模型</span>
                 </div>
                 <div class="tile">
-                  <span class="tile-label">验证码 / 保护</span>
+                  <span class="tile-label">验证码求解</span>
                   <span class="tile-value mono" id="dash-captcha">-</span>
-                  <span class="tile-hint" id="dash-protection">API Key 未启用</span>
+                  <span class="tile-hint" id="dash-protection">接口保护未启用</span>
                 </div>
               </div>
 
@@ -1402,6 +1501,17 @@
                       <div class="kv-row"><span class="kv-key">设备指纹</span><span id="info-device-fp" class="kv-val"><code>-</code></span></div>
                       <div class="kv-row"><span class="kv-key">上游超时</span><span id="dash-timeout" class="kv-val"><code>-</code></span></div>
                       <div class="kv-row"><span class="kv-key">繁忙重试</span><span id="dash-retry" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">Responses 缓存</span><span id="info-response-store" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">历史详情</span><span id="info-history-store" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">日志存储</span><span id="info-log-store" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">后台清理</span><span id="info-auto-delete" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">验证码回退</span><span id="info-captcha-worker" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">HTTP 处理</span><span id="info-http-handlers" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">上传任务</span><span id="info-upload-slots" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">上游响应</span><span id="info-upstream-responses" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">上游读取</span><span id="info-upstream-readers" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">SSE 心跳</span><span id="info-sse-heartbeat" class="kv-val"><code>-</code></span></div>
+                      <div class="kv-row"><span class="kv-key">上下文缓存</span><span id="info-context-cache" class="kv-val"><code>-</code></span></div>
                     </div>
                   </div>
                 </div>
@@ -1522,6 +1632,15 @@
                       <div class="kv-row"><span class="kv-key">HTTP P50 / P95</span><span id="stats-runtime-latency" class="kv-val">—</span></div>
                       <div class="kv-row"><span class="kv-key">4xx / 5xx</span><span id="stats-runtime-errors" class="kv-val">—</span></div>
                       <div class="kv-row"><span class="kv-key">当前并发</span><span id="stats-runtime-inflight" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">统计路径槽位</span><span id="stats-runtime-metric-paths" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">删除队列</span><span id="stats-runtime-delete-queue" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">验证码回退队列</span><span id="stats-runtime-captcha-worker" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">HTTP Handler</span><span id="stats-runtime-http-handlers" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">上传任务</span><span id="stats-runtime-upload-slots" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">上游响应限制</span><span id="stats-runtime-upstream-responses" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">上游读取线程</span><span id="stats-runtime-upstream-readers" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">下游 SSE 心跳</span><span id="stats-runtime-sse-heartbeat" class="kv-val">—</span></div>
+                      <div class="kv-row"><span class="kv-key">上下文附件缓存</span><span id="stats-runtime-context-cache" class="kv-val">—</span></div>
                     </div>
                     <div id="stats-paths" class="stats-table"><div class="stats-empty">暂无本地路由调用</div></div>
                   </div>
@@ -1653,7 +1772,7 @@
                 <button id="btn-history-refresh" class="tool-btn" title="重新拉取列表"><span>刷新</span></button>
               </div>
               <div class="history-filters">
-                <input id="history-search-input" class="input-custom" type="text" placeholder="搜索标题 / 内容 / 模型…" />
+                <input id="history-search-input" class="input-custom" type="text" maxlength="256" placeholder="搜索标题 / 内容 / 模型…" />
                 <select id="history-status-select" class="select-custom">
                   <option value="">全部状态</option>
                   <option value="success">成功</option>
@@ -1662,6 +1781,7 @@
                   <option value="streaming">进行中</option>
                 </select>
               </div>
+              <div id="history-store-status" class="status-banner error" style="display:none;"></div>
               <div id="history-list" class="history-list">
                 <div class="history-list-empty">正在加载…</div>
               </div>
@@ -1714,29 +1834,71 @@
         <section id="page-accounts" class="page">
           <div class="page-scroll">
             <div class="page-inner">
-              <div class="card">
-                <div class="card-head">
-                  <span class="card-title">登录态账号</span>
-                  <span class="card-desc">DPAPI 加密保存在本机 profiles.local.json</span>
-                  <div class="card-head-spacer"></div>
+              <div class="card account-pool-card">
+                <div class="account-pool-head">
+                  <div class="account-pool-copy">
+                    <span class="account-kicker">ACCOUNT POOL / ROUTER</span>
+                    <span class="card-title">账号池调度</span>
+                    <span class="card-desc">每个账号最多 3 个生成；当前账号满载后自动接管下一个账号</span>
+                  </div>
+                  <div id="account-routing-pill" class="account-routing-pill standby">自动分配待命</div>
                   <button id="btn-refresh-profiles" class="tool-btn" title="刷新登录态列表">
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 4v6h-6M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
                     <span>刷新</span>
                   </button>
                 </div>
+                <div class="account-pool-metrics">
+                  <div class="account-pool-metric">
+                    <span>已连接账号</span>
+                    <strong id="account-pool-profile-count">0</strong>
+                    <small id="account-pool-profile-meta">等待登录态</small>
+                  </div>
+                  <div class="account-pool-metric">
+                    <span>总生成容量</span>
+                    <strong id="account-pool-capacity">0</strong>
+                    <small id="account-pool-capacity-meta">每账号 3 个槽位</small>
+                  </div>
+                  <div class="account-pool-metric">
+                    <span>正在生成</span>
+                    <strong id="account-pool-inflight">0</strong>
+                    <small id="account-pool-inflight-meta">当前账号 0</small>
+                  </div>
+                  <div class="account-pool-metric account-pool-metric-accent">
+                    <span>可接入槽位</span>
+                    <strong id="account-pool-available">0</strong>
+                    <small id="account-pool-available-meta">自动分配开启</small>
+                  </div>
+                </div>
+                <div id="account-routing-status" class="account-routing-status">
+                  <span class="account-routing-dot"></span>
+                  <span>正在读取账号池状态…</span>
+                </div>
+              </div>
+
+              <div class="card account-list-card">
+                <div class="card-head">
+                  <span class="card-title">账号列表</span>
+                  <span class="card-desc">卡片显示实时占用；新请求按“默认优先 → 后续账号”顺序分配</span>
+                  <div class="card-head-spacer"></div>
+                </div>
                 <div class="card-body">
-                  <div class="field-group">
-                    <label class="field-label" for="profile-select">当前生效账号</label>
+                  <div id="profile-pool-list" class="account-profile-grid">
+                    <div class="account-empty">暂无已保存账号<br><span>添加一个账号后，自动并发分配会立即可用</span></div>
+                  </div>
+                  <div class="account-default-row">
+                    <div class="account-default-copy">
+                      <span class="field-label">默认优先账号</span>
+                      <span class="control-desc">新会话优先使用它；满 3 个后自动顺延到下一个可用账号</span>
+                    </div>
                     <select id="profile-select" class="select-custom"></select>
+                    <button id="btn-switch-profile" class="btn-secondary btn-accent" type="button">设为优先</button>
                   </div>
                   <div class="btn-grid-2">
-                    <button id="btn-switch-profile" class="btn-secondary btn-accent" type="button">切换到选中账号</button>
                     <button id="btn-remove-profile" class="btn-secondary btn-danger" type="button">删除选中账号</button>
-                  </div>
-                  <div class="btn-grid-2">
                     <button id="btn-compact-profiles" class="btn-secondary" type="button" disabled>清理同账号重复登录态</button>
-                    <button id="btn-captcha-refresh" class="btn-secondary" type="button" disabled title="为选中账号手动采集 AliyunCaptcha 验证码参数">手动采集验证码</button>
                   </div>
+                  <div class="account-security-note account-captcha-note"><span class="account-security-mark">AUTO</span><span>验证码按服务端模式自动处理；此处不需要手动采集，浏览器或 HAR 仅用于获取登录态。</span></div>
+                  <div class="account-security-note"><span class="account-security-mark">DPAPI</span><span>登录态仅保存在本机加密 profiles.local.json</span></div>
                   <div id="auth-status-banner" class="status-banner">读取登录态状态中...</div>
                 </div>
               </div>
@@ -1874,6 +2036,7 @@
                     <input id="history-max-records-input" class="input-custom" type="number" min="50" max="2000" step="50" value="300">
                   </div>
                   <button id="btn-save-settings" class="btn-secondary btn-accent btn-full" type="button">保存当前为默认设置</button>
+                  <div id="settings-store-status" class="status-banner standby">正在读取默认设置存储状态…</div>
                 </div>
               </div>
             </div>
@@ -1891,12 +2054,14 @@
                 </div>
                 <div class="card-body">
                   <div class="field-group">
-                    <label class="field-label" for="api-key-config-input">新密钥</label>
-                    <input id="api-key-config-input" class="input-custom" type="password" placeholder="留空不可保存；清除使用下方按钮" autocomplete="new-password">
+                    <label class="field-label" for="api-key-config-input">新密钥
+                      <span class="control-desc">最多 4096 字符，不允许控制字符</span>
+                    </label>
+                    <input id="api-key-config-input" class="input-custom" type="password" maxlength="4096" placeholder="留空不可保存；清除使用下方按钮" autocomplete="new-password">
                   </div>
                   <div class="field-group">
                     <label class="field-label" for="api-key-current-input">当前密钥（已启用时必填）</label>
-                    <input id="api-key-current-input" class="input-custom" type="password" autocomplete="current-password">
+                    <input id="api-key-current-input" class="input-custom" type="password" maxlength="4096" autocomplete="current-password">
                   </div>
                   <div class="btn-grid-2">
                     <button id="btn-save-api-key-config" class="btn-secondary btn-accent" type="button">保存到服务</button>
@@ -1964,7 +2129,7 @@
                 <div class="card-body">
                   <div class="field-group">
                     <label class="field-label" for="api-key-input">会话访问密钥</label>
-                    <input id="api-key-input" class="input-custom" type="password" placeholder="服务已启用时输入密钥" autocomplete="off">
+                    <input id="api-key-input" class="input-custom" type="password" maxlength="4096" placeholder="服务已启用时输入密钥" autocomplete="off">
                   </div>
                   <div class="btn-grid-2">
                     <button id="btn-set-api-key" class="btn-secondary btn-accent" type="button">保存到当前标签页</button>
@@ -2038,6 +2203,7 @@
     // ==========================================================================
     const state = {
       activeProfileId: "",
+      currentChatProfileId: "",
       chatBusy: false,
       currentChatId: "",
       currentSessionId: "",
@@ -2051,11 +2217,24 @@
       apiKey: "",
       apiKeyRequired: false,
       apiKeySource: "store",
-      lastStatus: null
+      playwrightAvailable: true,
+      browserLoginBusy: false,
+      lastStatus: null,
+      profiles: [],
+      maxProfiles: 0,
+      concurrency: null
     };
 
     const STORAGE_KEY = "glm2api_local_sessions_v1";
     const API_KEY_SESSION_KEY = "glm2api_api_key_session_v1";
+    const LOCAL_SESSION_MAX_TOTAL = 120;
+    const LOCAL_SESSION_MAX_PER_PROFILE = 30;
+    const LOCAL_SESSION_MAX_SCAN = 1000;
+    const LOCAL_SESSION_MAX_MESSAGES = 40;
+    const LOCAL_SESSION_TEXT_CHARS = 20000;
+    const LOCAL_SESSION_MAX_ATTACHMENTS = 32;
+    const LOCAL_SESSION_STORAGE_CHAR_BUDGET = 1500000;
+    let localSessionStorageWarningShown = false;
 
     try {
       state.apiKey = sessionStorage.getItem(API_KEY_SESSION_KEY) || "";
@@ -2069,48 +2248,188 @@
       return headers;
     }
 
+    const MANAGEMENT_FETCH_TIMEOUT_MS = 10000;
+    const UPSTREAM_CONTROL_FETCH_TIMEOUT_MS = 15000;
+    const FILE_UPLOAD_FETCH_TIMEOUT_MS = 10 * 60 * 1000;
+    const HAR_UPLOAD_FETCH_TIMEOUT_MS = 10 * 60 * 1000;
+    const BROWSER_LOGIN_FETCH_TIMEOUT_MS = 330 * 1000;
+
+    async function fetchWithTimeout(resource, options = {}, timeoutMs = 10000) {
+      const controller = new AbortController();
+      const externalSignal = options.signal;
+      let timedOut = false;
+      const forwardAbort = () => controller.abort();
+      if (externalSignal?.aborted) {
+        forwardAbort();
+      } else if (externalSignal) {
+        externalSignal.addEventListener("abort", forwardAbort, { once: true });
+      }
+      const timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, Math.max(1000, Number(timeoutMs) || MANAGEMENT_FETCH_TIMEOUT_MS));
+      try {
+        return await fetch(resource, { ...options, signal: controller.signal });
+      } catch (error) {
+        if (error?.name === "AbortError" && timedOut) throw new Error("本地服务响应超时");
+        throw error;
+      } finally {
+        clearTimeout(timer);
+        externalSignal?.removeEventListener?.("abort", forwardAbort);
+      }
+    }
+
+    function profileHeaders(profileId = "", extra = {}) {
+      const headers = apiHeaders(extra);
+      if (profileId) headers["X-GLM2API-Profile-ID"] = profileId;
+      return headers;
+    }
+
+    function normalizeLocalAttachment(value) {
+      if (!value || typeof value !== "object") return null;
+      const name = typeof value.name === "string" ? value.name.slice(0, 260) : "";
+      if (!name) return null;
+      const size = Number(value.size);
+      const lastModified = Number(value.lastModified);
+      return {
+        name,
+        size: Number.isFinite(size) ? Math.max(0, Math.floor(size)) : 0,
+        type: typeof value.type === "string" ? value.type.slice(0, 160) : "",
+        lastModified: Number.isFinite(lastModified) ? Math.max(0, Math.floor(lastModified)) : 0
+      };
+    }
+
+    function normalizeLocalMessage(value, textChars = LOCAL_SESSION_TEXT_CHARS) {
+      if (!value || typeof value !== "object") return null;
+      const role = ["user", "assistant", "system"].includes(value.role) ? value.role : "assistant";
+      const attachments = (Array.isArray(value.attachments) ? value.attachments : [])
+        .slice(0, LOCAL_SESSION_MAX_ATTACHMENTS)
+        .map(normalizeLocalAttachment)
+        .filter(Boolean);
+      return {
+        role,
+        content: (typeof value.content === "string" ? value.content : "").slice(0, textChars),
+        thinking: (typeof value.thinking === "string" ? value.thinking : "").slice(0, textChars),
+        time: typeof value.time === "string" ? value.time.slice(0, 24) : "",
+        attachments,
+        model: typeof value.model === "string" ? value.model.slice(0, 80) : "",
+        incomplete: Boolean(value.incomplete)
+      };
+    }
+
+    function normalizeLocalSession(value, options = {}) {
+      if (!value || typeof value !== "object") return null;
+      const id = typeof value.id === "string" ? value.id.slice(0, 120) : "";
+      if (!id) return null;
+      const maxMessages = Math.max(1, Number(options.maxMessages) || LOCAL_SESSION_MAX_MESSAGES);
+      const textChars = Math.max(256, Number(options.textChars) || LOCAL_SESSION_TEXT_CHARS);
+      const messages = (Array.isArray(value.messages) ? value.messages : [])
+        .slice(-maxMessages)
+        .map(message => normalizeLocalMessage(message, textChars))
+        .filter(Boolean);
+      const rawChatId = typeof value.upstreamChatId === "string" ? value.upstreamChatId : "";
+      const upstreamChatId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(rawChatId)
+        ? rawChatId
+        : "";
+      return {
+        id,
+        title: typeof value.title === "string" ? value.title.slice(0, 80) : "新会话",
+        time: typeof value.time === "string" ? value.time.slice(0, 40) : "",
+        upstreamChatId,
+        profileId: typeof value.profileId === "string" ? value.profileId.slice(0, 128) : "",
+        messages
+      };
+    }
+
+    function compactLocalSessions(values, options = {}) {
+      const maxTotal = Math.max(1, Number(options.maxTotal) || LOCAL_SESSION_MAX_TOTAL);
+      const maxPerProfile = Math.max(1, Number(options.maxPerProfile) || LOCAL_SESSION_MAX_PER_PROFILE);
+      const budget = Math.max(4096, Number(options.budget) || LOCAL_SESSION_STORAGE_CHAR_BUDGET);
+      const sessions = [];
+      const seenIds = new Set();
+      const perProfile = new Map();
+      const source = (Array.isArray(values) ? values : []).slice(0, LOCAL_SESSION_MAX_SCAN);
+      for (const value of source) {
+        const session = normalizeLocalSession(value, options);
+        if (!session || seenIds.has(session.id)) continue;
+        const profileKey = session.profileId || "";
+        const profileCount = perProfile.get(profileKey) || 0;
+        if (profileCount >= maxPerProfile) continue;
+        seenIds.add(session.id);
+        perProfile.set(profileKey, profileCount + 1);
+        sessions.push(session);
+        if (sessions.length >= maxTotal) break;
+      }
+
+      // Input order is newest-first. Fill the JSON budget in that order, and
+      // for each session retain the newest suffix of its chronological messages.
+      const compacted = [];
+      let usedChars = 2; // outer []
+      for (const session of sessions) {
+        const stored = { ...session, messages: [] };
+        let sessionChars = JSON.stringify(stored).length;
+        const outerCommaChars = compacted.length ? 1 : 0;
+        if (usedChars + sessionChars + outerCommaChars > budget) continue;
+        const newestFirst = [];
+        for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+          const messageChars = JSON.stringify(session.messages[index]).length;
+          const separatorChars = newestFirst.length ? 1 : 0;
+          if (usedChars + sessionChars + messageChars + separatorChars + outerCommaChars > budget) break;
+          newestFirst.push(session.messages[index]);
+          sessionChars += messageChars + separatorChars;
+        }
+        if (session.messages.length && !newestFirst.length) continue;
+        stored.messages = newestFirst.reverse();
+        compacted.push(stored);
+        usedChars += sessionChars + outerCommaChars;
+      }
+      return compacted;
+    }
+
     function loadLocalSessions() {
       try {
         const raw = localStorage.getItem(STORAGE_KEY);
-        if (raw) {
-          state.sessions = JSON.parse(raw) || [];
-        }
+        const parsed = raw ? JSON.parse(raw) : [];
+        state.sessions = compactLocalSessions(parsed);
       } catch (e) {
         state.sessions = [];
       }
     }
 
     function saveLocalSessions() {
-      // localStorage is typically capped at ~5 MB; cap stored message size per
-      // turn and degrade gracefully instead of silently dropping all sessions.
-      const grouped = new Map();
-      for (const s of state.sessions) {
-        const key = s.profileId || "";
-        if (!grouped.has(key)) grouped.set(key, []);
-        grouped.get(key).push(s);
-      }
-      const slim = [];
-      for (const arr of grouped.values()) {
-        for (const s of arr.slice(-30)) {
-          slim.push({
-            ...s,
-            messages: (s.messages || []).map(m => ({
-              ...m,
-              content: String(m.content || "").slice(0, 20000),
-              thinking: String(m.thinking || "").slice(0, 20000)
-            }))
-          });
-        }
-      }
+      const compacted = compactLocalSessions(state.sessions);
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(slim));
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(compacted));
+        state.sessions = compacted;
+        localSessionStorageWarningShown = false;
       } catch (e) {
+        const emergency = compactLocalSessions(compacted.slice(0, 8), {
+          maxTotal: 8,
+          maxPerProfile: 8,
+          maxMessages: 12,
+          textChars: 4000,
+          budget: 400000
+        });
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(slim.slice(0, 8)));
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(emergency));
+          state.sessions = emergency;
+          if (!localSessionStorageWarningShown) {
+            window.showToast?.("本地存储空间不足，已保留最近会话的精简副本", "standby");
+            localSessionStorageWarningShown = true;
+          }
         } catch (e2) {
-          window.showToast?.("本地会话保存失败：存储空间不足", "error");
+          if (!localSessionStorageWarningShown) {
+            window.showToast?.("本地会话保存失败：存储空间不足或已被浏览器禁用", "error");
+            localSessionStorageWarningShown = true;
+          }
         }
       }
+    }
+
+    function newLocalSessionId() {
+      const random = globalThis.crypto?.randomUUID?.().replace(/-/g, "")
+        || `${Date.now().toString(36)}${Math.random().toString(36).slice(2)}`;
+      return `sess_${random.slice(0, 48)}`;
     }
 
     // Per-model effort memory: 每个模型记住自己上次的思考挡位，切换模型互不影响；
@@ -2170,6 +2489,7 @@
     const btnStopActive = $("btn-stop-active");
     const btnDeleteUpstream = $("btn-delete-upstream");
     const btnSaveSettings = $("btn-save-settings");
+    const settingsStoreStatus = $("settings-store-status");
     const upstreamTimeoutInput = $("upstream-timeout-input");
     const upstreamRetryWaitInput = $("upstream-retry-wait-input");
     const upstreamRetryAttemptsInput = $("upstream-retry-attempts-input");
@@ -2191,7 +2511,6 @@
     const btnSwitchProfile = $("btn-switch-profile");
     const btnRemoveProfile = $("btn-remove-profile");
     const btnCompactProfiles = $("btn-compact-profiles");
-    const btnCaptchaRefresh = $("btn-captcha-refresh");
     const btnRefreshProfiles = $("btn-refresh-profiles");
     const profileNameInput = $("profile-name-input");
     const btnBrowserLogin = $("btn-browser-login");
@@ -2200,6 +2519,9 @@
     const tokenInput = $("token-input");
     const btnTokenLogin = $("btn-token-login");
     const authStatusBanner = $("auth-status-banner");
+    const profilePoolList = $("profile-pool-list");
+    const accountRoutingPill = $("account-routing-pill");
+    const accountRoutingStatus = $("account-routing-status");
 
     // ==========================================================================
     // TOAST NOTIFICATION SYSTEM
@@ -2249,11 +2571,18 @@
       if (!text) return "";
 
       const codeBlocks = [];
+      const codeBlockTokens = [];
+      let codeBlockTokenIndex = 0;
       // 1. Extract and preserve fenced code blocks
       let processed = text.replace(/```([a-zA-Z0-9_\-#+]*)\n([\s\S]*?)```/g, (match, lang, code) => {
         const cleanLang = (lang || 'plaintext').toLowerCase();
         const highlighted = highlightSimpleCode(code, cleanLang);
-        const placeholder = `__CODE_BLOCK_${codeBlocks.length}__`;
+        let placeholder = "";
+        do {
+          placeholder = `__GLM2API_INTERNAL_CODE_BLOCK_${codeBlockTokenIndex}__`;
+          codeBlockTokenIndex += 1;
+        } while (text.includes(placeholder));
+        codeBlockTokens.push(placeholder);
         codeBlocks.push(`
           <div class="code-block-wrapper">
             <div class="code-block-header">
@@ -2301,7 +2630,7 @@
 
       // 10. Restore code blocks
       codeBlocks.forEach((blockHtml, i) => {
-        processed = processed.replace(`__CODE_BLOCK_${i}__`, blockHtml);
+        processed = processed.replace(codeBlockTokens[i], blockHtml);
       });
 
       return processed;
@@ -2390,6 +2719,28 @@
       pollTimer: 0,
       pollCount: 0
     };
+
+    function renderHistoryStoreStatus(store) {
+      const banner = $("history-store-status");
+      const pendingWrites = Number(store?.pending_writes || 0);
+      const pendingDeletes = Number(store?.pending_deletes || 0);
+      if (store?.persisted !== false && !store?.error && !pendingWrites && !pendingDeletes) {
+        banner.style.display = "none";
+        banner.textContent = "";
+        return;
+      }
+      const pending = [];
+      if (pendingWrites) pending.push(`${pendingWrites} 条待写入`);
+      if (pendingDeletes) pending.push(`${pendingDeletes} 条待删除`);
+      const details = [store?.error || "历史存储尚未完全持久化", pending.join(" · ")].filter(Boolean).join("；");
+      banner.className = "status-banner error";
+      banner.style.display = "block";
+      banner.textContent = `${details}。服务会在下一次历史变更时重试。`;
+    }
+
+    function showHistoryMutationResult(data, fallbackMessage) {
+      window.showToast?.(data?.message || fallbackMessage, data?.persisted === false ? "standby" : "success");
+    }
 
     const SURFACE_LABELS = {
       "openai_chat": "OpenAI Chat",
@@ -2568,7 +2919,11 @@
         recordState.pollCount += 1;
         const id = recordState.currentId;
         try {
-          const resp = await fetch(`/api/history/record?id=${encodeURIComponent(id)}`, { headers: apiHeaders() });
+          const resp = await fetchWithTimeout(
+            `/api/history/record?id=${encodeURIComponent(id)}`,
+            { headers: apiHeaders() },
+            MANAGEMENT_FETCH_TIMEOUT_MS
+          );
           const data = await resp.json().catch(() => ({}));
           if (data.ok && data.record && recordState.currentId === id) {
             recordState.current = data.record;
@@ -2664,7 +3019,7 @@
         lines.push("## 内部附件");
         lines.push("");
         delivery.contextFiles.forEach((file, index) => {
-          lines.push(`### 附件 ${index + 1} · ${contextKindLabel(file.kind)} · ${file.name || "未命名"}`);
+          lines.push(`### 附件 ${index + 1} · ${contextFileKindLabel(file)} · ${file.name || "未命名"}`);
           lines.push("");
           lines.push("```");
           lines.push(String(file.content || ""));
@@ -2706,7 +3061,11 @@
         const qs = new URLSearchParams({ page: String(nextPage) });
         if (recordState.text) qs.set("text", recordState.text);
         if (recordState.status) qs.set("status", recordState.status);
-        const resp = await fetch(`/api/history/records?${qs.toString()}`, { headers: apiHeaders() });
+        const resp = await fetchWithTimeout(
+          `/api/history/records?${qs.toString()}`,
+          { headers: apiHeaders() },
+          MANAGEMENT_FETCH_TIMEOUT_MS
+        );
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.ok) {
           throw new Error(data.error?.message || `HTTP ${resp.status}`);
@@ -2779,11 +3138,11 @@
       if (!window.confirm("确定删除这条本地镜像记录？仅影响本地回看，不影响上游会话。")) return;
       try {
         if (recordState.currentId === id) stopRecordPoll();
-        const resp = await fetch("/api/history/record/delete", {
+        const resp = await fetchWithTimeout("/api/history/record/delete", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ id })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.ok) {
           throw new Error(data.error?.message || `HTTP ${resp.status}`);
@@ -2795,7 +3154,7 @@
           showHistoryEmpty();
         }
         renderRecordList();
-        window.showToast?.("已删除记录", "success");
+        showHistoryMutationResult(data, "已删除记录");
       } catch (err) {
         window.showToast?.(`删除失败：${err.message || err}`, "error");
       }
@@ -2963,6 +3322,14 @@
       }
     }
 
+    function contextFileKindLabel(file) {
+      const label = contextKindLabel(file && file.kind);
+      const headerMatch = String(file && file.content || "").slice(0, 320).match(/\bsegment\s+(\d+)\/(\d+)\b/i);
+      const part = Number(file && file.part) || Number(headerMatch && headerMatch[1]) || 1;
+      const parts = Number(file && file.parts) || Number(headerMatch && headerMatch[2]) || 1;
+      return parts > 1 ? `${label} ${part}/${parts}` : label;
+    }
+
     function recordDeliveryInfo(r) {
       const storedContextFiles = Array.isArray(r.context_files)
         ? r.context_files.filter((f) => f && typeof f === "object")
@@ -3078,7 +3445,7 @@
 
       if (info.mode === "file") {
         const manifest = document.createElement("div");
-        manifest.innerHTML = `<div class="rec-section-title">内部附件清单</div>${manifestRowsHtml(info.contextFiles, (f) => contextKindLabel(f.kind))}`;
+        manifest.innerHTML = `<div class="rec-section-title">内部附件清单</div>${manifestRowsHtml(info.contextFiles, (f) => contextFileKindLabel(f))}`;
         container.appendChild(manifest);
       }
       if (info.userFiles.length) {
@@ -3108,7 +3475,7 @@
       }
       if (info.mode === "file") {
         info.contextFiles.forEach((file, index) => {
-          const label = `附件 ${index + 1} · ${contextKindLabel(file.kind)} · ${file.name || "未命名"}${file.truncated ? " · 镜像已截断" : ""}`;
+          const label = `附件 ${index + 1} · ${contextFileKindLabel(file)} · ${file.name || "未命名"}${file.truncated ? " · 镜像已截断" : ""}`;
           stack.appendChild(renderTextCard(
             label,
             file.content || "",
@@ -3197,7 +3564,11 @@
       $("record-overview-view").replaceChildren();
       $("record-detail-view").replaceChildren();
       try {
-        const resp = await fetch(`/api/history/record?id=${encodeURIComponent(id)}`, { headers: apiHeaders() });
+        const resp = await fetchWithTimeout(
+          `/api/history/record?id=${encodeURIComponent(id)}`,
+          { headers: apiHeaders() },
+          MANAGEMENT_FETCH_TIMEOUT_MS
+        );
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.ok) {
           throw new Error(data.error?.message || `HTTP ${resp.status}`);
@@ -3218,11 +3589,11 @@
       if (!window.confirm("确定删除这条本地镜像记录？仅影响本地回看，不影响上游会话。")) return;
       try {
         stopRecordPoll();
-        const resp = await fetch("/api/history/record/delete", {
+        const resp = await fetchWithTimeout("/api/history/record/delete", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ id })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok || !data.ok) {
           throw new Error(data.error?.message || `HTTP ${resp.status}`);
@@ -3232,7 +3603,7 @@
         recordState.current = null;
         renderRecordList();
         showHistoryEmpty();
-        window.showToast?.("已删除记录");
+        showHistoryMutationResult(data, "已删除记录");
       } catch (err) {
         window.showToast?.(`删除失败：${err.message || err}`, "error");
       }
@@ -3381,7 +3752,7 @@
           <div class="session-item-title">${escapeHtml(s.title || "新会话")}</div>
           <div class="session-item-meta">
             <span>${s.messages?.length || 0} 条消息</span>
-            <span>${s.time || ""}</span>
+            <span>${escapeHtml(s.time || "")}</span>
           </div>
           <span class="session-item-del" title="删除记录">✕</span>
         `;
@@ -3410,7 +3781,8 @@
         return;
       }
       state.currentChatId = "";
-      state.currentSessionId = "sess_" + Date.now();
+      state.currentChatProfileId = state.activeProfileId || "";
+      state.currentSessionId = newLocalSessionId();
       state.pendingEdit = false;
       state.lastUserMessage = "";
       updateSessionUI();
@@ -3423,6 +3795,7 @@
     function applyProfileSessionFilter() {
       state.currentSessionId = "";
       state.currentChatId = "";
+      state.currentChatProfileId = state.activeProfileId || "";
       state.pendingEdit = false;
       state.lastUserMessage = "";
       updateSessionUI();
@@ -3439,6 +3812,7 @@
       if (!sess) return;
       state.currentSessionId = sess.id;
       state.currentChatId = sess.upstreamChatId || "";
+      state.currentChatProfileId = sess.profileId || state.activeProfileId || "";
       state.pendingEdit = false;
       const lastUserMsg = [...(sess.messages || [])].reverse().find(m => m.role === "user");
       state.lastUserMessage = lastUserMsg ? String(lastUserMsg.content || "") : "";
@@ -3470,15 +3844,32 @@
             });
           }
         }
+        if (msg.incomplete) {
+          appendMessageNode("system", "上一条助手回复在完成事件前中断，仅保留已收到的部分内容。");
+        }
       });
       renderSessionsList();
     }
 
-    function recordCurrentSession(title, role, content, thinking = "", attachments = []) {
-      if (!state.currentSessionId) {
-        state.currentSessionId = "sess_" + Date.now();
+    function bindCurrentSessionProfile(profileId, requestState = null) {
+      const id = String(profileId || "");
+      if (!id) return;
+      state.currentChatProfileId = id;
+      if (requestState) requestState.profileId = id;
+      const sess = state.sessions.find(s => s.id === state.currentSessionId);
+      if (sess && sess.profileId !== id) {
+        sess.profileId = id;
+        saveLocalSessions();
+        renderSessionsList();
       }
-      let sess = state.sessions.find(s => s.id === state.currentSessionId);
+    }
+
+    function recordCurrentSession(title, role, content, thinking = "", attachments = [], metadata = {}) {
+      if (!state.currentSessionId) {
+        state.currentSessionId = newLocalSessionId();
+      }
+      const existingIndex = state.sessions.findIndex(s => s.id === state.currentSessionId);
+      let sess = existingIndex >= 0 ? state.sessions[existingIndex] : null;
       const now = new Date();
       const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`;
 
@@ -3489,20 +3880,30 @@
           title: cleanTitle,
           time: `${now.getMonth()+1}/${now.getDate()} ${timeStr}`,
           upstreamChatId: state.currentChatId,
-          profileId: state.activeProfileId,
+          profileId: state.currentChatProfileId || state.activeProfileId,
           messages: []
         };
         state.sessions.unshift(sess);
+      } else if (existingIndex > 0) {
+        state.sessions.splice(existingIndex, 1);
+        state.sessions.unshift(sess);
       }
 
+      sess.time = `${now.getMonth()+1}/${now.getDate()} ${timeStr}`;
       sess.upstreamChatId = state.currentChatId;
+      sess.profileId = state.currentChatProfileId || state.activeProfileId || sess.profileId || "";
+      if (!Array.isArray(sess.messages)) sess.messages = [];
       sess.messages.push({
         role,
         content,
         thinking,
         time: timeStr,
-        attachments,
-        model: modelSelect.value
+        attachments: (Array.isArray(attachments) ? attachments : [])
+          .slice(0, LOCAL_SESSION_MAX_ATTACHMENTS)
+          .map(normalizeLocalAttachment)
+          .filter(Boolean),
+        model: modelSelect.value,
+        incomplete: Boolean(metadata.incomplete)
       });
 
       saveLocalSessions();
@@ -3649,32 +4050,80 @@
     });
 
     // API Upload helpers
-    async function uploadSingleFile(file, idx, total) {
+    const CHAT_FILE_UPLOAD_CONCURRENCY = 3;
+
+    async function mapWithConcurrency(items, limit, worker) {
+      const results = new Array(items.length);
+      let nextIndex = 0;
+      let firstError = null;
+      async function runWorker() {
+        while (!firstError) {
+          const index = nextIndex++;
+          if (index >= items.length) return;
+          try {
+            results[index] = await worker(items[index], index);
+          } catch (error) {
+            firstError = firstError || error;
+          }
+        }
+      }
+      const workerCount = Math.min(Math.max(1, Number(limit) || 1), items.length);
+      await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+      if (firstError) {
+        firstError.completedResults = results.filter(Boolean);
+        throw firstError;
+      }
+      return results;
+    }
+
+    async function uploadSingleFile(file, idx, total, profileId = "", signal = null) {
       updateStatusUI(`上传附件 ${idx + 1}/${total}...`, "standby");
       const params = new URLSearchParams({
         filename: file.name || `file-${idx + 1}.bin`,
         content_type: file.type || "application/octet-stream"
       });
-      const res = await fetch(`/api/files/upload?${params.toString()}`, {
+      const res = await fetchWithTimeout(`/api/files/upload?${params.toString()}`, {
         method: "POST",
-        headers: apiHeaders({ "Content-Type": file.type || "application/octet-stream" }),
-        body: file
-      });
+        headers: profileHeaders(profileId, { "Content-Type": file.type || "application/octet-stream" }),
+        body: file,
+        signal
+      }, FILE_UPLOAD_FETCH_TIMEOUT_MS);
       const data = await res.json().catch(() => ({}));
       if (!res.ok || !data.ok) {
-        throw new Error(data.error?.message || `附件上传失败 HTTP ${res.status}`);
+        const retryAfter = Number(res.headers.get("Retry-After")) || 0;
+        const suffix = res.status === 429 && retryAfter > 0 ? `（约 ${retryAfter} 秒后可重试）` : "";
+        const error = new Error((data.error?.message || `附件上传失败 HTTP ${res.status}`) + suffix);
+        error.code = data.error?.type || data.error?.code || "";
+        error.scope = data.error?.scope || "";
+        throw error;
       }
-      return data.file;
+      return { file: data.file, profileId: data.profile_id || profileId };
     }
 
-    async function uploadAllFiles(files) {
-      if (!files.length) return [];
+    async function uploadAllFiles(files, preferredProfileId = "", signal = null) {
+      if (!files.length) return { files: [], profileId: preferredProfileId };
       const oversized = files.filter(f => f.size > state.maxChatFileUploadBytes);
       if (oversized.length) {
         throw new Error(`${oversized.map(f => f.name).join("、")} 超过单文件上限 ${formatBytes(state.maxChatFileUploadBytes)}`);
       }
-      // 并发上传，Promise.all 保持结果顺序
-      return Promise.all(files.map((file, i) => uploadSingleFile(file, i, files.length)));
+      // 首个上传确定账号路由；其余文件并发上传到同一个账号，避免
+      // “文件属于账号 A、聊天被切到账号 B”导致上游看不到附件。
+      const first = await uploadSingleFile(files[0], 0, files.length, preferredProfileId, signal);
+      const profileId = first.profileId || preferredProfileId;
+      try {
+        const rest = await mapWithConcurrency(
+          files.slice(1),
+          CHAT_FILE_UPLOAD_CONCURRENCY,
+          (file, i) => uploadSingleFile(file, i + 1, files.length, profileId, signal)
+        );
+        return { files: [first.file, ...rest.map(item => item.file)], profileId };
+      } catch (error) {
+        // Preserve successfully uploaded ids so the outer failure handler can
+        // remove partial-batch orphans instead of leaking them upstream.
+        error.uploadedFiles = [first.file, ...(error.completedResults || []).map(item => item.file)];
+        error.profileId = profileId;
+        throw error;
+      }
     }
 
     // SSE Stream Parser
@@ -3724,19 +4173,45 @@
       btnStopActive.disabled = true;
       updateStatusUI("正在停止上游生成...", "standby");
       try {
-        const res = await fetch("/api/chat/cancel", {
+        const interruptedChatId = state.activeRequest.chatId || "";
+        const res = await fetchWithTimeout("/api/chat/cancel", {
           method: "POST",
-          headers: apiHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ assistant_message_id: state.activeRequest.assistantMessageId })
-        });
+          headers: profileHeaders(state.activeRequest.profileId, { "Content-Type": "application/json" }),
+          body: JSON.stringify({
+            assistant_message_id: state.activeRequest.assistantMessageId,
+            chat_id: interruptedChatId,
+            profile_id: state.activeRequest.profileId || ""
+          })
+        }, UPSTREAM_CONTROL_FETCH_TIMEOUT_MS);
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        if (data.chat_delete_pending || data.chat_deleted) {
+          // The cancel endpoint queues deletion after stopping the upstream
+          // task.  Clear the local pointer immediately so a follow-up request
+          // cannot accidentally reuse the interrupted chat while that job is
+          // still running.
+          state.activeRequest.chatDeleted = true;
+          state.activeRequest.chatId = "";
+          state.currentChatId = "";
+          state.lastUserMessage = "";
+          state.pendingEdit = false;
+          updateSessionUI();
+        }
         state.activeRequest.controller.abort();
-        window.showToast("已停止生成", "success");
+        if (data.upstream_stopped === false) {
+          updateStatusUI("停止请求未获上游确认，已安排删除会话", "standby");
+          window.showToast("上游停止未确认，已断开本地流并安排删除会话", "standby");
+        } else {
+          window.showToast("已停止生成", "success");
+        }
       } catch (err) {
         // Even if the upstream stop call fails, break the local stream so the UI
         // never hangs; the upstream turn may continue briefly but is no longer consumed.
         try { state.activeRequest.controller.abort(); } catch (_) {}
+        state.currentChatId = "";
+        state.lastUserMessage = "";
+        state.pendingEdit = false;
+        updateSessionUI();
         window.showToast(`停止请求异常: ${err.message}，已断开本地流`, "error");
       }
     }
@@ -3753,12 +4228,16 @@
       // while continue/edit use it only as fallback data when the reused
       // upstream chat no longer exists (server-side degrade retry).
       const activeSess = state.sessions.find(s => s.id === state.currentSessionId);
+      const sessionProfileId = mode === "new" ? "" : (activeSess?.profileId || state.currentChatProfileId || "");
       const histMsgs = activeSess?.messages || [];
       let history = histMsgs.slice(-20).map(m => {
         const attachNames = (m.attachments || []).map(a => a.name || "").filter(Boolean);
         let content = String(m.content || "").trim();
         if (attachNames.length) {
           content = `[附件: ${attachNames.join(", ")}]\n${content}`;
+        }
+        if (m.role === "assistant" && m.incomplete) {
+          content = `[上一条助手回复因流中断，仅保留部分内容]\n${content}`;
         }
         return {
           role: m.role === "user" ? "user" : "assistant",
@@ -3780,7 +4259,9 @@
 
       const requestState = {
         controller: new AbortController(),
+        profileId: sessionProfileId,
         assistantMessageId: "",
+        chatId: mode === "new" ? "" : (state.currentChatId || ""),
         canStop: false,
         cancelRequested: false,
         chatDeleted: false,
@@ -3797,6 +4278,7 @@
 
       // Render User Bubble
       const userText = text || "请分析附件。";
+      state.currentChatProfileId = sessionProfileId || state.activeProfileId || "";
       appendMessageNode("user", userText, { attachments: filesToSend });
       recordCurrentSession(userText, "user", userText, "", filesToSend);
 
@@ -3808,6 +4290,19 @@
       let rawContentText = "";
       let rawThinkingText = "";
       let thinkingBoxEl = null;
+      let terminalEventReceived = false;
+      const STREAM_MARKDOWN_MAX_CHARS = 250000;
+
+      function renderStreamContent() {
+        if (!rawContentText) return;
+        const plain = rawContentText.length > STREAM_MARKDOWN_MAX_CHARS;
+        contentEl.classList.toggle("stream-plain", plain);
+        if (plain) {
+          contentEl.textContent = rawContentText;
+        } else {
+          contentEl.innerHTML = renderMarkdown(rawContentText);
+        }
+      }
 
       // High-performance streaming throttler (requestAnimationFrame).
       let isRenderScheduled = false;
@@ -3819,8 +4314,8 @@
         isRenderScheduled = true;
         requestAnimationFrame(() => {
           isRenderScheduled = false;
-          const longText = rawContentText.length > 30000;
-          const minGapMs = longText ? 200 : 0;
+          const renderChars = Math.max(rawContentText.length, rawThinkingText.length);
+          const minGapMs = renderChars > 1000000 ? 1200 : renderChars > 250000 ? 600 : renderChars > 30000 ? 200 : 0;
           const now = performance.now();
           if (now - lastStreamRenderAt < minGapMs) {
             if (pendingStreamRender) scheduleStreamRender();
@@ -3831,22 +4326,26 @@
           if (rawThinkingText && thinkingBoxEl) {
             thinkingBoxEl.querySelector(".thinking-body").textContent = rawThinkingText;
           }
-          if (rawContentText) {
-            contentEl.innerHTML = renderMarkdown(rawContentText);
-          }
+          renderStreamContent();
           messageStream.scrollTop = messageStream.scrollHeight;
         });
       }
 
       let uploadedZaiFiles = [];
       try {
-        uploadedZaiFiles = await uploadAllFiles(filesToSend);
+        const uploaded = await uploadAllFiles(
+          filesToSend,
+          requestState.profileId,
+          requestState.controller.signal
+        );
+        uploadedZaiFiles = uploaded.files;
+        requestState.profileId = uploaded.profileId || requestState.profileId || "";
         state.selectedFiles = [];
         updateFilePreview();
 
         const res = await fetch("/api/chat", {
           method: "POST",
-          headers: apiHeaders({ "Content-Type": "application/json" }),
+          headers: profileHeaders(requestState.profileId, { "Content-Type": "application/json" }),
           body: JSON.stringify({
             message: text || "请分析附件。",
             stream: true,
@@ -3860,13 +4359,16 @@
           const errText = await res.text();
           let errMsg = errText || `HTTP ${res.status}`;
           let errCode = "";
+          let errScope = "";
           try {
             const errJson = JSON.parse(errText);
             errMsg = errJson?.error?.message || errJson?.message || errMsg;
             errCode = errJson?.error?.code || errJson?.error?.type || "";
+            errScope = errJson?.error?.scope || "";
           } catch (_) { /* keep raw body text */ }
           const err = new Error(errMsg);
           err.code = errCode;
+          err.scope = errScope;
           throw err;
         }
 
@@ -3887,9 +4389,13 @@
 
           if (sseEvent.event === "status") {
             requestState.assistantMessageId = data.assistant_message_id || requestState.assistantMessageId;
+            if (data.chat_id) requestState.chatId = data.chat_id;
+            if (data.profile_id) bindCurrentSessionProfile(data.profile_id, requestState);
             updateStatusUI(data.message || "处理中...", "standby");
           } else if (sseEvent.event === "context") {
             requestState.assistantMessageId = data.assistant_message_id || requestState.assistantMessageId;
+            if (data.chat_id) requestState.chatId = data.chat_id;
+            if (data.profile_id) bindCurrentSessionProfile(data.profile_id, requestState);
             state.currentChatId = data.chat_id || state.currentChatId;
             updateSessionUI();
           } else if (sseEvent.event === "delta") {
@@ -3922,13 +4428,12 @@
           } else if (sseEvent.event === "error") {
             throw new Error(data.message || "上游服务返回异常");
           } else if (sseEvent.event === "done") {
+            terminalEventReceived = true;
             // Finalize render
             if (rawThinkingText && thinkingBoxEl) {
               thinkingBoxEl.querySelector(".thinking-body").textContent = rawThinkingText;
             }
-            if (rawContentText) {
-              contentEl.innerHTML = renderMarkdown(rawContentText);
-            }
+            renderStreamContent();
             messageStream.scrollTop = messageStream.scrollHeight;
 
             requestState.succeeded = true;
@@ -3948,6 +4453,8 @@
               }
             } else {
               state.currentChatId = data.chat_id || state.currentChatId;
+              if (data.chat_id) requestState.chatId = data.chat_id;
+              if (data.profile_id) bindCurrentSessionProfile(data.profile_id, requestState);
               if (data.chat_delete_error) {
                 appendMessageNode("system", `自动删除会话失败: ${data.chat_delete_error}`);
               }
@@ -3980,28 +4487,71 @@
           handleSseBlock(buffer.trim());
         }
 
+        if (!terminalEventReceived) {
+          const incomplete = new Error(
+            requestState.cancelRequested ? "已停止生成" : "流式响应在完成事件前中断"
+          );
+          incomplete.code = "stream_incomplete";
+          if (requestState.cancelRequested) incomplete.name = "AbortError";
+          throw incomplete;
+        }
+
         if (!rawContentText.trim() && !rawThinkingText.trim()) {
           contentEl.textContent = "（上游返回空内容）";
         }
       } catch (err) {
+        if (Array.isArray(err?.uploadedFiles)) uploadedZaiFiles = err.uploadedFiles;
+        if (err?.profileId) requestState.profileId = err.profileId;
         if (requestState.cancelRequested && err?.name === "AbortError") {
           requestState.succeeded = true;
           updateStatusUI("已停止生成", "standby");
-          appendMessageNode("system", "已停止上游生成，保留已输出的解答。");
+          appendMessageNode(
+            "system",
+            requestState.chatDeleted
+              ? "已停止上游生成，中断的上游会话已安排删除，保留已输出的解答。"
+              : "已停止上游生成，保留已输出的解答。"
+          );
           recordCurrentSession(userText, "assistant", rawContentText, rawThinkingText);
         } else {
-          contentEl.textContent = `请求失败: ${err.message}`;
-          contentEl.style.color = "var(--rose-core)";
+          const hasPartialOutput = Boolean(rawContentText.trim() || rawThinkingText.trim());
+          if (hasPartialOutput) {
+            if (rawThinkingText && thinkingBoxEl) {
+              thinkingBoxEl.querySelector(".thinking-body").textContent = rawThinkingText;
+            }
+            renderStreamContent();
+            appendMessageNode("system", `流式响应中断：${err.message}。以上仅为已收到的部分内容。`);
+            recordCurrentSession(
+              userText,
+              "assistant",
+              rawContentText,
+              rawThinkingText,
+              [],
+              { incomplete: true }
+            );
+          } else {
+            contentEl.textContent = `请求失败: ${err.message}`;
+            contentEl.style.color = "var(--rose-core)";
+            rollbackFailedUserMessage();
+          }
           updateStatusUI("请求失败", "error");
           window.showToast(err.message, "error");
-          rollbackFailedUserMessage();
-          if (err?.code === "chat_slot_busy") {
-            // The account is generating elsewhere (another tab/API client).
-            // Keep the user's input so they can resend once the slot frees up.
+          if (!hasPartialOutput && err?.code === "chat_slot_busy") {
+            // Keep the user's input so they can resend once capacity returns.
             promptInput.value = text || "";
             promptInput.style.height = "auto";
             promptInput.style.height = `${Math.min(promptInput.scrollHeight, 220)}px`;
-            updateStatusUI("当前账号并发生成已达上限（3 个），等待完成或先停止后再试", "standby");
+            updateStatusUI(
+              err?.scope === "profile"
+                ? "当前会话所属账号已满；为避免串号不会自动切换账号"
+                : "账号池暂时满载（每个账号 3 个槽位），稍后将自动接入",
+              "standby"
+            );
+          } else if (!hasPartialOutput && err?.code === "profile_not_found") {
+            promptInput.value = text || "";
+            promptInput.style.height = "auto";
+            promptInput.style.height = `${Math.min(promptInput.scrollHeight, 220)}px`;
+            state.currentChatProfileId = state.activeProfileId || "";
+            updateStatusUI("原会话所属账号已删除；内容已保留，请重新发送为新会话", "standby");
           }
           // The upstream chat created for this attempt is cleaned up server-side
           // on failure; drop the stale id so the UI never points at a dead chat.
@@ -4012,11 +4562,11 @@
         // would stay orphaned on Z.ai; ask the proxy to delete them best-effort.
         const orphanIds = uploadedZaiFiles.map(f => f && (f.id || f.file?.id)).filter(Boolean);
         if (orphanIds.length) {
-          fetch("/api/files/cleanup", {
+          fetchWithTimeout("/api/files/cleanup", {
             method: "POST",
-            headers: apiHeaders({ "Content-Type": "application/json" }),
-            body: JSON.stringify({ files: orphanIds })
-          }).catch(() => {});
+            headers: profileHeaders(requestState.profileId, { "Content-Type": "application/json" }),
+            body: JSON.stringify({ files: orphanIds, profile_id: requestState.profileId || "" })
+          }, MANAGEMENT_FETCH_TIMEOUT_MS).catch(() => {});
         }
       } finally {
         if (state.activeRequest === requestState) {
@@ -4126,7 +4676,7 @@
     btnSaveSettings.addEventListener("click", async () => {
       btnSaveSettings.disabled = true;
       try {
-        const res = await fetch("/api/settings", {
+        const res = await fetchWithTimeout("/api/settings", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({
@@ -4143,13 +4693,19 @@
               history_max_records: Number(historyMaxRecordsInput.value) || 300
             }
           })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
+        if (!res.ok || !data.ok) {
+          const retryAfter = Number(res.headers.get("Retry-After")) || 0;
+          const suffix = res.status === 429 && retryAfter > 0 ? `（约 ${retryAfter} 秒后可重试）` : "";
+          throw new Error((data.error?.message || `HTTP ${res.status}`) + suffix);
+        }
         state.statusDefaultsApplied = false;
         await fetchStatus();
-        window.showToast("默认设置已保存，下次启动自动生效", "success");
+        window.showToast(data.message || "默认设置已保存，下次启动自动生效", "success");
       } catch (err) {
+        settingsStoreStatus.className = "status-banner error";
+        settingsStoreStatus.textContent = `默认设置未保存: ${err.message}`;
         window.showToast(`保存默认设置失败: ${err.message}`, "error");
       } finally {
         btnSaveSettings.disabled = false;
@@ -4186,11 +4742,11 @@
       btnDeleteUpstream.disabled = true;
       updateStatusUI("正在删除上游会话...", "standby");
       try {
-        const res = await fetch("/api/chat/delete", {
+        const res = await fetchWithTimeout("/api/chat/delete", {
           method: "POST",
-          headers: apiHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ chat_id: targetId })
-        });
+          headers: profileHeaders(state.currentChatProfileId, { "Content-Type": "application/json" }),
+          body: JSON.stringify({ chat_id: targetId, profile_id: state.currentChatProfileId || "" })
+        }, UPSTREAM_CONTROL_FETCH_TIMEOUT_MS);
         const data = await res.json().catch(() => ({}));
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
@@ -4341,6 +4897,14 @@
       const history = data.history || {};
       const runtime = data.runtime || {};
       const logs = data.logs || {};
+      const autoDelete = runtime.auto_delete || {};
+      const captchaWorker = runtime.captcha_worker || {};
+      const httpHandlers = runtime.http_handlers || {};
+      const uploadSlots = runtime.upload_slots || {};
+      const upstreamResponses = runtime.upstream_responses || {};
+      const upstreamReaders = runtime.upstream_readers || {};
+      const sseHeartbeat = runtime.sse_heartbeat || {};
+      const contextCache = runtime.context_cache || {};
       const statuses = history.statuses || {};
       const success = Number(statuses.success) || 0;
       const errors = Number(statuses.error) || 0;
@@ -4415,13 +4979,30 @@
       $("stats-runtime-requests").textContent = `${runtime.requests_total || 0} 次`;
       $("stats-runtime-recent").textContent = `${runtime.requests_5m || 0} 请求 · ${runtime.errors_5m || 0} 个 5xx`;
       $("stats-runtime-latency").textContent = `${formatElapsed(runtime.p50_duration_ms)} / ${formatElapsed(runtime.p95_duration_ms)}`;
-      $("stats-runtime-errors").textContent = `${runtime.status_4xx || 0} / ${runtime.status_5xx || 0}`;
+      $("stats-runtime-errors").textContent = `${runtime.status_4xx || 0} / ${runtime.status_5xx || 0} · 408 ${runtime.request_timeouts || 0} · 413 ${runtime.request_too_large || 0}`;
       $("stats-runtime-inflight").textContent = `${runtime.inflight || 0}（当前账号 ${runtime.active_profile_inflight || 0}）`;
+      $("stats-runtime-metric-paths").textContent = `${runtime.tracked_paths || 0}/${runtime.max_paths || 0} · 聚合 ${runtime.path_overflow_total || 0}`;
+      const replayState = autoDelete.replay_active
+        ? `重放中 · 待提交 ${autoDelete.replay_deferred || 0}`
+        : autoDelete.replay_deferred
+          ? `重放已暂停 · 待提交 ${autoDelete.replay_deferred}`
+          : "重放空闲";
+      $("stats-runtime-delete-queue").textContent = `${autoDelete.pending || 0}/${autoDelete.max_pending || 0} · 补偿 会话 ${autoDelete.journal_chat_pending || 0} / 文件 ${autoDelete.journal_file_pending || 0} · ${replayState} · 取消 ${autoDelete.cancelled_total || 0} · 回压 ${autoDelete.backpressure_total || 0}`;
+      $("stats-runtime-captcha-worker").textContent = captchaWorker.enabled
+        ? `${captchaWorker.active ? "求解中" : "空闲"} · 排队 ${captchaWorker.pending || 0}/${captchaWorker.max_pending || 0} · 回压 ${captchaWorker.backpressure_total || 0}`
+        : "未启用（当前无需浏览器回退）";
+      $("stats-runtime-http-handlers").textContent = `${httpHandlers.active || 0}/${httpHandlers.max_active || 0} · 峰值 ${httpHandlers.peak || 0} · 拒绝 ${httpHandlers.rejected_total ?? httpHandlers.wait_total ?? 0}`;
+      $("stats-runtime-upload-slots").textContent = `附件 ${uploadSlots.file?.active || 0}/${uploadSlots.file?.max_active || 0} · HAR ${uploadSlots.har?.active || 0}/${uploadSlots.har?.max_active || 0} · 拒绝 ${uploadSlots.rejected_total || 0}`;
+      $("stats-runtime-upstream-responses").textContent = `JSON拒绝 ${upstreamResponses.rejected_total || 0} · 流拒绝 ${upstreamResponses.stream_rejected_total || 0} · 未完整 ${upstreamResponses.stream_incomplete_total || 0} · 错误截断 ${upstreamResponses.error_truncated_total || 0} · 流输出 ${formatBytes(upstreamResponses.stream_output_max_bytes || 0)} / 原始 ${formatBytes(upstreamResponses.stream_wire_max_bytes || 0)}`;
+      $("stats-runtime-upstream-readers").textContent = `${upstreamReaders.active || 0} 活跃 · 峰值 ${upstreamReaders.peak || 0} · 静默 ${upstreamReaders.heartbeats_total || 0} · 强关 ${upstreamReaders.forced_closes_total || 0}`;
+      $("stats-runtime-sse-heartbeat").textContent = `${sseHeartbeat.active || 0} 活跃 · 峰值 ${sseHeartbeat.peak || 0} · 已发 ${sseHeartbeat.sent_total || 0} · 错误 ${sseHeartbeat.errors_total || 0}`;
+      $("stats-runtime-context-cache").textContent = `${contextCache.items || 0}/${contextCache.max_items || 0} · ${formatBytes(contextCache.bytes || 0)} · 失败 ${contextCache.failure_states || 0} · 降级 ${contextCache.degraded_states || 0}`;
       renderStatsTable($("stats-paths"), runtime.top_paths, "path", "count");
 
       const levels = logs.levels || {};
       const kinds = logs.kinds || {};
-      $("stats-log-total").textContent = `内存环 ${logs.total || 0}/${logs.capacity || 0}`;
+      const logStore = logs.store || {};
+      $("stats-log-total").textContent = `内存环 ${logs.total || 0}/${logs.capacity || 0} · 单条截断 ${logs.truncated_total || 0} · 磁盘 ${formatBytes(logStore.total_bytes || 0)}`;
       $("stats-log-info").textContent = levels.INFO || 0;
       $("stats-log-warning").textContent = levels.WARNING || 0;
       $("stats-log-error").textContent = (levels.ERROR || 0) + (levels.CRITICAL || 0);
@@ -4431,7 +5012,7 @@
 
     async function refreshMetrics() {
       try {
-        const response = await fetch(`/api/metrics?hours=${metricHours}`, { headers: apiHeaders() });
+        const response = await fetchWithTimeout(`/api/metrics?hours=${metricHours}`, { headers: apiHeaders() }, 8000);
         const data = await response.json();
         if (!response.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${response.status}`);
         renderMetrics(data);
@@ -4637,10 +5218,10 @@
           text: logFilterInput.value.trim() || ""
         });
         if (incremental) params.set("after_seq", String(logLastSeq));
-        const resp = await fetch("/api/logs?" + params.toString(), {
+        const resp = await fetchWithTimeout("/api/logs?" + params.toString(), {
           headers: apiHeaders(),
           signal: controller.signal
-        });
+        }, 8000);
         const data = await resp.json();
         if (!resp.ok || !data.ok) throw new Error((data.error && data.error.message) || "加载失败");
         if (controller !== logFetchController) return;
@@ -4663,7 +5244,8 @@
           option.label = `${item.count} 次`;
           stateOptions.appendChild(option);
         });
-        logMeta.textContent = `内存 ${stats.total ?? data.ring_count}/${stats.capacity ?? data.ring_capacity} · 显示 ${logVisibleEntries.length}/${stats.matched ?? 0} · 游标 ${logLastSeq || "—"} · 文件 ${formatBytes(data.file_bytes) || "0B"} · ${data.level}`;
+        const store = data.store || {};
+        logMeta.textContent = `内存 ${stats.total ?? data.ring_count}/${stats.capacity ?? data.ring_capacity} · 显示 ${logVisibleEntries.length}/${stats.matched ?? 0} · 游标 ${logLastSeq || "—"} · 单条截断 ${stats.truncated_total || 0} · 磁盘 ${formatBytes(store.total_bytes ?? data.file_bytes) || "0B"}/${formatBytes(store.max_total_bytes || 0)} · ${store.segments || 0}/${store.max_segments || 0} 段 · ${data.level}`;
         $("btn-log-errors").classList.toggle("active", logLevelSel.value === "WARNING");
       } catch (e) {
         if (e.name !== "AbortError" && controller === logFetchController) {
@@ -4720,7 +5302,7 @@
     let dashLogTimer = null;
     async function refreshDashboardLog() {
       try {
-        const resp = await fetch("/api/logs?lines=8", { headers: apiHeaders() });
+        const resp = await fetchWithTimeout("/api/logs?lines=8", { headers: apiHeaders() }, 4000);
         const data = await resp.json();
         if (data.ok) {
           $("dash-log").textContent = (data.lines || []).join("\n") || "暂无日志";
@@ -4811,6 +5393,24 @@
     });
 
     // Server API Key config (persisted, DPAPI-encrypted)
+    function renderSettingsStoreStatus(store) {
+      if (!store) {
+        settingsStoreStatus.className = "status-banner standby";
+        settingsStoreStatus.textContent = "验证服务状态后显示本地设置存储信息";
+        return;
+      }
+      if (store.persisted === false || store.error) {
+        settingsStoreStatus.className = "status-banner error";
+        const reason = store.error ? `: ${store.error}` : "";
+        settingsStoreStatus.textContent = `最近一次默认设置写入失败${reason}；当前继续使用原设置`;
+        return;
+      }
+      settingsStoreStatus.className = store.saved_at ? "status-banner success" : "status-banner standby";
+      settingsStoreStatus.textContent = store.saved_at
+        ? `默认设置已持久化 · ${store.saved_at}`
+        : "尚未保存自定义默认设置，当前使用内置默认值";
+    }
+
     function renderServerApiKeyConfig(data) {
       const enabled = Boolean(data ? (data.api_key_required !== undefined ? data.api_key_required : data.enabled) : false);
       const source = (data && (data.api_key_source || data.source)) || "store";
@@ -4847,11 +5447,11 @@
       const currentKey = apiKeyCurrentInput.value.trim();
       btnSaveApiKeyConfig.disabled = true;
       try {
-        const res = await fetch("/api/settings/api-key", {
+        const res = await fetchWithTimeout("/api/settings/api-key", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ api_key: newKey, current_key: currentKey })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
         apiKeyConfigInput.value = "";
@@ -4878,11 +5478,11 @@
       if (!confirm("确认清除服务端 API Key？清除后服务将不再需要密钥即可访问。")) return;
       btnClearApiKeyConfig.disabled = true;
       try {
-        const res = await fetch("/api/settings/api-key", {
+        const res = await fetchWithTimeout("/api/settings/api-key", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ api_key: "", current_key: currentKey })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
         apiKeyConfigInput.value = "";
@@ -4928,10 +5528,170 @@
       }
     }
 
+    function profileRuntime(p, concurrency) {
+      const rows = Array.isArray(concurrency?.profiles) ? concurrency.profiles : [];
+      const row = rows.find(item => item && item.id === p.id) || {};
+      const capacity = Math.max(1, Number(row.capacity ?? p.concurrency_limit ?? concurrency?.per_profile ?? 3) || 3);
+      const inflight = Math.max(0, Number(row.inflight ?? p.inflight ?? 0) || 0);
+      return {
+        capacity,
+        inflight,
+        available: Math.max(0, Number(row.available ?? p.available_slots ?? capacity - inflight) || 0)
+      };
+    }
+
+    function renderAccountPool(payload = {}) {
+      const incomingProfiles = Array.isArray(payload.profiles) ? payload.profiles : (state.profiles || []);
+      const profiles = [...incomingProfiles].sort((a, b) => {
+        const aOrder = Number(a.routing_order) || Number.MAX_SAFE_INTEGER;
+        const bOrder = Number(b.routing_order) || Number.MAX_SAFE_INTEGER;
+        return aOrder - bOrder;
+      });
+      const concurrency = payload.concurrency || state.concurrency || {};
+      state.profiles = profiles;
+      state.concurrency = concurrency;
+      if (profileSelect && profiles.length) {
+        const selectedId = profiles.some(p => p.id === profileSelect.value)
+          ? profileSelect.value
+          : (payload.active_profile_id || state.activeProfileId || profiles[0].id);
+        profileSelect.value = selectedId || "";
+      }
+
+      const count = Number(concurrency.profile_count ?? profiles.length) || 0;
+      const maxProfiles = Number(payload.max_profiles ?? state.maxProfiles) || 0;
+      if (maxProfiles > 0) state.maxProfiles = maxProfiles;
+      const perProfile = Number(concurrency.per_profile) || 3;
+      const capacity = Number(concurrency.capacity ?? count * perProfile) || 0;
+      const inflight = Number(concurrency.inflight) || 0;
+      const available = Number(concurrency.available ?? Math.max(0, capacity - inflight)) || 0;
+      const activeInflight = Number(concurrency.active_profile_inflight) || 0;
+      const activeProfile = profiles.find(p => p.active) || profiles.find(p => p.id === state.activeProfileId);
+      const activeName = activeProfile?.label || "当前优先账号";
+
+      $("account-pool-profile-count").textContent = maxProfiles ? `${count}/${maxProfiles}` : String(count);
+      $("account-pool-profile-meta").textContent = count ? `${activeName} 为默认优先` : "先添加一个登录态";
+      $("account-pool-capacity").textContent = String(capacity);
+      $("account-pool-capacity-meta").textContent = `每账号 ${perProfile} 个槽位`;
+      $("account-pool-inflight").textContent = String(inflight);
+      $("account-pool-inflight-meta").textContent = `当前账号 ${activeInflight}`;
+      $("account-pool-available").textContent = String(available);
+      $("account-pool-available-meta").textContent = available ? "新请求可自动接入" : "所有账号暂时满载";
+
+      if (!count) {
+        accountRoutingPill.className = "account-routing-pill standby";
+        accountRoutingPill.textContent = "未配置账号";
+        accountRoutingStatus.className = "account-routing-status";
+        accountRoutingStatus.innerHTML = `<span class="account-routing-dot"></span><span>添加账号后，服务会按容量自动分配新请求。</span>`;
+      } else if (!available) {
+        accountRoutingPill.className = "account-routing-pill busy";
+        accountRoutingPill.textContent = "容量已满";
+        accountRoutingStatus.className = "account-routing-status busy";
+        accountRoutingStatus.innerHTML = `<span class="account-routing-dot"></span><span>所有账号均已占用；新请求会收到 429，已有请求不受影响。</span>`;
+      } else {
+        accountRoutingPill.className = "account-routing-pill ready";
+        accountRoutingPill.textContent = "自动分配已启用";
+        accountRoutingStatus.className = "account-routing-status ready";
+        accountRoutingStatus.innerHTML = `<span class="account-routing-dot"></span><span>新请求优先进入 ${escapeHtml(activeName)}；满 ${perProfile} 个后自动顺延到下一个账号。</span>`;
+      }
+
+      const selectedProfile = profiles.find(p => p.id === profileSelect.value);
+      const selectedRuntime = selectedProfile ? profileRuntime(selectedProfile, concurrency) : null;
+      const selectedBusy = Boolean(selectedRuntime && selectedRuntime.inflight > 0);
+      btnRemoveProfile.disabled = !selectedProfile || selectedBusy;
+      btnRemoveProfile.title = selectedBusy
+        ? `该账号仍有 ${selectedRuntime.inflight} 个生成请求，完成或停止后才能删除`
+        : "删除选中的本地登录态";
+
+      profilePoolList.replaceChildren();
+      if (!profiles.length) {
+        const empty = document.createElement("div");
+        empty.className = "account-empty";
+        empty.innerHTML = "暂无已保存账号<br><span>添加一个账号后，自动并发分配会立即可用</span>";
+        profilePoolList.appendChild(empty);
+        return;
+      }
+      profiles.forEach((p, index) => {
+        const runtime = profileRuntime(p, concurrency);
+        const selected = p.id === profileSelect.value;
+        const full = runtime.inflight >= runtime.capacity;
+        const duplicateMark = p.duplicate_user ? " · 重复登录态" : "";
+        const source = p.source_display || "登录态";
+        const user = p.user_name || p.user_id_fp || "未知用户";
+        const fp = p.token_fp ? `token ${p.token_fp}` : "token 未就绪";
+        const profileName = p.label || `账号 ${index + 1}`;
+        const routingOrder = Math.max(1, Number(p.routing_order) || index + 1);
+        const hasInflight = runtime.inflight > 0;
+        const removeTitle = hasInflight ? `仍有 ${runtime.inflight} 个生成请求，暂不可删除` : "删除本地登录态";
+        const badgeClass = full ? "busy" : (p.active ? "active" : "available");
+        const badgeText = p.active ? (full ? "默认 · 已满" : "默认优先") : (full ? "已满" : "可接入");
+        const card = document.createElement("article");
+        card.className = `account-profile-card${p.active ? " active" : ""}${selected ? " selected" : ""}${full ? " full" : ""}`;
+        card.dataset.profileKey = p.id;
+        card.innerHTML = `
+          <div class="account-profile-head">
+            <div class="account-profile-ident">
+              <div class="account-profile-name" title="${escapeHtml(profileName)}"><span class="account-route-index" title="第 ${routingOrder} 调度顺位">${String(routingOrder).padStart(2, "0")}</span><span class="account-profile-name-text">${escapeHtml(profileName)}</span></div>
+              <div class="account-profile-user" title="${escapeHtml(user)}">${escapeHtml(user)}</div>
+            </div>
+            <span class="account-profile-badge ${badgeClass}">${badgeText}</span>
+          </div>
+          <div class="account-profile-meta"><span>${escapeHtml(source)}</span><span>${escapeHtml(fp)}${escapeHtml(duplicateMark)}</span></div>
+          <div class="account-profile-slot">
+            <div class="account-profile-slot-head"><span>生成槽位</span><strong>${runtime.inflight} / ${runtime.capacity}</strong></div>
+            <div class="account-slot-track" role="progressbar" aria-label="账号并发占用" aria-valuemin="0" aria-valuemax="${runtime.capacity}" aria-valuenow="${runtime.inflight}"><div class="account-slot-fill${full ? " full" : ""}" style="width:${Math.min(100, runtime.inflight / runtime.capacity * 100)}%"></div></div>
+          </div>
+          <div class="account-profile-actions">
+            <button class="tool-btn" type="button" data-profile-action="select" data-profile-key="${escapeHtml(p.id)}" ${selected ? "disabled" : ""}>${selected ? "已选中" : "选中"}</button>
+            <button class="tool-btn" type="button" data-profile-action="remove" data-profile-key="${escapeHtml(p.id)}" ${hasInflight ? "disabled" : ""} title="${escapeHtml(removeTitle)}">删除</button>
+          </div>`;
+        profilePoolList.appendChild(card);
+      });
+    }
+
+    function formatCaptchaMode(data) {
+      const mode = String(data?.captcha_strategy || data?.captcha_mode || "");
+      const solver = String(data?.captcha_solver || "");
+      if (mode === "fresh" || mode === "browser_fresh") {
+        if (solver === "happydom") return "自动 · happy-dom";
+        if (solver === "auto") {
+          if (data?.captcha_happydom_available === false) return "自动 · 浏览器回退";
+          if (data?.captcha_browser_fallback_enabled === false) return "自动 · happy-dom";
+          return "自动 · happy-dom / 浏览器回退";
+        }
+        if (solver === "browser") return "自动 · 浏览器回退";
+        return "自动求解";
+      }
+      return "账号 / HAR 验证码";
+    }
+
+    function selectProfileCard(profileId) {
+      const id = String(profileId || "");
+      if (!id) return;
+      profileSelect.value = id;
+      renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
+    }
+
+    function activeProfileForStatus(data = {}) {
+      const activeId = data.active_profile_id || state.activeProfileId || "";
+      return state.profiles.find(p => p.id === activeId)
+        || state.profiles.find(p => p.active)
+        || null;
+    }
+
+    function accountNameForStatus(data = {}) {
+      const profile = activeProfileForStatus(data);
+      return profile?.user_name || profile?.user_id_fp || data.user_id_fp || "";
+    }
+
+    function showProfileMutationResult(data, fallbackMessage) {
+      const persisted = data?.persisted !== false;
+      window.showToast(data?.message || fallbackMessage, persisted ? "success" : "standby");
+    }
+
     // Profile & Auth Handlers
     async function fetchProfiles() {
       try {
-        const res = await fetch("/api/auth/profiles", { headers: apiHeaders() });
+        const res = await fetchWithTimeout("/api/auth/profiles", { headers: apiHeaders() });
         const data = await res.json();
         if (!data.ok) throw new Error(data.error?.message || "无法读取登录态");
 
@@ -4941,40 +5701,79 @@
           opt.value = p.id;
           opt.selected = p.active;
           const duplicateMark = p.duplicate_user ? " · 重复" : "";
-          const source = p.source_display || p.source || "profile";
-          opt.textContent = `${p.active ? "● " : ""}${p.label} (${p.user_name || p.user_id_fp || 'ID'} · ${source} · ${p.token_fp}${duplicateMark})`;
+          const source = p.source_display || "profile";
+          const runtime = profileRuntime(p, data.concurrency);
+          opt.textContent = `${p.active ? "● " : ""}${p.label} (${runtime.inflight}/${runtime.capacity} · ${p.user_name || p.user_id_fp || 'ID'} · ${source}${duplicateMark})`;
           profileSelect.appendChild(opt);
         });
+
+        state.activeProfileId = data.active_profile_id || state.activeProfileId || "";
+        renderAccountPool(data);
+        if (state.lastStatus) {
+          renderDashboard(state.lastStatus);
+          $("info-user-name").textContent = accountNameForStatus(state.lastStatus) || "-";
+        }
 
         const store = data.profile_store || {};
         const dupStats = data.duplicate_stats || {};
         const duplicateCount = Number(dupStats.duplicate_profile_count || 0);
         btnCompactProfiles.disabled = duplicateCount <= 0;
-        btnCaptchaRefresh.disabled = (data.profiles?.length || 0) === 0;
         const savedTime = store.saved_at ? ` · 保存于 ${store.saved_at}` : "";
-        authStatusBanner.className = "status-banner success";
         const dupText = duplicateCount > 0 ? ` · 发现 ${duplicateCount} 个同账号重复项` : "";
-        authStatusBanner.textContent = `已安全加载 ${data.profiles?.length || 0} 个登录态 (DPAPI 加密)${savedTime}${dupText}`;
+        const capacityText = data.max_profiles ? ` / 上限 ${data.max_profiles}` : "";
+        if (store.persisted === false || store.error) {
+          authStatusBanner.className = "status-banner error";
+          const reason = store.error ? `：${store.error}` : "";
+          authStatusBanner.textContent = `已加载 ${data.profiles?.length || 0} 个登录态，但本地加密存储异常${reason}。当前进程中的账号变更可能在重启后丢失${dupText}`;
+        } else {
+          authStatusBanner.className = "status-banner success";
+          authStatusBanner.textContent = `已安全加载 ${data.profiles?.length || 0} 个登录态${capacityText} (DPAPI 加密)${savedTime}${dupText}`;
+        }
+        return true;
       } catch (err) {
         authStatusBanner.className = "status-banner error";
         authStatusBanner.textContent = `读取登录态失败: ${err.message}`;
+        return false;
       }
     }
 
     async function fetchStatus() {
       try {
-        const res = await fetch("/api/status", { headers: apiHeaders() });
+        const res = await fetchWithTimeout("/api/status", { headers: apiHeaders() });
         const data = await res.json();
         if (!data.ok) throw new Error("获取状态失败");
         state.lastStatus = data;
         state.apiKeyRequired = Boolean(data.api_key_required);
         state.apiKeySource = data.api_key_source || "store";
+        state.playwrightAvailable = data.playwright_available !== false;
+        btnBrowserLogin.disabled = state.browserLoginBusy || !state.playwrightAvailable;
+        btnBrowserLogin.title = state.playwrightAvailable
+          ? "打开官方页面获取登录态"
+          : "未安装可选 Playwright 组件；请使用 Token/HAR，或先安装 requirements.txt";
+        const browserLoginLabel = btnBrowserLogin.querySelector("span");
+        if (browserLoginLabel) {
+          browserLoginLabel.textContent = state.playwrightAvailable ? "拉起官方浏览器登录" : "浏览器登录组件未安装";
+        }
         state.activeProfileId = data.active_profile_id || "";
         state.chatBusy = Boolean(data.chat_busy);
+        state.concurrency = data.concurrency || state.concurrency;
+        if (state.profiles.length) {
+          renderAccountPool({
+            profiles: state.profiles,
+            concurrency: state.concurrency,
+            active_profile_id: state.activeProfileId
+          });
+        }
+        renderSettingsStoreStatus(data.settings_store);
         renderServerApiKeyConfig(data);
         renderDashboard(data);
         populateModelSelect(data.supported_models);
         if (state.apiKeyRequired && !data.api_key_valid) {
+          // 受保护状态失效时丢弃页面内旧的账号展示，避免继续显示缓存身份。
+          state.profiles = [];
+          profileSelect.replaceChildren();
+          renderAccountPool({ profiles: [], concurrency: {}, active_profile_id: "" });
+          renderDashboard(data);
           updateStatusUI("需要 API Key", "standby");
           authStatusBanner.className = "status-banner error";
           authStatusBanner.textContent = "服务已启用 API Key，请在接口页输入密钥后保存到当前标签页。";
@@ -5016,12 +5815,57 @@
 
         modelPillText.textContent = `model: ${modelSelect.value}`;
         $("info-model").textContent = modelSelect.value;
-        $("info-captcha").textContent = data.captcha_mode || "browser_fresh";
-        $("info-user-name").textContent = data.user_name || data.user_id || "-";
+        $("info-captcha").textContent = formatCaptchaMode(data);
+        $("info-user-name").textContent = accountNameForStatus(data) || "-";
         $("info-token-fp").textContent = data.token_fp || "-";
         $("info-device-fp").textContent = data.device_id_fp || "-";
         $("dash-timeout").textContent = (data.upstream_timeout_sec || "-") + "s";
         $("dash-retry").textContent = `wait ${data.upstream_retry_wait_sec ?? "-"}s × ${data.upstream_retry_max_attempts ?? "-"}`;
+        const responseStore = data.response_store || {};
+        $("info-response-store").textContent = responseStore.max_items
+          ? `${responseStore.items || 0}/${responseStore.max_items} · ${formatBytes(responseStore.bytes || 0)}/${formatBytes(responseStore.max_bytes || 0)}`
+          : "-";
+        const historyStore = data.history_store || {};
+        renderHistoryStoreStatus(historyStore);
+        $("info-history-store").textContent = historyStore.max_records
+          ? `${historyStore.records || 0}/${historyStore.max_records} · ${formatBytes(historyStore.detail_bytes || 0)}/${formatBytes(historyStore.max_detail_bytes || 0)}`
+          : "-";
+        const logStore = data.log_store || {};
+        $("info-log-store").textContent = logStore.max_total_bytes
+          ? `${formatBytes(logStore.total_bytes || 0)}/${formatBytes(logStore.max_total_bytes)} · ${logStore.segments || 0}/${logStore.max_segments || 0} 段`
+          : "-";
+        const autoDelete = data.auto_delete || {};
+        $("info-auto-delete").textContent = autoDelete.max_pending
+          ? `${autoDelete.pending || 0}/${autoDelete.max_pending} · 补偿 会话 ${autoDelete.journal_chat_pending || 0} / 文件 ${autoDelete.journal_file_pending || 0} · ${autoDelete.replay_active ? `重放中(${autoDelete.replay_deferred || 0})` : "重放空闲"}`
+          : "-";
+        const captchaWorker = data.captcha_worker || {};
+        $("info-captcha-worker").textContent = captchaWorker.enabled
+          ? `${captchaWorker.active ? "求解中" : "空闲"} · ${captchaWorker.pending || 0}/${captchaWorker.max_pending || 0} · 回压 ${captchaWorker.backpressure_total || 0}`
+          : "未启用（当前无需浏览器回退）";
+        const httpHandlers = data.http_handlers || {};
+        $("info-http-handlers").textContent = httpHandlers.max_active
+          ? `${httpHandlers.active || 0}/${httpHandlers.max_active} · 峰值 ${httpHandlers.peak || 0} · 拒绝 ${httpHandlers.rejected_total ?? httpHandlers.wait_total ?? 0}`
+          : "-";
+        const uploadSlots = data.upload_slots || {};
+        $("info-upload-slots").textContent = uploadSlots.max_active
+          ? `附件 ${uploadSlots.file?.active || 0}/${uploadSlots.file?.max_active || 0} · HAR ${uploadSlots.har?.active || 0}/${uploadSlots.har?.max_active || 0} · 拒绝 ${uploadSlots.rejected_total || 0}`
+          : "-";
+        const upstreamResponses = data.upstream_responses || {};
+        $("info-upstream-responses").textContent = upstreamResponses.json_max_bytes
+          ? `JSON拒绝 ${upstreamResponses.rejected_total || 0} · 流拒绝 ${upstreamResponses.stream_rejected_total || 0} · 未完整 ${upstreamResponses.stream_incomplete_total || 0} · 流输出 ${formatBytes(upstreamResponses.stream_output_max_bytes || 0)}`
+          : "-";
+        const upstreamReaders = data.upstream_readers || {};
+        $("info-upstream-readers").textContent = upstreamReaders.queue_size
+          ? `${upstreamReaders.active || 0} 活跃 · 峰值 ${upstreamReaders.peak || 0} · 静默 ${upstreamReaders.heartbeats_total || 0}`
+          : "-";
+        const sseHeartbeat = data.sse_heartbeat || {};
+        $("info-sse-heartbeat").textContent = sseHeartbeat.interval_seconds
+          ? `${sseHeartbeat.active || 0} 活跃 · ${sseHeartbeat.sent_total || 0} 次 · ${sseHeartbeat.interval_seconds}s`
+          : "-";
+        const contextCache = data.context_cache || {};
+        $("info-context-cache").textContent = contextCache.max_items
+          ? `${contextCache.items || 0}/${contextCache.max_items} · ${formatBytes(contextCache.bytes || 0)} · 降级 ${contextCache.degraded_states || 0}`
+          : "-";
 
         if (data.limits?.chat_file_upload_bytes) {
           state.maxChatFileUploadBytes = Number(data.limits.chat_file_upload_bytes);
@@ -5031,8 +5875,10 @@
           if (state.activeRequest) {
             // A local generation is in progress; the 30s polling must not
             // overwrite its progress/upload status.
-          } else if (state.chatBusy) {
+          } else if (state.chatBusy && Number(data.concurrency?.available || 0) <= 0) {
             updateStatusUI("当前账号有进行中的生成请求（含其它入口）", "standby");
+          } else if (state.chatBusy) {
+            updateStatusUI("当前账号生成中，后续请求将自动分配到其它账号", "connected");
           } else {
             updateStatusUI("已连接", "connected");
           }
@@ -5067,11 +5913,13 @@
         authEl.style.color = "var(--rose-core)";
       }
 
-      $("dash-account").textContent = data.user_name || data.user_id || "-";
-      $("dash-account").className = "tile-value" + (data.user_name ? "" : " warn");
+      const activeProfile = activeProfileForStatus(data);
+      const accountName = accountNameForStatus(data);
+      $("dash-account").textContent = accountName || "-";
+      $("dash-account").className = "tile-value" + (activeProfile?.user_name ? "" : " warn");
       $("dash-model").textContent = modelSelect.value || data.model || "-";
       $("dash-models-count").textContent = `${(data.supported_models || []).length} 个可用模型`;
-      $("dash-captcha").textContent = data.captcha_mode || "-";
+      $("dash-captcha").textContent = formatCaptchaMode(data);
       const settingsModelValue = $("settings-model-value");
       if (settingsModelValue) settingsModelValue.textContent = modelSelect.value || data.model || "-";
 
@@ -5085,36 +5933,50 @@
       }
 
       // 左下角账号迷你卡
-      const name = data.user_name || data.user_id || "";
+      const name = accountName;
       $("nav-account-name").textContent = name || "未登录";
       $("nav-account-avatar").textContent = name ? name.slice(0, 1).toUpperCase() : "?";
       $("nav-account-hint").textContent = data.auth_ready
-        ? (data.profile_label ? data.profile_label : "登录态就绪")
+        ? (activeProfile?.label || "登录态就绪")
         : "点击添加账号";
     }
 
     async function reloadAllData() {
       const ok = await fetchStatus();
-      if (ok) await fetchProfiles();
+      return ok ? fetchProfiles() : false;
     }
 
-    btnRefreshProfiles.addEventListener("click", () => {
-      reloadAllData();
-      window.showToast("已刷新登录态与状态");
+    btnRefreshProfiles.addEventListener("click", async () => {
+      const ok = await reloadAllData();
+      window.showToast(ok ? "已刷新登录态与状态" : "刷新失败，请检查本地服务", ok ? "success" : "error");
+    });
+
+    profileSelect.addEventListener("change", () => {
+      renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
+    });
+
+    profilePoolList.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-profile-action]");
+      const card = event.target.closest("[data-profile-key]");
+      const profileId = target?.dataset.profileKey || card?.dataset.profileKey || "";
+      if (!profileId) return;
+      selectProfileCard(profileId);
+      if (!target) return;
+      if (target.dataset.profileAction === "remove") btnRemoveProfile.click();
     });
 
     // Switch profile
-    btnSwitchProfile.addEventListener("click", async () => {
+    async function switchSelectedProfile() {
       const pId = profileSelect.value;
       if (!pId) return;
       btnSwitchProfile.disabled = true;
       authStatusBanner.textContent = "正在切换登录态...";
       try {
-        const res = await fetch("/api/auth/switch", {
+        const res = await fetchWithTimeout("/api/auth/switch", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ profile_id: pId })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
@@ -5122,28 +5984,35 @@
         updateSessionUI();
         await reloadAllData();
         applyProfileSessionFilter();
-        window.showToast(`已切换账号: ${data.profile.label}，本地会话已按账号隔离`, "success");
+        showProfileMutationResult(data, `已切换账号: ${data.profile.label}，本地会话已按账号隔离`);
       } catch (err) {
         window.showToast(`切换失败: ${err.message}`, "error");
       } finally {
         btnSwitchProfile.disabled = false;
       }
-    });
+    }
+    btnSwitchProfile.addEventListener("click", switchSelectedProfile);
 
     // Remove profile
-    btnRemoveProfile.addEventListener("click", async () => {
+    async function removeSelectedProfile() {
       const pId = profileSelect.value;
       if (!pId) return;
+      const selectedProfile = state.profiles.find(p => p.id === pId);
+      const runtime = selectedProfile ? profileRuntime(selectedProfile, state.concurrency || {}) : null;
+      if (runtime && runtime.inflight > 0) {
+        window.showToast(`该账号仍有 ${runtime.inflight} 个生成请求，请先完成或停止`, "error");
+        return;
+      }
       const optText = profileSelect.selectedOptions[0]?.textContent || pId;
       if (!confirm(`确认从本地安全区删除账号？\n${optText}`)) return;
 
       btnRemoveProfile.disabled = true;
       try {
-        const res = await fetch("/api/auth/remove", {
+        const res = await fetchWithTimeout("/api/auth/remove", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ profile_id: pId })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
@@ -5151,32 +6020,33 @@
         updateSessionUI();
         await reloadAllData();
         applyProfileSessionFilter();
-        window.showToast("登录态已从本地加密区删除", "success");
+        showProfileMutationResult(data, "登录态已从本地加密区删除");
       } catch (err) {
         window.showToast(`删除失败: ${err.message}`, "error");
       } finally {
-        btnRemoveProfile.disabled = false;
+        renderAccountPool({ profiles: state.profiles, concurrency: state.concurrency, active_profile_id: state.activeProfileId });
       }
-    });
+    }
+    btnRemoveProfile.addEventListener("click", removeSelectedProfile);
 
     btnCompactProfiles.addEventListener("click", async () => {
       if (btnCompactProfiles.disabled) return;
-      if (!confirm("确认清理同一账号的重复登录态？\n会保留当前启用项；如果某组没有当前启用项，则保留最近保存项。")) return;
+      if (!confirm("确认清理同一账号的重复登录态？\n会保留当前启用项；正在生成的账号会跳过，任务结束后可再次清理。")) return;
 
       btnCompactProfiles.disabled = true;
       try {
-        const res = await fetch("/api/auth/compact", {
+        const res = await fetchWithTimeout("/api/auth/compact", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: "{}"
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
         state.currentChatId = "";
         updateSessionUI();
         await reloadAllData();
-        window.showToast(data.message || "已清理重复登录态", "success");
+        showProfileMutationResult(data, "已清理重复登录态");
       } catch (err) {
         window.showToast(`清理失败: ${err.message}`, "error");
       } finally {
@@ -5186,31 +6056,45 @@
 
     // Browser login trigger
     btnBrowserLogin.addEventListener("click", async () => {
+      if (!state.playwrightAvailable) {
+        window.showToast("浏览器登录组件未安装，请使用 Token/HAR 或安装 requirements.txt", "error");
+        return;
+      }
       const label = profileNameInput.value.trim() || "browser login";
+      state.browserLoginBusy = true;
       btnBrowserLogin.disabled = true;
       authStatusBanner.className = "status-banner standby";
       authStatusBanner.textContent = "正在拉起官方 Chrome 窗口...";
       window.showToast("已打开浏览器登录窗口，请在官方页面完成登录");
       const loginStartedAt = Date.now();
+      let loginPollBusy = false;
+      let loginPolling = true;
       const loginPollTimer = setInterval(async () => {
+        if (!loginPolling || loginPollBusy) return;
+        loginPollBusy = true;
         try {
-          const res = await fetch("/api/auth/browser-login/status", { headers: apiHeaders() });
+          const res = await fetchWithTimeout(
+            "/api/auth/browser-login/status",
+            { headers: apiHeaders() },
+            5000
+          );
           const data = await res.json();
-          if (data && data.stage) {
+          if (loginPolling && data && data.stage) {
             const elapsed = Math.round((Date.now() - loginStartedAt) / 1000);
             const extra = data.error ? ` (${data.error})` : "";
             authStatusBanner.className = "status-banner standby";
             authStatusBanner.textContent = `浏览器登录中: ${data.stage} · 已等待 ${elapsed}s${extra}`;
           }
         } catch (e) { /* status polling is best-effort */ }
+        finally { loginPollBusy = false; }
       }, 1500);
 
       try {
-        const res = await fetch("/api/auth/browser-login", {
+        const res = await fetchWithTimeout("/api/auth/browser-login", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ label, timeout_sec: 300 })
-        });
+        }, BROWSER_LOGIN_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
@@ -5219,59 +6103,16 @@
         updateSessionUI();
         await reloadAllData();
         applyProfileSessionFilter();
-        const captchaNote = data.captcha_ok === false ? "（验证码待采集，发消息时自动尝试）" : "";
-        window.showToast(`浏览器登录成功并已加密保存: ${data.profile.label}${captchaNote}`, "success");
+        showProfileMutationResult(data, `浏览器登录成功并已加密保存: ${data.profile.label} · 验证码将由本地求解器自动处理`);
       } catch (err) {
         authStatusBanner.className = "status-banner error";
         authStatusBanner.textContent = `浏览器登录失败: ${err.message}`;
         window.showToast(`浏览器登录异常: ${err.message}`, "error");
       } finally {
+        loginPolling = false;
         clearInterval(loginPollTimer);
-        btnBrowserLogin.disabled = false;
-      }
-    });
-
-    // Manual captcha refresh
-    btnCaptchaRefresh.addEventListener("click", async () => {
-      const pid = profileSelect.value;
-      if (!pid) {
-        window.showToast("请先选择账号", "error");
-        return;
-      }
-      btnCaptchaRefresh.disabled = true;
-      authStatusBanner.className = "status-banner standby";
-      authStatusBanner.textContent = "已打开验证码采集窗口，请在浏览器中完成滑块验证...";
-      const captchaStartedAt = Date.now();
-      const captchaPollTimer = setInterval(async () => {
-        try {
-          const res = await fetch("/api/auth/browser-login/status", { headers: apiHeaders() });
-          const data = await res.json();
-          if (data && data.stage) {
-            const elapsed = Math.round((Date.now() - captchaStartedAt) / 1000);
-            authStatusBanner.className = "status-banner standby";
-            authStatusBanner.textContent = `验证码采集: ${data.stage} · 已等待 ${elapsed}s`;
-          }
-        } catch (e) { /* best-effort */ }
-      }, 1500);
-
-      try {
-        const res = await fetch("/api/auth/captcha-refresh", {
-          method: "POST",
-          headers: apiHeaders({ "Content-Type": "application/json" }),
-          body: JSON.stringify({ profile_id: pid, timeout_sec: 180 })
-        });
-        const data = await res.json();
-        if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
-        await reloadAllData();
-        applyProfileSessionFilter();
-        window.showToast("验证码已采集并保存", "success");
-      } catch (err) {
-        authStatusBanner.className = "status-banner error";
-        authStatusBanner.textContent = `验证码采集失败: ${err.message}`;
-        window.showToast(`验证码采集失败: ${err.message}`, "error");
-      } finally {
-        clearInterval(captchaPollTimer);
-        btnCaptchaRefresh.disabled = false;
+        state.browserLoginBusy = false;
+        btnBrowserLogin.disabled = !state.playwrightAvailable;
       }
     });
 
@@ -5288,11 +6129,11 @@
 
       try {
         const params = new URLSearchParams({ label, source: file.name });
-        const res = await fetch(`/api/auth/har?${params.toString()}`, {
+        const res = await fetchWithTimeout(`/api/auth/har?${params.toString()}`, {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/har+json" }),
           body: file
-        });
+        }, HAR_UPLOAD_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
@@ -5302,7 +6143,7 @@
         updateSessionUI();
         await reloadAllData();
         applyProfileSessionFilter();
-        window.showToast(`HAR 解析成功并保存登录态: ${data.profile.label}`, "success");
+        showProfileMutationResult(data, `HAR 解析成功并保存登录态: ${data.profile.label}`);
       } catch (err) {
         authStatusBanner.className = "status-banner error";
         authStatusBanner.textContent = `HAR 上传失败: ${err.message}`;
@@ -5323,11 +6164,11 @@
       btnTokenLogin.disabled = true;
       authStatusBanner.textContent = "正在校验 token...";
       try {
-        const res = await fetch("/api/auth/token", {
+        const res = await fetchWithTimeout("/api/auth/token", {
           method: "POST",
           headers: apiHeaders({ "Content-Type": "application/json" }),
           body: JSON.stringify({ token, label })
-        });
+        }, MANAGEMENT_FETCH_TIMEOUT_MS);
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error?.message || `HTTP ${res.status}`);
 
@@ -5337,7 +6178,7 @@
         updateSessionUI();
         await reloadAllData();
         applyProfileSessionFilter();
-        window.showToast(`token 登录成功并切换账号: ${data.profile.label}`, "success");
+        showProfileMutationResult(data, `token 登录成功并切换账号: ${data.profile.label}`);
       } catch (err) {
         authStatusBanner.className = "status-banner error";
         authStatusBanner.textContent = `token 登录失败: ${err.message}`;
@@ -5370,12 +6211,18 @@
       }
     });
 
-    // 轻量状态自动刷新：仅页面可见时执行，失败静默
+    // 轻量状态自动刷新：仅页面可见时执行，且后台轮询不重入。
+    let statusAutoRefreshRunning = false;
     setInterval(async () => {
-      if (document.hidden) return;
+      if (document.hidden || statusAutoRefreshRunning) return;
+      statusAutoRefreshRunning = true;
       try {
         await reloadAllData();
-      } catch (e) {}
+      } catch (e) {
+        // fetchStatus/fetchProfiles 已将故障反映到 UI；定时器保持运行。
+      } finally {
+        statusAutoRefreshRunning = false;
+      }
     }, 30000);
   </script>
 </body>

@@ -49,11 +49,41 @@ function Ensure-Playwright {
     }
 }
 
+function Test-HappyDom {
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    if (-not $node -or -not (Test-Path -LiteralPath (Join-Path $Root 'captcha_happy.mjs'))) {
+        return $false
+    }
+
+    & $node.Source -e 'import("happy-dom").then(() => process.exit(0)).catch(() => process.exit(1))' *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+function Ensure-HappyDom {
+    if (Test-HappyDom) {
+        return $true
+    }
+
+    $node = Get-Command node -ErrorAction SilentlyContinue
+    $npm = Get-Command npm -ErrorAction SilentlyContinue
+    if (-not $node -or -not $npm -or -not (Test-Path -LiteralPath (Join-Path $Root 'package.json'))) {
+        return $false
+    }
+
+    Write-Host '[glm2api] happy-dom solver was not found; installing the local Node dependency...' -ForegroundColor Yellow
+    & $npm.Source install --omit=dev --no-audit --no-fund --no-package-lock | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        return $false
+    }
+
+    return (Test-HappyDom)
+}
+
 function Test-ExistingGlm2Api {
     try {
         $response = Invoke-WebRequest -Uri 'http://127.0.0.1:8008/healthz' -UseBasicParsing -TimeoutSec 1
         $status = $response.Content | ConvertFrom-Json
-        return [bool]$status.ok
+        return [bool]$status.ok -and $status.service -eq 'glm2api'
     } catch {
         return $false
     }
@@ -81,20 +111,27 @@ if ($PortListener) {
 
 $PythonExe = Find-Python
 $HarPath = Find-Har
-Ensure-Playwright -PythonExe $PythonExe
+$CaptchaMode = 'happydom'
+if (Ensure-HappyDom) {
+    Write-Host '[glm2api] captcha solver: happy-dom (no browser worker required).' -ForegroundColor Green
+} else {
+    Write-Host '[glm2api] happy-dom is unavailable; enabling the Playwright browser fallback.' -ForegroundColor Yellow
+    Ensure-Playwright -PythonExe $PythonExe
+    $CaptchaMode = 'browser'
+}
 
 Write-Host ''
 Write-Host '[glm2api] starting local web service...' -ForegroundColor Cyan
 if ($HarPath) {
     Write-Host ('[glm2api] preload HAR: ' + $HarPath)
 } else {
-    Write-Host '[glm2api] no HAR found; starting without account. Use Browser Login in the web panel.' -ForegroundColor Yellow
+    Write-Host '[glm2api] no HAR found; starting without account. Add Token/HAR in the web panel.' -ForegroundColor Yellow
 }
 Write-Host '[glm2api] Web: http://127.0.0.1:8008/'
-Write-Host '[glm2api] Login: use Browser Login or upload HAR in the right panel.'
+Write-Host '[glm2api] Login: Token/HAR are browser-free; Browser Login uses optional Playwright.'
 Write-Host ''
 
-$RunArgs = @('.\glm2api.py', '--serve', '--port', '8008', '--fresh-captcha-browser', '--open-web')
+$RunArgs = @('.\glm2api.py', '--serve', '--port', '8008', '--fresh-captcha', '--captcha-mode', $CaptchaMode, '--open-web')
 if ($HarPath) {
     $RunArgs += @('--har', $HarPath)
 }

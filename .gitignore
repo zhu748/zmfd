@@ -1,6 +1,7 @@
 # Local credentials and captures must never be versioned.
 profiles.local.json
 apikey.local.json
+pending_deletes.local.json
 *.har
 
 # Python runtime artifacts.

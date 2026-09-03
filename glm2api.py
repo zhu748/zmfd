@@ -26,6 +26,7 @@ import hashlib
 import html
 import hmac
 import http.client
+import importlib.util
 import ipaddress
 import json
 import mimetypes
@@ -34,6 +35,7 @@ import queue
 import re
 import secrets
 import shutil
+import socket
 import string
 import subprocess
 import sys
@@ -43,14 +45,14 @@ import time
 import uuid
 import webbrowser
 from collections import Counter, deque
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass, replace
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from ctypes import wintypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, NoReturn
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit
 from urllib.request import Request, urlopen
@@ -66,10 +68,135 @@ LOG_FILE_PATH = LOG_DIR / "glm2api.log"
 LOG_MAX_BYTES = 8 * 1024 * 1024
 LOG_BACKUP_COUNT = 5
 LOG_RING_CAPACITY = 1500
+LOG_RECORD_MAX_CHARS = 16 * 1024
+LOG_TRUNCATION_SUFFIX = "…[log truncated]"
 LOG_FORMAT = "%(asctime)s.%(msecs)03d [%(levelname)s] [%(threadName)s] %(message)s"
 LOG = logging.getLogger("glm2api")
+# Avoid Python's unformatted lastResort stderr handler leaking an exception
+# before service logging is initialized (for example when imported as a lib).
+LOG.addHandler(logging.NullHandler())
+LOG.propagate = False
 
 _REQ_CONTEXT = threading.local()
+
+_SENSITIVE_LOG_KEYS = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "authorization",
+        "captcha",
+        "captcha_verify_param",
+        "certifyid",
+        "certify_id",
+        "client_secret",
+        "cookie",
+        "current_key",
+        "passwd",
+        "password",
+        "refresh_token",
+        "securitytoken",
+        "security_token",
+        "set_cookie",
+        "token",
+    }
+)
+_SECRET_FIELD_PATTERN = (
+    r"access_token|api[_-]?key|authorization|captcha(?:_verify_param)?|certify_?id|client_secret|"
+    r"cookie|current_key|passw(?:or)?d|refresh_token|security_?token|set[_-]?cookie|token"
+)
+_LOG_QUOTED_SECRET_RE = re.compile(
+    rf'''(?i)(["']?(?:{_SECRET_FIELD_PATTERN})["']?\s*:\s*)(["'])(.*?)(\2)'''
+)
+_LOG_ASSIGNED_SECRET_RE = re.compile(
+    rf"(?i)(\b(?:{_SECRET_FIELD_PATTERN})\b\s*=\s*)([^&\s,}}]+)"
+)
+_LOG_HEADER_SECRET_RE = re.compile(
+    r'''(?im)(?<!["'])(\b(?:authorization|cookie|set-cookie|x-api-key)\s*:\s*)[^\r\n]+'''
+)
+_LOG_BEARER_RE = re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+")
+_LOG_JWT_RE = re.compile(r"\beyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\b")
+_LOG_PROVIDER_KEY_RE = re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{16,})\b")
+_CLIENT_ERROR_URL_QUERY_RE = re.compile(r"(?i)(https?://[^\s?#]+)\?[^\s<>'\"]+")
+_CLIENT_ERROR_QUOTED_PATH_RE = re.compile(
+    r'''(?P<quote>["'])(?:(?:[A-Za-z]:[\\/])|(?:/(?:home|Users|tmp|var/tmp)/))[^"'\r\n]+(?P=quote)'''
+)
+_CLIENT_ERROR_WINDOWS_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])(?:[A-Za-z]:[\\/]|\\\\)[^\s,;)\]}]+")
+_CLIENT_ERROR_UNIX_PATH_RE = re.compile(r"(?<![A-Za-z0-9_])/(?:home|Users|tmp|var/tmp)/[^\s,;)\]}]+")
+CLIENT_ERROR_MAX_CHARS = 1200
+
+
+def bounded_log_text(value: Any) -> str:
+    """Redact and cap one formatted log field before it reaches disk or the UI ring."""
+    text = redact_private_locations(redact_log_text(value))
+    if len(text) <= LOG_RECORD_MAX_CHARS:
+        return text
+    keep = max(0, LOG_RECORD_MAX_CHARS - len(LOG_TRUNCATION_SUFFIX))
+    return text[:keep].rstrip() + LOG_TRUNCATION_SUFFIX
+
+
+def redact_log_text(value: Any) -> str:
+    """Remove credentials from arbitrary log text, including exception text."""
+    text = str(value)
+    text = _LOG_QUOTED_SECRET_RE.sub(lambda match: f'{match.group(1)}{match.group(2)}<redacted>{match.group(4)}', text)
+    text = _LOG_ASSIGNED_SECRET_RE.sub(lambda match: f"{match.group(1)}<redacted>", text)
+    text = _LOG_HEADER_SECRET_RE.sub(lambda match: f"{match.group(1)}<redacted>", text)
+    text = _LOG_BEARER_RE.sub("Bearer <redacted>", text)
+    text = _LOG_JWT_RE.sub("<redacted:jwt>", text)
+    return _LOG_PROVIDER_KEY_RE.sub("<redacted:key>", text)
+
+
+def redact_private_locations(value: Any) -> str:
+    """Remove URL queries and user-specific absolute paths from diagnostics."""
+    text = _CLIENT_ERROR_URL_QUERY_RE.sub(r"\1?<redacted:query>", str(value))
+    text = _CLIENT_ERROR_QUOTED_PATH_RE.sub(
+        lambda match: f"{match.group('quote')}<redacted:path>{match.group('quote')}",
+        text,
+    )
+    text = _CLIENT_ERROR_WINDOWS_PATH_RE.sub("<redacted:path>", text)
+    return _CLIENT_ERROR_UNIX_PATH_RE.sub("<redacted:path>", text)
+
+
+def client_error_message(value: Any, fallback: str = "request failed") -> str:
+    """Return a useful error without credentials, queries, local paths or controls."""
+    text = redact_private_locations(redact_log_text(value)).strip()
+    text = re.sub(r"[\r\n\t\x00-\x08\x0b\x0c\x0e-\x1f]+", " ", text)
+    text = re.sub(r" {2,}", " ", text).strip()
+    if not text:
+        return fallback
+    if len(text) > CLIENT_ERROR_MAX_CHARS:
+        text = text[: CLIENT_ERROR_MAX_CHARS - 18].rstrip() + "…[error truncated]"
+    return text
+
+
+def sanitize_client_error_payload(value: Any) -> Any:
+    """Recursively sanitize an error-shaped payload without touching success data."""
+    if isinstance(value, dict):
+        return {str(key): sanitize_client_error_payload(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_client_error_payload(item) for item in value]
+    if isinstance(value, str):
+        return client_error_message(value, fallback="")
+    return value
+
+
+def sanitize_log_value(value: Any, key: str = "") -> Any:
+    """Recursively sanitize structured event fields before serialization."""
+    if str(key or "").strip().lower() in _SENSITIVE_LOG_KEYS:
+        return "<redacted>" if value not in (None, "") else ""
+    if isinstance(value, dict):
+        return {str(item_key): sanitize_log_value(item_value, str(item_key)) for item_key, item_value in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [sanitize_log_value(item) for item in value]
+    if isinstance(value, str):
+        return redact_private_locations(redact_log_text(value))
+    return value
+
+
+class RedactingFormatter(logging.Formatter):
+    """Final logging boundary: redact message text and formatted tracebacks."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return bounded_log_text(super().format(record))
 
 
 class RingBufferHandler(logging.Handler):
@@ -82,17 +209,21 @@ class RingBufferHandler(logging.Handler):
         self._records: deque[dict[str, Any]] = deque(maxlen=self.capacity)
         self._sequence = 0
         self.dropped_by_filter = 0
+        self._truncated_total = 0
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            line = self.format(record)
+            line = bounded_log_text(self.format(record))
         except Exception:
             return
-        message = record.getMessage()
-        state = ""
-        rid = ""
+        message = bounded_log_text(record.getMessage())
+        truncated = line.endswith(LOG_TRUNCATION_SUFFIX) or message.endswith(LOG_TRUNCATION_SUFFIX)
+        state = str(getattr(record, "glm2api_event_state", "") or "")[:120]
+        rid = str(getattr(record, "glm2api_event_rid", "") or "")[:32]
         kind = "system"
-        if message.startswith("{"):
+        if state:
+            kind = "event"
+        elif message.startswith("{"):
             try:
                 payload = json.loads(message)
             except Exception:
@@ -110,6 +241,8 @@ class RingBufferHandler(logging.Handler):
                 kind = "error"
         with self._lock:
             self._sequence += 1
+            if truncated:
+                self._truncated_total += 1
             self._records.append(
                 {
                     "seq": self._sequence,
@@ -192,6 +325,8 @@ class RingBufferHandler(logging.Handler):
             "total": len(records),
             "matched": len(records) if matched_count is None else max(0, int(matched_count)),
             "capacity": self.capacity,
+            "max_record_chars": LOG_RECORD_MAX_CHARS,
+            "truncated_total": self._truncated_total,
             "levels": {name: int(level_counts.get(name, 0)) for name in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")},
             "kinds": dict(kind_counts),
             "top_states": [{"state": name, "count": count} for name, count in state_counts.most_common(16)],
@@ -208,7 +343,10 @@ class RingBufferHandler(logging.Handler):
 def setup_logging(level: str = "INFO", console: bool = True) -> Path:
     """Install file + stderr + ring handlers on the glm2api logger (idempotent)."""
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+    formatter = RedactingFormatter(LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S")
+    for handler in list(LOG.handlers):
+        if isinstance(handler, logging.NullHandler):
+            LOG.removeHandler(handler)
     if not any(isinstance(handler, RingBufferHandler) for handler in LOG.handlers):
         ring_handler = RingBufferHandler()
         ring_handler.setFormatter(formatter)
@@ -230,6 +368,10 @@ def setup_logging(level: str = "INFO", console: bool = True) -> Path:
         console_handler = logging.StreamHandler(sys.stderr)
         console_handler.setFormatter(formatter)
         LOG.addHandler(console_handler)
+    # A host application may have attached a handler before calling us. Keep
+    # the logger boundary safe instead of trusting that handler's formatter.
+    for handler in LOG.handlers:
+        handler.setFormatter(formatter)
     LOG.propagate = False
     LOG.setLevel(getattr(logging, str(level).upper(), logging.INFO))
     return LOG_FILE_PATH
@@ -241,6 +383,31 @@ def log_file_label() -> str:
         return LOG_FILE_PATH.relative_to(Path(__file__).resolve().parent).as_posix()
     except ValueError:
         return LOG_FILE_PATH.name
+
+
+def log_store_status() -> dict[str, int]:
+    """Return active + rotated log usage without exposing absolute paths."""
+    active_bytes = 0
+    total_bytes = 0
+    segments = 0
+    for index in range(LOG_BACKUP_COUNT + 1):
+        path = LOG_FILE_PATH if index == 0 else Path(f"{LOG_FILE_PATH}.{index}")
+        try:
+            size = max(0, int(path.stat().st_size))
+        except OSError:
+            continue
+        if index == 0:
+            active_bytes = size
+        total_bytes += size
+        segments += 1
+    return {
+        "active_bytes": active_bytes,
+        "total_bytes": total_bytes,
+        "segments": segments,
+        "max_segments": LOG_BACKUP_COUNT + 1,
+        "max_segment_bytes": LOG_MAX_BYTES,
+        "max_total_bytes": LOG_MAX_BYTES * (LOG_BACKUP_COUNT + 1),
+    }
 
 
 def log_ring() -> RingBufferHandler:
@@ -263,11 +430,18 @@ def current_request_id() -> str:
 
 def log_event(state: str, level: int = logging.INFO, **fields: Any) -> None:
     """Emit one structured JSON event line (keeps the historical {"state": ...} shape)."""
-    payload: dict[str, Any] = {"state": state, **fields}
+    payload = sanitize_log_value({"state": state, **fields})
     rid = current_request_id()
     if rid:
         payload = {"rid": rid, **payload}
-    LOG.log(level, json.dumps(payload, ensure_ascii=False, default=str))
+    LOG.log(
+        level,
+        json.dumps(payload, ensure_ascii=False, default=str),
+        extra={
+            "glm2api_event_state": str(state or "")[:120],
+            "glm2api_event_rid": rid[:32],
+        },
+    )
 
 
 def _percentile(values: Iterable[int | float], percentile: float) -> int:
@@ -287,6 +461,21 @@ def _metric_path(path: str) -> str:
     return value
 
 
+def safe_access_log_target(target: str) -> str:
+    """Return a query-free, identifier-normalized target for access logs."""
+    try:
+        path = urlsplit(str(target or "/")).path or "/"
+    except ValueError:
+        path = "/"
+    path = re.sub(r"[\r\n\t]", "_", path)
+    return _metric_path(path)[:300]
+
+
+MAX_RUNTIME_METRIC_PATHS = 256
+MAX_RUNTIME_METRIC_PATH_CHARS = 300
+RUNTIME_METRIC_OTHER_PATH = "/:other"
+
+
 class RuntimeMetrics:
     """Small in-memory operational counters; content and account identifiers are excluded."""
 
@@ -298,6 +487,7 @@ class RuntimeMetrics:
         self._status = Counter()
         self._methods = Counter()
         self._paths = Counter()
+        self._path_overflow_total = 0
         self._samples: deque[tuple[float, int, int]] = deque(maxlen=4096)
 
     def record_http(self, method: str, path: str, status: int, duration_ms: int) -> None:
@@ -307,7 +497,11 @@ class RuntimeMetrics:
             self._requests_total += 1
             self._status[str(status)] += 1
             self._methods[str(method or "UNKNOWN").upper()] += 1
-            self._paths[_metric_path(path)] += 1
+            metric_path = _metric_path(path)[:MAX_RUNTIME_METRIC_PATH_CHARS]
+            if metric_path not in self._paths and len(self._paths) >= MAX_RUNTIME_METRIC_PATHS - 1:
+                metric_path = RUNTIME_METRIC_OTHER_PATH
+                self._path_overflow_total += 1
+            self._paths[metric_path] += 1
             self._samples.append((time.monotonic(), status, duration_ms))
 
     def snapshot(self) -> dict[str, Any]:
@@ -317,6 +511,7 @@ class RuntimeMetrics:
             status = Counter(self._status)
             methods = Counter(self._methods)
             paths = Counter(self._paths)
+            path_overflow_total = self._path_overflow_total
             samples = list(self._samples)
         durations = [item[2] for item in samples]
         recent = [item for item in samples if now_mono - item[0] <= 300]
@@ -329,6 +524,8 @@ class RuntimeMetrics:
             "requests_total": requests_total,
             "status_4xx": status_4xx,
             "status_5xx": status_5xx,
+            "request_timeouts": int(status.get("408", 0)),
+            "request_too_large": int(status.get("413", 0)),
             "error_rate": round(status_5xx / requests_total, 4) if requests_total else 0.0,
             "avg_duration_ms": round(sum(durations) / len(durations)) if durations else 0,
             "p50_duration_ms": _percentile(durations, 0.50),
@@ -336,6 +533,9 @@ class RuntimeMetrics:
             "requests_5m": len(recent),
             "errors_5m": recent_errors,
             "methods": dict(methods),
+            "tracked_paths": len(paths),
+            "max_paths": MAX_RUNTIME_METRIC_PATHS,
+            "path_overflow_total": path_overflow_total,
             "top_paths": [{"path": name, "count": count} for name, count in paths.most_common(8)],
         }
 
@@ -344,6 +544,7 @@ RUNTIME_METRICS = RuntimeMetrics()
 
 
 BASE_URL = "https://chat.z.ai"
+SERVICE_ID = "glm2api"
 DEFAULT_MODEL = "glm-5.3"
 # x-preview-l is the upstream model ID behind the GLM-5.3-Flash UI entry.
 FLASH_MODEL = "x-preview-l"
@@ -397,27 +598,327 @@ TRANSIENT_UPSTREAM_ERROR_PATTERNS = (
     "请稍后再试",
     "上游繁忙",
     "系统繁忙",
+    "上游中断",
 )
 SUPPORTED_REASONING_EFFORTS = ("low", "high", "max")
 MAX_HAR_UPLOAD_BYTES = 512 * 1024 * 1024
 MAX_CHAT_FILE_UPLOAD_BYTES = 128 * 1024 * 1024
+# 原始 HAR 使用临时文件流式解析；旧版 JSON 包装会先在内存中解码，需单独收紧。
+MAX_LEGACY_JSON_HAR_BYTES = 64 * 1024 * 1024
 MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
 MAX_SSE_BUFFER_BYTES = 2 * 1024 * 1024
+MAX_UPSTREAM_STREAM_WIRE_BYTES = 32 * 1024 * 1024
+MAX_UPSTREAM_STREAM_OUTPUT_BYTES = 16 * 1024 * 1024
+MAX_UPSTREAM_STREAM_EVENTS = 100_000
+MAX_UPSTREAM_JSON_RESPONSE_BYTES = 32 * 1024 * 1024
+MAX_UPSTREAM_ERROR_RESPONSE_BYTES = 64 * 1024
+MAX_UPSTREAM_UPLOAD_RESPONSE_BYTES = 1024 * 1024
+# ThreadingHTTPServer otherwise creates one unbounded thread per accepted
+# connection. Bound all HTTP handlers (including slow uploads/admin calls),
+# independently from the much smaller per-profile generation slot pool.
+MAX_HTTP_HANDLER_THREADS = 128
+HTTP_HANDLER_OVERLOAD_RETRY_SECONDS = 1
+MAX_QUERY_FIELDS = 32
+MAX_QUERY_KEY_CHARS = 128
+MAX_QUERY_VALUE_CHARS = 4096
+MAX_HISTORY_SEARCH_CHARS = 256
+MAX_HISTORY_QUERY_PAGE = 1000
+MAX_ACCOUNT_PROFILES = 64
+MAX_SESSION_TOKEN_CHARS = 16 * 1024
+MAX_CAPTCHA_VERIFY_PARAM_CHARS = 64 * 1024
+MAX_PROFILE_STATE_FIELD_CHARS = 4 * 1024
+MAX_SETTINGS_STORE_BYTES = 64 * 1024
+MAX_PROFILE_STORE_PAYLOAD_BYTES = 16 * 1024 * 1024
+MAX_PROFILE_STORE_BYTES = 24 * 1024 * 1024
+MAX_ACTIVE_CHAT_FILE_UPLOADS = 4
+MAX_ACTIVE_HAR_UPLOADS = 1
+GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS = 15.0
+FORCED_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+REQUEST_SOCKET_IDLE_TIMEOUT_SECONDS = 10.0
+UPSTREAM_FILE_IDLE_TIMEOUT_SECONDS = 15.0
+CAPTCHA_WORKER_MAX_PENDING = 8
+AUTO_DELETE_REQUEST_TIMEOUT_SECONDS = 10.0
+AUTO_DELETE_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+UPSTREAM_STOP_TIMEOUT_SECONDS = 10.0
+HAR_EXTRACT_TIMEOUT_SECONDS = 120.0
+HELPER_PROCESS_POLL_SECONDS = 0.25
+BROWSER_LOGIN_LAUNCH_TIMEOUT_MS = 10_000
+BROWSER_LOGIN_NAVIGATION_SLICE_MS = 5_000
+BROWSER_LOGIN_NAVIGATION_TOTAL_MS = 60_000
+BROWSER_LOGIN_DOM_READY_TIMEOUT_MS = 5_000
+BROWSER_LOGIN_AUTH_FETCH_TIMEOUT_MS = 5_000
+MAX_CHUNK_SIZE_LINE_BYTES = 128
+MAX_CHUNK_TRAILER_BYTES = 8 * 1024
+
+
+class RequestBodyTimeout(ValueError):
+    """The client did not deliver its declared body before the socket timeout."""
+
+
+class RequestBodyTooLarge(ValueError):
+    """The client declared or streamed more bytes than this route accepts."""
+
+
+class QueryValidationError(ValueError):
+    """The request target contains an excessive or malformed query string."""
+
+
+class ProfileCapacityError(ValueError):
+    """Adding a new account would exceed the bounded local profile pool."""
+
+
+class LocalStoreWriteError(RuntimeError):
+    """A validated local state change could not be committed atomically to disk."""
+
+
+class UpstreamRequestError(RuntimeError):
+    """The Z.ai transport or response failed after local input validation."""
+
+
+class UpstreamResponseTooLarge(UpstreamRequestError):
+    """An upstream response or complete stream exceeded its bounded memory budget."""
+
+
+class UpstreamStreamIncomplete(UpstreamRequestError):
+    """The upstream SSE connection ended without an explicit completion marker."""
+
+
+class ServiceShuttingDown(ConnectionResetError):
+    """Internal cancellation used to unwind active requests during shutdown."""
+
+
+def interruption_reason(exc: BaseException) -> str:
+    return "service_shutdown" if isinstance(exc, ServiceShuttingDown) else "client_disconnect"
+
+
+def interruptible_wait(seconds: float, cancel_check: Callable[[], None] | None = None) -> None:
+    """Sleep in short slices so shutdown/downstream cancellation stays prompt."""
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_check is not None:
+            cancel_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.1, remaining))
+
+
+def exception_http_status(exc: BaseException) -> int:
+    """Map validated client, timeout, and upstream failures to stable HTTP status."""
+    if isinstance(exc, RequestBodyTooLarge):
+        return 413
+    if isinstance(exc, RequestBodyTimeout):
+        return 408
+    if isinstance(exc, ProfileCapacityError):
+        return 409
+    if isinstance(exc, ValueError):
+        return 400
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return 504
+    if isinstance(exc, URLError):
+        reason = getattr(exc, "reason", None)
+        return 504 if isinstance(reason, (TimeoutError, socket.timeout)) else 502
+    if isinstance(exc, (UpstreamRequestError, HTTPError, http.client.HTTPException)):
+        return 502
+    return 500
+
+
+class ActivityLimiter:
+    """Non-blocking concurrency gate with content-free process telemetry."""
+
+    def __init__(self, max_active: int) -> None:
+        self.max_active = max(1, int(max_active))
+        self._lock = threading.Lock()
+        self._active = 0
+        self._peak = 0
+        self._started_total = 0
+        self._rejected_total = 0
+
+    def try_acquire(self) -> bool:
+        with self._lock:
+            if self._active >= self.max_active:
+                self._rejected_total += 1
+                return False
+            self._active += 1
+            self._started_total += 1
+            self._peak = max(self._peak, self._active)
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            if self._active > 0:
+                self._active -= 1
+
+    def status(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "active": self._active,
+                "max_active": self.max_active,
+                "peak": self._peak,
+                "started_total": self._started_total,
+                "rejected_total": self._rejected_total,
+            }
+
+
+_CHAT_FILE_UPLOAD_LIMITER = ActivityLimiter(MAX_ACTIVE_CHAT_FILE_UPLOADS)
+_HAR_UPLOAD_LIMITER = ActivityLimiter(MAX_ACTIVE_HAR_UPLOADS)
+
+
+def upload_slot_status() -> dict[str, Any]:
+    """Return bounded upload activity without filenames, labels, or account data."""
+    file_status = _CHAT_FILE_UPLOAD_LIMITER.status()
+    har_status = _HAR_UPLOAD_LIMITER.status()
+    return {
+        "active": file_status["active"] + har_status["active"],
+        "max_active": file_status["max_active"] + har_status["max_active"],
+        "rejected_total": file_status["rejected_total"] + har_status["rejected_total"],
+        "file": file_status,
+        "har": har_status,
+    }
+
+
+_UPSTREAM_RESPONSE_STATS_LOCK = threading.Lock()
+_UPSTREAM_RESPONSE_REJECTED_TOTAL = 0
+_UPSTREAM_ERROR_TRUNCATED_TOTAL = 0
+_UPSTREAM_STREAM_REJECTED_TOTAL = 0
+_UPSTREAM_STREAM_WIRE_REJECTED_TOTAL = 0
+_UPSTREAM_STREAM_OUTPUT_REJECTED_TOTAL = 0
+_UPSTREAM_STREAM_EVENT_REJECTED_TOTAL = 0
+_UPSTREAM_STREAM_INCOMPLETE_TOTAL = 0
+
+
+class UpstreamStreamBudget:
+    """Bound cumulative SSE wire, semantic output and event count for one attempt."""
+
+    def __init__(self) -> None:
+        self.wire_bytes = 0
+        self.output_bytes = 0
+        self.events = 0
+
+    def reset(self) -> None:
+        self.wire_bytes = 0
+        self.output_bytes = 0
+        self.events = 0
+
+    @staticmethod
+    def _reject(kind: str, observed: int, limit: int) -> NoReturn:
+        global _UPSTREAM_STREAM_REJECTED_TOTAL
+        global _UPSTREAM_STREAM_WIRE_REJECTED_TOTAL
+        global _UPSTREAM_STREAM_OUTPUT_REJECTED_TOTAL
+        global _UPSTREAM_STREAM_EVENT_REJECTED_TOTAL
+        with _UPSTREAM_RESPONSE_STATS_LOCK:
+            _UPSTREAM_STREAM_REJECTED_TOTAL += 1
+            if kind == "wire":
+                _UPSTREAM_STREAM_WIRE_REJECTED_TOTAL += 1
+            elif kind == "output":
+                _UPSTREAM_STREAM_OUTPUT_REJECTED_TOTAL += 1
+            else:
+                _UPSTREAM_STREAM_EVENT_REJECTED_TOTAL += 1
+        log_event(
+            "upstream_stream_limit_exceeded",
+            level=logging.WARNING,
+            limit_kind=kind,
+            observed=max(0, int(observed)),
+            limit=max(1, int(limit)),
+        )
+        labels = {"wire": "原始事件", "output": "正文与思考", "events": "事件数量"}
+        raise UpstreamResponseTooLarge(f"上游流式{labels.get(kind, kind)}超过 {limit} 限制")
+
+    def observe_event(self, event: str) -> None:
+        next_events = self.events + 1
+        if next_events > MAX_UPSTREAM_STREAM_EVENTS:
+            self._reject("events", next_events, MAX_UPSTREAM_STREAM_EVENTS)
+        event_bytes = len(str(event or "").encode("utf-8"))
+        next_wire = self.wire_bytes + event_bytes
+        if next_wire > MAX_UPSTREAM_STREAM_WIRE_BYTES:
+            self._reject("wire", next_wire, MAX_UPSTREAM_STREAM_WIRE_BYTES)
+        self.events = next_events
+        self.wire_bytes = next_wire
+
+    def observe_delta(self, delta: str) -> None:
+        delta_bytes = len(str(delta or "").encode("utf-8"))
+        next_output = self.output_bytes + delta_bytes
+        if next_output > MAX_UPSTREAM_STREAM_OUTPUT_BYTES:
+            self._reject("output", next_output, MAX_UPSTREAM_STREAM_OUTPUT_BYTES)
+        self.output_bytes = next_output
+
+
+def append_text_prefix(parts: list[str], delta: str, retained_chars: int, max_chars: int) -> int:
+    """Append only the prefix that a persisted/history consumer can actually retain."""
+    limit = max(0, int(max_chars))
+    remaining = max(0, limit - max(0, int(retained_chars)))
+    if remaining:
+        piece = str(delta or "")[:remaining]
+        if piece:
+            parts.append(piece)
+            retained_chars += len(piece)
+    return min(limit, max(0, int(retained_chars)))
+
+
+def upstream_response_status() -> dict[str, int]:
+    """Return content-free counters for bounded upstream response reads."""
+    with _UPSTREAM_RESPONSE_STATS_LOCK:
+        return {
+            "rejected_total": max(0, int(_UPSTREAM_RESPONSE_REJECTED_TOTAL)),
+            "error_truncated_total": max(0, int(_UPSTREAM_ERROR_TRUNCATED_TOTAL)),
+            "stream_rejected_total": max(0, int(_UPSTREAM_STREAM_REJECTED_TOTAL)),
+            "stream_wire_rejected_total": max(0, int(_UPSTREAM_STREAM_WIRE_REJECTED_TOTAL)),
+            "stream_output_rejected_total": max(0, int(_UPSTREAM_STREAM_OUTPUT_REJECTED_TOTAL)),
+            "stream_event_rejected_total": max(0, int(_UPSTREAM_STREAM_EVENT_REJECTED_TOTAL)),
+            "stream_incomplete_total": max(0, int(_UPSTREAM_STREAM_INCOMPLETE_TOTAL)),
+            "stream_wire_max_bytes": MAX_UPSTREAM_STREAM_WIRE_BYTES,
+            "stream_output_max_bytes": MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+            "stream_max_events": MAX_UPSTREAM_STREAM_EVENTS,
+            "json_max_bytes": MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+            "error_max_bytes": MAX_UPSTREAM_ERROR_RESPONSE_BYTES,
+            "upload_max_bytes": MAX_UPSTREAM_UPLOAD_RESPONSE_BYTES,
+        }
+
+
 # Buffered tool/reasoning streams can be quiet from the client's perspective
 # even while upstream is still producing hidden semantic deltas.  SSE comments
 # are protocol-safe and keep SDK/proxy idle timers from tearing down the turn.
 SSE_KEEPALIVE_INTERVAL_SECONDS = 10.0
+UPSTREAM_IDLE_HEARTBEAT_EVENT = ": glm2api-upstream-idle"
+UPSTREAM_READER_QUEUE_SIZE = 8
+_UPSTREAM_READER_STATS_LOCK = threading.Lock()
+_UPSTREAM_READERS_ACTIVE = 0
+_UPSTREAM_READERS_PEAK = 0
+_UPSTREAM_READERS_STARTED = 0
+_UPSTREAM_HEARTBEATS_TOTAL = 0
+_UPSTREAM_READER_ERRORS_TOTAL = 0
+_UPSTREAM_READER_FORCED_CLOSES_TOTAL = 0
+_SSE_HEARTBEAT_STATS_LOCK = threading.Lock()
+_SSE_HEARTBEAT_PUMPS_ACTIVE = 0
+_SSE_HEARTBEAT_PUMPS_PEAK = 0
+_SSE_HEARTBEAT_PUMPS_STARTED = 0
+_SSE_HEARTBEATS_SENT_TOTAL = 0
+_SSE_HEARTBEAT_ERRORS_TOTAL = 0
 UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_CONTEXT_FILE_BYTES = 4 * 1024 * 1024
+# Empirical 2026-08-30 boundary probe: GLM-5.3 reads a 48 KiB text
+# attachment through its final marker, while 50/52/256 KiB files stop at
+# OFFSET_KIB=49. GLM-5.2 reads the full 256 KiB control. Keep generated 5.3
+# context segments below that hard edge, including the multipart header.
+GLM53_CONTEXT_FILE_PART_BYTES = 40 * 1024
+CONTEXT_FILE_PART_HEADER_RESERVE_BYTES = 512
 # Per-account concurrency cap for in-flight upstream generations (Z.ai 429s beyond this).
 MAX_CONCURRENT_GENERATIONS_PER_PROFILE = 3
+# Optional request header used by the web console to keep a continued chat on
+# the profile that owns its upstream conversation.  New chats omit the header
+# and are automatically routed through the profile pool.
+PROFILE_ROUTING_HEADER = "X-GLM2API-Profile-ID"
 RESPONSE_STORE_TTL_SECONDS = 60 * 60
 MAX_RESPONSE_STORE_ITEMS = 128
+MAX_RESPONSE_STORE_BYTES = 32 * 1024 * 1024
+MAX_STORED_RESPONSE_BYTES = 8 * 1024 * 1024
 PROFILE_STORE_LOCK = threading.RLock()
 SETTINGS_STORE_LOCK = threading.RLock()
 API_KEY_STORE_LOCK = threading.RLock()
 API_KEY_ENV_NAME = "GLM2API_API_KEY"
 API_KEY_STORE_PATH = Path(__file__).with_name("apikey.local.json")
+MAX_LOCAL_API_KEY_CHARS = 4096
+MAX_API_KEY_STORE_BYTES = 64 * 1024
 
 # Recovered from the production front-end bundle in chat.z.ai.har.
 SIGNING_SEED = "key-@@@@)))()((9))-xxxx&&&%%%%%"
@@ -425,6 +926,31 @@ SIGNING_SEED = "key-@@@@)))()((9))-xxxx&&&%%%%%"
 
 def sha16(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+
+
+def normalize_local_api_key(value: Any, *, label: str = "API Key") -> str:
+    """Normalize one local API key consistently across every configuration path."""
+    normalized = str(value or "").strip()
+    if len(normalized) > MAX_LOCAL_API_KEY_CHARS:
+        raise ValueError(f"{label} 超过 {MAX_LOCAL_API_KEY_CHARS} 字符限制")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in normalized):
+        raise ValueError(f"{label} 不能包含控制字符")
+    return normalized
+
+
+def local_api_keys_match(provided: Any, configured: Any) -> bool:
+    """Compare bounded keys through fixed-size digests instead of raw variable-length strings."""
+    try:
+        candidate = normalize_local_api_key(provided)
+        expected = normalize_local_api_key(configured)
+    except ValueError:
+        return False
+    if not candidate or not expected:
+        return False
+    return hmac.compare_digest(
+        hashlib.sha256(candidate.encode("utf-8")).digest(),
+        hashlib.sha256(expected.encode("utf-8")).digest(),
+    )
 
 
 def load_har(path: Path) -> dict[str, Any]:
@@ -489,6 +1015,27 @@ def atomic_write_text(path: Path, text: str, *, durable: bool = True) -> None:
             Path(tmp_name).unlink(missing_ok=True)
 
 
+def read_file_bytes_limited(path: Path, max_bytes: int, *, label: str) -> bytes:
+    """Read a local state file without trusting its size metadata or racing replacement."""
+    limit = max(1, int(max_bytes))
+    with path.open("rb") as source:
+        raw = source.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"{label} exceeds {limit} bytes")
+    return raw
+
+
+def read_json_file_limited(path: Path, max_bytes: int, *, label: str) -> Any:
+    raw = read_file_bytes_limited(path, max_bytes, label=label)
+    return json.loads(raw.decode("utf-8"))
+
+
+def ensure_utf8_size(text: str, max_bytes: int, *, label: str) -> str:
+    if len(text.encode("utf-8")) > max(1, int(max_bytes)):
+        raise ValueError(f"{label} exceeds {max(1, int(max_bytes))} bytes")
+    return text
+
+
 def decode_har_text(content: dict[str, Any]) -> str:
     text = content.get("text", "") or ""
     if content.get("encoding") == "base64":
@@ -504,6 +1051,27 @@ def json_or_none(text: str) -> Any:
         return json.loads(text)
     except Exception:
         return None
+
+
+def parse_request_query(path: Any) -> dict[str, str]:
+    """Parse a bounded HTTP query without echoing rejected values into errors or logs."""
+    query = urlsplit(str(path or "")).query
+    try:
+        pairs = parse_qsl(
+            query,
+            keep_blank_values=True,
+            max_num_fields=MAX_QUERY_FIELDS,
+        )
+    except ValueError as exc:
+        raise QueryValidationError(f"query exceeds {MAX_QUERY_FIELDS} fields") from exc
+    params: dict[str, str] = {}
+    for key, value in pairs:
+        if len(key) > MAX_QUERY_KEY_CHARS:
+            raise QueryValidationError(f"query key exceeds {MAX_QUERY_KEY_CHARS} characters")
+        if len(value) > MAX_QUERY_VALUE_CHARS:
+            raise QueryValidationError(f"query value exceeds {MAX_QUERY_VALUE_CHARS} characters")
+        params[key] = value
+    return params
 
 
 def entry_url_path(entry: dict[str, Any]) -> str:
@@ -614,17 +1182,31 @@ def describe_captcha_verify_param(value: str) -> dict[str, Any]:
 
 
 _CAPTCHA_PLAYWRIGHT: Callable[..., Any] | None = None
+_PLAYWRIGHT_PACKAGE_AVAILABLE: bool | None = None
+
+
+def playwright_package_available() -> bool:
+    """Return whether optional browser automation support is importable."""
+    global _PLAYWRIGHT_PACKAGE_AVAILABLE
+    if _PLAYWRIGHT_PACKAGE_AVAILABLE is None:
+        try:
+            _PLAYWRIGHT_PACKAGE_AVAILABLE = importlib.util.find_spec("playwright.sync_api") is not None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            _PLAYWRIGHT_PACKAGE_AVAILABLE = False
+    return _PLAYWRIGHT_PACKAGE_AVAILABLE
 
 
 def _captcha_playwright() -> Callable[..., Any]:
     """Lazily import the Playwright sync API (heavy import; browser paths only)."""
-    global _CAPTCHA_PLAYWRIGHT
+    global _CAPTCHA_PLAYWRIGHT, _PLAYWRIGHT_PACKAGE_AVAILABLE
     if _CAPTCHA_PLAYWRIGHT is None:
         try:
             from playwright.sync_api import sync_playwright
         except Exception as exc:  # pragma: no cover - depends on local toolchain
+            _PLAYWRIGHT_PACKAGE_AVAILABLE = False
             raise RuntimeError("Playwright Python package is unavailable; install/playwright-enable it first") from exc
         _CAPTCHA_PLAYWRIGHT = sync_playwright
+        _PLAYWRIGHT_PACKAGE_AVAILABLE = True
     return _CAPTCHA_PLAYWRIGHT
 
 
@@ -803,6 +1385,17 @@ def get_browser_captcha(
         pw.stop()
 
 
+@dataclass
+class _CaptchaWorkItem:
+    request_id: str
+    state: "HarState"
+    selected_model: str
+    timeout_ms: int
+    deadline: float
+    result: queue.Queue[object] = field(default_factory=lambda: queue.Queue(maxsize=1))
+    cancelled: threading.Event = field(default_factory=threading.Event)
+
+
 class CaptchaWorker:
     """Reuse one headless browser/page for AliyunCaptcha across completions.
 
@@ -819,64 +1412,165 @@ class CaptchaWorker:
         headless: bool = True,
         default_timeout_ms: int = 75_000,
         idle_timeout_sec: float = 900.0,
+        max_pending: int = CAPTCHA_WORKER_MAX_PENDING,
     ) -> None:
         self.chrome_path = chrome_path
         self.headless = headless
         self.default_timeout_ms = default_timeout_ms
         self.idle_timeout_sec = idle_timeout_sec
-        self._requests: queue.Queue[tuple[str, "HarState", str]] = queue.Queue()
-        self._results: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.max_pending = max(1, int(max_pending))
+        self._requests: queue.Queue[_CaptchaWorkItem | None] = queue.Queue(maxsize=self.max_pending)
         self._thread: threading.Thread | None = None
         self._start_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._current_item: _CaptchaWorkItem | None = None
+        self._backpressure_total = 0
         self._closed = False
-        self._last_used = time.time()
+        self._last_used = time.monotonic()
 
     def start(self) -> None:
         with self._start_lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            while True:  # 丢弃上次会话残留的过期请求
-                try:
-                    self._requests.get_nowait()
-                except queue.Empty:
-                    break
-            self._closed = False
-            self._last_used = time.time()
-            self._thread = threading.Thread(
-                target=self._run,
-                name="glm2api-captcha-worker",
-                daemon=True,
-            )
-            self._thread.start()
+            if self._closed:
+                raise RuntimeError("captcha worker is closed")
+            self._start_locked()
 
-    def solve(self, state: "HarState", selected_model: str, timeout_ms: int | None = None) -> str:
-        self.start()
-        request_id = uuid.uuid4().hex
+    def _start_locked(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._last_used = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="glm2api-captcha-worker",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def solve(
+        self,
+        state: "HarState",
+        selected_model: str,
+        timeout_ms: int | None = None,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> str:
+        if cancel_check is not None:
+            cancel_check()
         timeout_ms = max(10_000, int(timeout_ms or self.default_timeout_ms))
-        self._requests.put((request_id, state, selected_model))
-        self._last_used = time.time()
-        deadline = time.time() + timeout_ms / 1000
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                raise TimeoutError(f"captcha worker timed out after {timeout_ms / 1000:.1f}s")
+        item = _CaptchaWorkItem(
+            request_id=uuid.uuid4().hex,
+            state=state,
+            selected_model=selected_model,
+            timeout_ms=timeout_ms,
+            deadline=time.monotonic() + timeout_ms / 1000,
+        )
+        with self._start_lock:
+            if self._closed:
+                raise RuntimeError("captcha worker is closed")
             try:
-                result_id, value = self._results.get(timeout=min(0.5, max(0.05, remaining)))
-            except queue.Empty:
-                continue
-            if result_id != request_id:
-                continue
-            if isinstance(value, Exception):
-                raise value
-            return str(value)
+                self._requests.put_nowait(item)
+            except queue.Full as exc:
+                with self._status_lock:
+                    self._backpressure_total += 1
+                raise RuntimeError(f"captcha worker backlog is full ({self.max_pending})") from exc
+            self._last_used = time.monotonic()
+            self._start_locked()
+        try:
+            while True:
+                if cancel_check is not None:
+                    cancel_check()
+                remaining = item.deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"captcha worker timed out after {timeout_ms / 1000:.1f}s")
+                try:
+                    value = item.result.get(timeout=min(0.5, max(0.05, remaining)))
+                except queue.Empty:
+                    continue
+                if isinstance(value, BaseException):
+                    raise value
+                return str(value)
+        finally:
+            # The worker checks this marker before expensive browser work and
+            # before publishing a result, so timed-out/disconnected callers do
+            # not leave stale work or retained result objects behind.
+            item.cancelled.set()
 
     def close(self) -> None:
+        cancelled: list[_CaptchaWorkItem] = []
         with self._start_lock:
             self._closed = True
-            self._requests.put(("__close__", None, ""))  # type: ignore[arg-type]
             thread = self._thread
+            while True:
+                try:
+                    queued = self._requests.get_nowait()
+                except queue.Empty:
+                    break
+                if queued is not None:
+                    cancelled.append(queued)
+            if thread is not None and thread.is_alive():
+                self._requests.put_nowait(None)
+        with self._status_lock:
+            current = self._current_item
+        if current is not None:
+            cancelled.append(current)
+        for item in cancelled:
+            self._cancel_item(item, ServiceShuttingDown("captcha worker closed"))
         if thread is not None and thread.is_alive():
             thread.join(timeout=8)
+
+    def status(self) -> dict[str, int | bool]:
+        with self._start_lock:
+            thread_alive = self._thread is not None and self._thread.is_alive()
+            closed = self._closed
+            pending = self._requests.qsize()
+        with self._status_lock:
+            active = self._current_item is not None
+            backpressure_total = self._backpressure_total
+        return {
+            "enabled": True,
+            "thread_alive": thread_alive,
+            "active": active,
+            "pending": max(0, pending - (1 if closed and thread_alive else 0)),
+            "max_pending": self.max_pending,
+            "backpressure_total": max(0, backpressure_total),
+            "closed": closed,
+        }
+
+    @staticmethod
+    def _publish(item: _CaptchaWorkItem, value: object) -> bool:
+        if item.cancelled.is_set():
+            return False
+        try:
+            item.result.put_nowait(value)
+        except queue.Full:
+            return False
+        return True
+
+    @staticmethod
+    def _cancel_item(item: _CaptchaWorkItem, exc: BaseException) -> None:
+        if not item.cancelled.is_set():
+            try:
+                item.result.put_nowait(exc)
+            except queue.Full:
+                pass
+        item.cancelled.set()
+
+    def _remaining_timeout_ms(self, item: _CaptchaWorkItem) -> int:
+        remaining_ms = int((item.deadline - time.monotonic()) * 1000)
+        return max(0, min(int(self.default_timeout_ms), remaining_ms))
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        pending: list[_CaptchaWorkItem] = []
+        with self._start_lock:
+            if self._thread is threading.current_thread():
+                self._thread = None
+            while True:
+                try:
+                    item = self._requests.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not None:
+                    pending.append(item)
+        for item in pending:
+            self._publish(item, exc)
 
     def _run(self) -> None:
         browser = None
@@ -884,45 +1578,102 @@ class CaptchaWorker:
         current_token = ""
         current_device = ""
         pw = None
+        fatal_error: BaseException | None = None
         try:
             pw = _captcha_playwright()().start()
             while not self._closed:
                 try:
-                    request_id, state, selected_model = self._requests.get(timeout=1.0)
+                    item = self._requests.get(timeout=1.0)
                 except queue.Empty:
-                    if self.idle_timeout_sec and time.time() - self._last_used > self.idle_timeout_sec:
-                        break
+                    if self.idle_timeout_sec and time.monotonic() - self._last_used > self.idle_timeout_sec:
+                        # Serialize the empty check with solve() enqueue/start.
+                        # Otherwise an enqueue can race with this idle exit and
+                        # leave a task waiting on a thread that just disappeared.
+                        with self._start_lock:
+                            if not self._requests.empty():
+                                continue
+                            if self._thread is threading.current_thread():
+                                self._thread = None
+                        return
                     continue
-                if request_id == "__close__":
+                if item is None:
                     break
-                if state is None:
+                if item.cancelled.is_set():
                     continue
-                self._last_used = time.time()
+                solve_timeout_ms = self._remaining_timeout_ms(item)
+                if solve_timeout_ms <= 0:
+                    self._publish(
+                        item,
+                        TimeoutError(f"captcha worker timed out after {item.timeout_ms / 1000:.1f}s"),
+                    )
+                    continue
+                self._last_used = time.monotonic()
+                with self._status_lock:
+                    self._current_item = item
                 try:
-                    browser, page = self._ensure_page(pw, browser, page, state, current_token, current_device, selected_model)
-                    current_token = state.token
-                    current_device = state.device_id
-                    value = solve_captcha_on_page(page, self.default_timeout_ms)
-                    self._results.put((request_id, value))
-                except Exception as exc:
+                    browser, page = self._ensure_page(
+                        pw,
+                        browser,
+                        page,
+                        item.state,
+                        current_token,
+                        current_device,
+                        item.selected_model,
+                        solve_timeout_ms,
+                    )
+                    current_token = item.state.token
+                    current_device = item.state.device_id
+                    value = solve_captcha_on_page(page, solve_timeout_ms)
+                    self._publish(item, value)
+                except Exception:
                     self._teardown_browser(browser)
                     browser = None
                     page = None
                     current_token = ""
                     current_device = ""
+                    if item.cancelled.is_set():
+                        continue
+                    retry_timeout_ms = self._remaining_timeout_ms(item)
+                    if retry_timeout_ms <= 0:
+                        self._publish(
+                            item,
+                            TimeoutError(f"captcha worker timed out after {item.timeout_ms / 1000:.1f}s"),
+                        )
+                        continue
                     try:
-                        browser, page = self._ensure_page(pw, browser, page, state, current_token, current_device, selected_model)
-                        current_token = state.token
-                        current_device = state.device_id
-                        value = solve_captcha_on_page(page, self.default_timeout_ms)
-                        self._results.put((request_id, value))
+                        browser, page = self._ensure_page(
+                            pw,
+                            browser,
+                            page,
+                            item.state,
+                            current_token,
+                            current_device,
+                            item.selected_model,
+                            retry_timeout_ms,
+                        )
+                        current_token = item.state.token
+                        current_device = item.state.device_id
+                        value = solve_captcha_on_page(page, retry_timeout_ms)
+                        self._publish(item, value)
                     except Exception as retry_exc:
                         self._teardown_browser(browser)
                         browser = None
                         page = None
                         current_token = ""
                         current_device = ""
-                        self._results.put((request_id, retry_exc))
+                        self._publish(item, retry_exc)
+                except BaseException as exc:
+                    # Do not strand the active waiter if the owner thread dies
+                    # outside the normal Exception hierarchy.
+                    self._publish(item, exc)
+                    raise
+                finally:
+                    with self._status_lock:
+                        if self._current_item is item:
+                            self._current_item = None
+        except BaseException as exc:
+            fatal_error = exc
+            LOG.error("captcha worker terminated unexpectedly: %s", exc, exc_info=True)
         finally:
             self._teardown_browser(browser)
             if pw is not None:
@@ -930,6 +1681,12 @@ class CaptchaWorker:
                     pw.stop()
                 except Exception:
                     pass
+            if fatal_error is not None:
+                self._fail_pending(fatal_error)
+            else:
+                with self._start_lock:
+                    if self._thread is threading.current_thread():
+                        self._thread = None
 
     def _ensure_page(
         self,
@@ -940,6 +1697,7 @@ class CaptchaWorker:
         current_token: str,
         current_device: str,
         selected_model: str,
+        timeout_ms: int,
     ) -> tuple[Any, Any]:
         if page is not None and state.token == current_token and state.device_id == current_device:
             return browser, page
@@ -950,7 +1708,7 @@ class CaptchaWorker:
             state,
             headless=self.headless,
             chrome_path=self.chrome_path,
-            timeout_ms=self.default_timeout_ms,
+            timeout_ms=timeout_ms,
             selected_model=selected_model,
         )
         return new_browser, new_page
@@ -971,11 +1729,27 @@ _CAPTCHA_DEGRADED_LOCK = threading.RLock()
 CAPTCHA_DEGRADED_COOLDOWN_SECONDS = 1800
 CAPTCHA_RETRY_BACKOFF_SECONDS = 20
 
+
+def captcha_worker_status() -> dict[str, int | bool]:
+    worker = _CAPTCHA_WORKER
+    if worker is not None:
+        return worker.status()
+    return {
+        "enabled": False,
+        "thread_alive": False,
+        "active": False,
+        "pending": 0,
+        "max_pending": CAPTCHA_WORKER_MAX_PENDING,
+        "backpressure_total": 0,
+        "closed": False,
+    }
+
 # happy-dom (Node) AliyunCaptcha solver: an in-process DOM mock that solves the
 # TRACELESS challenge in ~5-10s without a real browser. Headless Chromium gets
 # challenged/looped by upstream far more often, so auto mode prefers this path
 # and keeps the Playwright worker as fallback.
 HAPPYDOM_CAPTCHA_SCRIPT = Path(__file__).with_name("captcha_happy.mjs")
+HAPPYDOM_PACKAGE_MANIFEST = Path(__file__).with_name("node_modules") / "happy-dom" / "package.json"
 _HAPPYDOM_AVAILABLE: bool | None = None
 _CAPTCHA_MODE = "auto"
 
@@ -983,31 +1757,82 @@ _CAPTCHA_MODE = "auto"
 def happydom_captcha_available() -> bool:
     global _HAPPYDOM_AVAILABLE
     if _HAPPYDOM_AVAILABLE is None:
-        _HAPPYDOM_AVAILABLE = HAPPYDOM_CAPTCHA_SCRIPT.exists() and shutil.which("node") is not None
+        _HAPPYDOM_AVAILABLE = bool(
+            HAPPYDOM_CAPTCHA_SCRIPT.exists()
+            and HAPPYDOM_PACKAGE_MANIFEST.exists()
+            and shutil.which("node") is not None
+        )
     return _HAPPYDOM_AVAILABLE
 
 
-def get_happydom_captcha(timeout_ms: int = 75_000) -> str:
+def browser_captcha_refresh_enabled(fresh_captcha_enabled: bool) -> bool:
+    """Expose the legacy manual browser route only for browser-capable modes."""
+    return bool(fresh_captcha_enabled and _CAPTCHA_MODE in {"auto", "browser"})
+
+
+def _terminate_subprocess(proc: subprocess.Popen[str]) -> None:
+    """Terminate one owned helper process without leaving a child behind."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.communicate(timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        try:
+            proc.kill()
+            proc.communicate(timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def get_happydom_captcha(
+    timeout_ms: int = 75_000,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> str:
     """Solve the AliyunCaptcha challenge via the local happy-dom Node script.
 
     Returns "" when Node/the script is missing or the solve fails; callers fall
     back to the Playwright browser worker.
     """
     node = shutil.which("node")
-    if not node or not HAPPYDOM_CAPTCHA_SCRIPT.exists():
+    if not node or not happydom_captcha_available():
         return ""
+    proc: subprocess.Popen[str] | None = None
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [node, str(HAPPYDOM_CAPTCHA_SCRIPT), "--timeout-ms", str(max(timeout_ms, 30_000))],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=max(timeout_ms / 1000 + 15, 30),
         )
+        deadline = time.monotonic() + max(timeout_ms / 1000 + 15, 30)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_subprocess(proc)
+                return ""
+            try:
+                stdout, _stderr = proc.communicate(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                if cancel_check is not None:
+                    try:
+                        cancel_check()
+                    except BaseException:
+                        _terminate_subprocess(proc)
+                        raise
+    except (BrokenPipeError, ConnectionResetError):
+        if proc is not None:
+            _terminate_subprocess(proc)
+        raise
     except (OSError, subprocess.SubprocessError):
+        if proc is not None:
+            _terminate_subprocess(proc)
         return ""
-    lines = (proc.stdout or "").strip().splitlines()
+    lines = (stdout or "").strip().splitlines()
     payload = json_or_none(lines[-1]) if lines else None
     if isinstance(payload, dict) and payload.get("ok") and payload.get("captcha"):
         return str(payload["captcha"])
@@ -1015,7 +1840,7 @@ def get_happydom_captcha(timeout_ms: int = 75_000) -> str:
 
 
 def _set_captcha_degraded(seconds: float) -> None:
-    """After a fresh-captcha failure, skip the slow browser retry for a while.
+    """After a fresh-captcha failure, skip the slow solver retry for a while.
 
     ``seconds <= 0`` clears the cooldown (used by tests and after a manual
     re-authorization so the next request can try the browser flow again).
@@ -1036,20 +1861,24 @@ def resolve_fresh_captcha(
     chrome_path: str | None = None,
     headless: bool = True,
     force_fresh: bool = False,
+    cancel_check: Callable[[], None] | None = None,
 ) -> str:
     """Return a captcha_verify_param for fresh-captcha mode with fallback.
 
-    The headless AliyunCaptcha flow can fail (page without a solvable
-    challenge, browser issue, network) and each attempt blocks the request for
-    up to ``timeout_ms``. On failure we record a cooldown and fall back to the
-    captcha stored in the account profile (e.g. obtained through the manual
-    browser login in the web panel). That keeps requests working right after a
-    re-authorization instead of timing out on every turn.
+    The selected solver can fail (challenge/network/runtime issue), and each
+    attempt blocks the request for up to ``timeout_ms``. On failure we record a
+    cooldown and fall back to the captcha stored in the account profile. That
+    keeps requests working right after re-authorization instead of timing out
+    on every turn.
 
     ``force_fresh``：上游刚以 F018/F019 拒绝过验证码时使用。池中的预热码与
     降级路径的 profile 存码大概率同样超龄，必须绕开一切缓存捷径现场重解。
     """
-    if not force_fresh:
+    if cancel_check is not None:
+        cancel_check()
+    # 预热池仅由 happy-dom 产生；显式 browser 模式必须严格使用浏览器求解，
+    # 不能意外消费上一次 auto/happydom 模式遗留的池码。
+    if not force_fresh and _CAPTCHA_MODE in {"auto", "happydom"}:
         pooled = _captcha_pool_take()
         if pooled:
             log_event("fresh_captcha_pool_hit")
@@ -1067,8 +1896,8 @@ def resolve_fresh_captcha(
     if degraded and not stored:
         # Without a stored captcha the request would fail upstream with
         # FRONTEND_CAPTCHA_REQUIRED anyway, so the cooldown must not suppress
-        # the browser attempt; challenge issuance is intermittent and a spaced
-        # retry typically succeeds.
+        # the selected solver attempt; challenge issuance is intermittent and
+        # a spaced retry typically succeeds.
         log_event("fresh_captcha_cooldown_retry")
         _set_captcha_degraded(0)
     last_exc: Exception | None = None
@@ -1078,15 +1907,15 @@ def resolve_fresh_captcha(
     for attempt in range(2):
         if attempt:
             log_event("fresh_captcha_retry", after_sec=CAPTCHA_RETRY_BACKOFF_SECONDS)
-            time.sleep(CAPTCHA_RETRY_BACKOFF_SECONDS)
+            interruptible_wait(CAPTCHA_RETRY_BACKOFF_SECONDS, cancel_check)
         captcha = ""
         if want_happydom:
-            captcha = get_happydom_captcha(timeout_ms)
+            captcha = get_happydom_captcha(timeout_ms, cancel_check=cancel_check)
             backend = "happydom"
         if not captcha and want_browser:
             try:
                 captcha = (
-                    worker.solve(state, selected_model, timeout_ms=timeout_ms)
+                    worker.solve(state, selected_model, timeout_ms=timeout_ms, cancel_check=cancel_check)
                     if worker is not None
                     else get_browser_captcha(
                         state,
@@ -1097,6 +1926,8 @@ def resolve_fresh_captcha(
                     )
                 )
                 backend = "browser"
+            except ServiceShuttingDown:
+                raise
             except Exception as exc:
                 last_exc = exc
         if captcha:
@@ -1116,20 +1947,79 @@ def resolve_fresh_captcha(
     log_event(
         "fresh_captcha_fallback",
         error_type=type(last_exc).__name__ if last_exc else "empty",
-        error=str(last_exc)[:300] if last_exc else "captcha worker returned empty result",
+        error=str(last_exc)[:300] if last_exc else f"{_CAPTCHA_MODE} captcha solver returned empty result",
         has_stored_captcha=bool(fallback),
     )
     if fallback:
         return fallback
     raise RuntimeError(
-        "验证码获取失败：请先在网页面板重新完成浏览器授权（登录并切换账号），保存后再重试。"
+        "验证码获取失败：请确认本地求解器可用，或在网页面板重新登录/切换账号后重试。"
     ) from last_exc
+
+
+def _navigate_browser_login_page(
+    page: Any,
+    *,
+    deadline: float,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
+    """Reach the login page in short slices so shutdown stays responsive."""
+    navigation_deadline = min(
+        float(deadline),
+        time.monotonic() + BROWSER_LOGIN_NAVIGATION_TOTAL_MS / 1000,
+    )
+    last_error = ""
+    while True:
+        if cancel_check is not None:
+            cancel_check()
+        remaining = navigation_deadline - time.monotonic()
+        if remaining <= 0:
+            detail = f": {last_error}" if last_error else ""
+            raise TimeoutError(f"授权页面加载超时{detail}")
+        try:
+            page.goto(
+                BASE_URL + "/auth",
+                wait_until="commit",
+                timeout=max(1, min(BROWSER_LOGIN_NAVIGATION_SLICE_MS, int(remaining * 1000))),
+            )
+            break
+        except Exception as exc:
+            last_error = str(exc)[:300]
+            if cancel_check is not None:
+                cancel_check()
+            try:
+                if page.is_closed():
+                    raise RuntimeError("授权浏览器窗口在页面加载期间被关闭") from exc
+            except RuntimeError:
+                raise
+            except Exception:
+                pass
+            interruptible_wait(
+                min(0.25, max(0.0, navigation_deadline - time.monotonic())),
+                cancel_check,
+            )
+
+    if cancel_check is not None:
+        cancel_check()
+    remaining = float(deadline) - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("浏览器登录等待时间已用尽")
+    try:
+        page.wait_for_load_state(
+            "domcontentloaded",
+            timeout=max(1, min(BROWSER_LOGIN_DOM_READY_TIMEOUT_MS, int(remaining * 1000))),
+        )
+    except Exception:
+        # A committed document is enough to show the login window. The polling
+        # loop below will keep probing as the remaining resources finish loading.
+        pass
 
 
 def get_browser_login_state(
     chrome_path: str | None = None,
     timeout_ms: int = 300_000,
     progress_cb: Callable[[str], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> HarState:
     """Open a real browser for manual login and collect post-login state.
 
@@ -1145,7 +2035,7 @@ def get_browser_login_state(
 
     executable_path = chrome_path or default_chrome_path()
     launch_args = ["--disable-blink-features=AutomationControlled", "--no-sandbox"]
-    deadline = time.time() + timeout_ms / 1000
+    deadline = time.monotonic() + timeout_ms / 1000
 
     def report(stage: str) -> None:
         log_event("browser_login_progress", stage=stage)
@@ -1156,14 +2046,20 @@ def get_browser_login_state(
                 pass
 
     with sync_playwright() as p:
-        launch_kwargs: dict[str, Any] = {"headless": False, "args": launch_args}
+        if cancel_check is not None:
+            cancel_check()
+        launch_kwargs: dict[str, Any] = {
+            "headless": False,
+            "args": launch_args,
+            "timeout": BROWSER_LOGIN_LAUNCH_TIMEOUT_MS,
+        }
         if executable_path:
             launch_kwargs["executable_path"] = executable_path
         browser = p.chromium.launch(**launch_kwargs)
         try:
             context = browser.new_context(locale="zh-CN", timezone_id="Asia/Shanghai")
             page = context.new_page()
-            page.goto(BASE_URL + "/auth", wait_until="domcontentloaded", timeout=60_000)
+            _navigate_browser_login_page(page, deadline=deadline, cancel_check=cancel_check)
             report("授权浏览器已打开，请在窗口中完成登录")
 
             captured_token: dict[str, str] = {"value": ""}
@@ -1283,7 +2179,9 @@ def get_browser_login_state(
                     sec_ch_ua_platform=str(telemetry.get("sec_ch_ua_platform") or '"Windows"'),
                 )
 
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
+                if cancel_check is not None:
+                    cancel_check()
                 # 网络层抓到的真实 token 优先：页面跳转/替换/关闭都不影响已捕获结果
                 if captured_token["value"]:
                     claims = _jwt_claims(captured_token["value"])
@@ -1305,8 +2203,8 @@ def get_browser_login_state(
                             report("登录窗口已切换页面，继续等待登录")
                         else:
                             if closed_since is None:
-                                closed_since = time.time()
-                            if time.time() - closed_since >= 5:
+                                closed_since = time.monotonic()
+                            if time.monotonic() - closed_since >= 5:
                                 raise RuntimeError("授权浏览器窗口已关闭，登录流程未完成，请重新点击“浏览器登录”。")
                             last_error = "window closed; waiting for replacement page"
                             try:
@@ -1320,7 +2218,7 @@ def get_browser_login_state(
                     pass
                 try:
                     capture = page.evaluate(
-                        """async () => {
+                        """async (authTimeoutMs) => {
                           const token = localStorage.getItem("token") || "";
                           let device = localStorage.getItem("_arms_uid") || "";
                           if (!device || !/^uid_[A-Za-z0-9]{7,}$/.test(device)) {
@@ -1352,10 +2250,13 @@ def get_browser_login_state(
                           let auth = null;
                           let auth_error = "";
                           if (token) {
+                            const authController = new AbortController();
+                            const authTimer = setTimeout(() => authController.abort(), authTimeoutMs);
                             try {
                               const resp = await fetch("/api/v1/auths/", {
                                 method: "GET",
                                 credentials: "include",
+                                signal: authController.signal,
                                 headers: {
                                   "Accept": "application/json",
                                   "Content-Type": "application/json",
@@ -1365,12 +2266,17 @@ def get_browser_login_state(
                               auth = await resp.json().catch(() => null);
                               if (!resp.ok) auth_error = `auths status ${resp.status}`;
                             } catch (e) {
-                              auth_error = String(e && e.message || e);
+                              auth_error = e && e.name === "AbortError"
+                                ? `auths timeout after ${authTimeoutMs}ms`
+                                : String(e && e.message || e);
+                            } finally {
+                              clearTimeout(authTimer);
                             }
                           }
                           const bodyText = (document.body ? document.body.innerText : "").slice(0, 200);
                           return {token, device, telemetry, auth, auth_error, href: location.href, bodyText};
-                        }"""
+                        }""",
+                        BROWSER_LOGIN_AUTH_FETCH_TIMEOUT_MS,
                     )
                     last_capture = capture or {}
                     token = str((capture or {}).get("token") or "")
@@ -1421,6 +2327,29 @@ class HarState:
     sec_ch_ua: str = ""
     sec_ch_ua_mobile: str = "?0"
     sec_ch_ua_platform: str = '"Windows"'
+
+
+def validate_har_state(state: HarState) -> HarState:
+    """Bound credential and telemetry fields before retaining a login state."""
+    limits = {
+        "token": MAX_SESSION_TOKEN_CHARS,
+        "captcha_verify_param": MAX_CAPTCHA_VERIFY_PARAM_CHARS,
+        "user_id": 512,
+        "user_name": 512,
+    }
+    for name in HarState.__dataclass_fields__:
+        value = str(getattr(state, name, "") or "")
+        if name in {"token", "user_id"}:
+            value = value.strip()
+        limit = int(limits.get(name, MAX_PROFILE_STATE_FIELD_CHARS))
+        if len(value) > limit:
+            raise ValueError(f"登录态字段 {name} 超过 {limit} 字符限制")
+        setattr(state, name, value)
+    if not state.token:
+        raise ValueError("登录态缺少 token")
+    if not state.user_id:
+        raise ValueError("登录态缺少 user_id")
+    return state
 
 
 @dataclass
@@ -1480,6 +2409,7 @@ class ProtocolRequest:
     context_as_file: bool
     store: bool = True
     previous_response_id: str = ""
+    tool_retry_active: bool = False
 
 
 @dataclass
@@ -1489,6 +2419,7 @@ class ProtocolTurn:
     tool_calls: list[ToolCall]
     input_tokens: int
     output_tokens: int
+    tool_calls_source: str = ""
     upstream_chat_id: str = ""
     upstream_chat_deleted: bool = False
     upstream_chat_delete_error: str = ""
@@ -1499,6 +2430,15 @@ class StoredResponse:
     payload: dict[str, Any]
     messages: list[dict[str, Any]]
     expires_at: float
+    size_bytes: int = 0
+
+
+def json_size_bytes(value: Any) -> int:
+    """Estimate retained JSON memory using its compact UTF-8 wire representation."""
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8"))
+    except Exception:
+        return len(str(value).encode("utf-8", errors="replace"))
 
 
 _MISSING = object()
@@ -1796,7 +2736,7 @@ def load_local_settings(path: Path = SETTINGS_STORE_PATH) -> tuple[dict[str, Any
         if not path.exists():
             return local_settings_defaults(), "", ""
         try:
-            raw = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            raw = read_json_file_limited(path, MAX_SETTINGS_STORE_BYTES, label="settings store")
             if not isinstance(raw, dict):
                 raise ValueError("settings store must be a JSON object")
             source = raw.get("settings") if isinstance(raw.get("settings"), dict) else raw
@@ -1814,7 +2754,8 @@ def save_local_settings(settings: dict[str, Any], path: Path = SETTINGS_STORE_PA
             "saved_at": saved_at,
             "settings": normalize_local_settings(settings),
         }
-        atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, ensure_utf8_size(text, MAX_SETTINGS_STORE_BYTES, label="settings store"))
         return saved_at
 
 
@@ -1823,14 +2764,15 @@ def load_api_key_store(path: Path = API_KEY_STORE_PATH) -> tuple[str, str, str]:
         if not path.exists():
             return "", "", ""
         try:
-            store = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+            store = read_json_file_limited(path, MAX_API_KEY_STORE_BYTES, label="api key store")
             if not isinstance(store, dict) or store.get("encryption") != "windows-dpapi-current-user":
                 raise ValueError("unsupported api key store encryption")
-            encrypted = base64.b64decode(str(store.get("payload") or ""))
+            encrypted = base64.b64decode(str(store.get("payload") or ""), validate=True)
             payload = json.loads(dpapi_unprotect(encrypted).decode("utf-8", errors="replace"))
             if not isinstance(payload, dict):
                 raise ValueError("api key store payload must be an object")
-            return str(payload.get("api_key") or ""), str(store.get("saved_at") or ""), ""
+            api_key = normalize_local_api_key(payload.get("api_key"), label="已保存 API Key")
+            return api_key, str(store.get("saved_at") or ""), ""
         except Exception as exc:
             return "", "", f"api key load failed: {exc}"
 
@@ -1838,7 +2780,7 @@ def load_api_key_store(path: Path = API_KEY_STORE_PATH) -> tuple[str, str, str]:
 def save_api_key_store(api_key: str, path: Path = API_KEY_STORE_PATH) -> str:
     with API_KEY_STORE_LOCK:
         saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
-        payload = {"api_key": str(api_key or "").strip()}
+        payload = {"api_key": normalize_local_api_key(api_key)}
         encrypted = dpapi_protect(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         store = {
             "schema": "glm2api.api_key_store.v1",
@@ -1868,7 +2810,10 @@ def profile_source_display(source: str) -> tuple[str, str]:
 
 def jwt_payload_claims(token: str) -> dict[str, Any]:
     """Decode the payload segment of a chat.z.ai session JWT (no signature check)."""
-    parts = str(token or "").strip().split(".")
+    token = str(token or "").strip()
+    if len(token) > MAX_SESSION_TOKEN_CHARS:
+        raise ValueError(f"token 超过 {MAX_SESSION_TOKEN_CHARS} 字符限制")
+    parts = token.split(".")
     if len(parts) != 3 or not all(parts):
         raise ValueError("token 必须是 chat.z.ai 的三段式 JWT（形如 eyJ....xxx....xxx）")
     padded = parts[1] + "=" * (-len(parts[1]) % 4)
@@ -1918,7 +2863,7 @@ def state_from_token(token: str) -> HarState:
     user_id = str(claims.get("id") or claims.get("sub") or claims.get("user_id") or "")
     if not user_id:
         raise ValueError("token payload 缺少用户 id，请确认复制的是 chat.z.ai 的会话 token")
-    return HarState(
+    return validate_har_state(HarState(
         token=token,
         user_id=user_id,
         user_name=str(claims.get("name") or claims.get("email") or "token-user"),
@@ -1941,40 +2886,41 @@ def state_from_token(token: str) -> HarState:
         sec_ch_ua=default_sec_ch_ua(DEFAULT_USER_AGENT),
         sec_ch_ua_mobile="?0",
         sec_ch_ua_platform='"Windows"',
-    )
+    ))
 
 
 def profile_summary(
     profile: AccountProfile,
     active: bool = False,
     same_user_count: int = 1,
+    inflight: int = 0,
+    concurrency_limit: int = MAX_CONCURRENT_GENERATIONS_PER_PROFILE,
+    routing_order: int = 0,
 ) -> dict[str, Any]:
     state = profile.state
     source_display, source_type = profile_source_display(profile.source)
+    inflight = max(0, int(inflight))
+    concurrency_limit = max(1, int(concurrency_limit))
     return {
         "id": profile.id,
         "label": profile.label,
-        "source": profile.source,
         "source_display": source_display,
         "source_type": source_type,
-        "har_fp": profile.har_fp,
-        "loaded_at": profile.loaded_at,
         "active": active,
-        "user_id": state.user_id,
         "user_id_fp": sha16(state.user_id) if state.user_id else "",
         "user_name": state.user_name,
         "token_fp": sha16(state.token),
-        "device_id_fp": sha16(state.device_id) if state.device_id else "",
-        "captcha_fp": sha16(state.captcha_verify_param) if state.captcha_verify_param else "",
-        "chat_id": state.chat_id,
         "same_user_count": same_user_count,
         "duplicate_user": same_user_count > 1,
-        "default_model": DEFAULT_MODEL,
-        "supported_models": list(ADVERTISED_MODELS),
+        "inflight": inflight,
+        "concurrency_limit": concurrency_limit,
+        "available_slots": max(0, concurrency_limit - inflight),
+        "routing_order": max(0, int(routing_order)),
     }
 
 
 def make_profile(state: HarState, label: str, source: str, har_text: str = "", har_fp: str = "") -> AccountProfile:
+    state = validate_har_state(state)
     if not har_fp and har_text:
         har_fp = hashlib.sha256(har_text.encode("utf-8", errors="replace")).hexdigest()[:16]
     return AccountProfile(
@@ -1992,7 +2938,7 @@ def har_state_from_dict(data: dict[str, Any]) -> HarState:
     values = {name: str(data.get(name) or "") for name in fields}
     values["fe_version"] = values.get("fe_version") or FE_VERSION
     values["region"] = values.get("region") or REGION
-    return HarState(**values)
+    return validate_har_state(HarState(**values))
 
 
 def profile_to_dict(profile: AccountProfile) -> dict[str, Any]:
@@ -2007,8 +2953,11 @@ def profile_to_dict(profile: AccountProfile) -> dict[str, Any]:
 
 
 def profile_from_dict(data: dict[str, Any]) -> AccountProfile:
+    profile_id = str(data.get("id") or "profile_" + uuid.uuid4().hex[:12])
+    if not re.fullmatch(r"profile_[0-9a-f]{12}", profile_id):
+        raise ValueError("saved profile id is invalid")
     return AccountProfile(
-        id=str(data.get("id") or "profile_" + uuid.uuid4().hex[:12]),
+        id=profile_id,
         label=safe_profile_label(str(data.get("label") or "saved profile")),
         source=safe_profile_label(str(data.get("source") or "profile store")),
         har_fp=str(data.get("har_fp") or ""),
@@ -2102,12 +3051,20 @@ def save_profile_store(
     path: Path = PROFILE_STORE_PATH,
 ) -> None:
     with PROFILE_STORE_LOCK:
+        if len(profiles) > MAX_ACCOUNT_PROFILES:
+            raise ProfileCapacityError(f"profile store exceeds {MAX_ACCOUNT_PROFILES} profiles")
+        for profile_id, profile in profiles.items():
+            if profile_id != profile.id or not re.fullmatch(r"profile_[0-9a-f]{12}", profile_id):
+                raise ValueError("profile store contains an invalid profile id")
+            validate_har_state(profile.state)
         payload = {
             "active_profile_id": active_profile_id,
             "profiles": [profile_to_dict(profile) for profile in profiles.values()],
             "saved_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
         raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        if len(raw) > MAX_PROFILE_STORE_PAYLOAD_BYTES:
+            raise ValueError(f"profile store payload exceeds {MAX_PROFILE_STORE_PAYLOAD_BYTES} bytes")
         encrypted = dpapi_protect(raw)
         store = {
             "schema": "glm2api.profile_store.v1",
@@ -2117,24 +3074,38 @@ def save_profile_store(
             "active_profile_id": active_profile_id,
             "saved_at": payload["saved_at"],
         }
-        atomic_write_text(path, json.dumps(store, ensure_ascii=False, indent=2) + "\n")
+        text = json.dumps(store, ensure_ascii=False, indent=2) + "\n"
+        atomic_write_text(path, ensure_utf8_size(text, MAX_PROFILE_STORE_BYTES, label="profile store"))
 
 
 def load_profile_store(path: Path = PROFILE_STORE_PATH) -> tuple[dict[str, AccountProfile], str, str]:
     with PROFILE_STORE_LOCK:
         if not path.exists():
             return {}, "", ""
-        store = json.loads(path.read_text(encoding="utf-8", errors="replace"))
-        if store.get("encryption") != "windows-dpapi-current-user":
+        store = read_json_file_limited(path, MAX_PROFILE_STORE_BYTES, label="profile store")
+        if not isinstance(store, dict) or store.get("encryption") != "windows-dpapi-current-user":
             raise RuntimeError("unsupported profile store encryption")
-        encrypted = base64.b64decode(str(store.get("payload") or ""))
-        payload = json.loads(dpapi_unprotect(encrypted).decode("utf-8", errors="replace"))
+        encrypted = base64.b64decode(str(store.get("payload") or ""), validate=True)
+        decrypted = dpapi_unprotect(encrypted)
+        if len(decrypted) > MAX_PROFILE_STORE_PAYLOAD_BYTES:
+            raise ValueError(f"profile store payload exceeds {MAX_PROFILE_STORE_PAYLOAD_BYTES} bytes")
+        payload = json.loads(decrypted.decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("profile store payload must be a JSON object")
+        items = payload.get("profiles") or []
+        if not isinstance(items, list):
+            raise ValueError("profile store profiles must be a list")
+        if len(items) > MAX_ACCOUNT_PROFILES:
+            raise ProfileCapacityError(f"profile store exceeds {MAX_ACCOUNT_PROFILES} profiles")
         profiles: dict[str, AccountProfile] = {}
-        for item in payload.get("profiles") or []:
-            if isinstance(item, dict):
-                profile = profile_from_dict(item)
-                refresh_state_browser_version(profile.state)
-                profiles[profile.id] = profile
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("profile store item must be a JSON object")
+            profile = profile_from_dict(item)
+            refresh_state_browser_version(profile.state)
+            if profile.id in profiles:
+                raise ValueError("profile store contains duplicate profile ids")
+            profiles[profile.id] = profile
         active = str(payload.get("active_profile_id") or "")
         if active not in profiles:
             active = next(iter(profiles.keys()), "")
@@ -2142,6 +3113,7 @@ def load_profile_store(path: Path = PROFILE_STORE_PATH) -> tuple[dict[str, Accou
 
 
 def merge_profile(profiles: dict[str, AccountProfile], profile: AccountProfile) -> str:
+    validate_har_state(profile.state)
     token_fp = sha16(profile.state.token)
     for existing_id, existing in profiles.items():
         if sha16(existing.state.token) == token_fp:
@@ -2154,6 +3126,8 @@ def merge_profile(profiles: dict[str, AccountProfile], profile: AccountProfile) 
                 profile.id = existing_id
                 profiles[existing_id] = profile
                 return existing_id
+    if len(profiles) >= MAX_ACCOUNT_PROFILES:
+        raise ProfileCapacityError(f"账号池已达到 {MAX_ACCOUNT_PROFILES} 个登录态上限，请先删除不用的账号")
     profiles[profile.id] = profile
     return profile.id
 
@@ -2183,7 +3157,9 @@ def profile_loaded_timestamp(profile: AccountProfile) -> str:
 def compact_duplicate_profiles(
     profiles: dict[str, AccountProfile],
     active_profile_id: str,
+    protected_profile_ids: set[str] | None = None,
 ) -> tuple[str, list[AccountProfile]]:
+    protected = set(protected_profile_ids or ())
     by_user: dict[str, list[tuple[str, AccountProfile]]] = {}
     for profile_id, profile in profiles.items():
         user_id = profile.state.user_id
@@ -2196,10 +3172,15 @@ def compact_duplicate_profiles(
             continue
         if any(profile_id == active_profile_id for profile_id, _profile in items):
             keep_id = active_profile_id
+        elif any(profile_id in protected for profile_id, _profile in items):
+            keep_id, _keep_profile = max(
+                (item for item in items if item[0] in protected),
+                key=lambda item: profile_loaded_timestamp(item[1]),
+            )
         else:
             keep_id, _keep_profile = max(items, key=lambda item: profile_loaded_timestamp(item[1]))
         for profile_id, profile in items:
-            if profile_id == keep_id:
+            if profile_id == keep_id or profile_id in protected:
                 continue
             removed.append(profile)
             profiles.pop(profile_id, None)
@@ -2257,7 +3238,7 @@ def extract_state(har: dict[str, Any]) -> HarState:
     if not token or not user_id:
         raise RuntimeError("无法从 HAR 提取 token / user_id")
 
-    return HarState(
+    return validate_har_state(HarState(
         token=token,
         user_id=user_id,
         user_name=str(user.get("name") or variables.get("{{USER_NAME}}") or "user"),
@@ -2280,7 +3261,7 @@ def extract_state(har: dict[str, Any]) -> HarState:
         sec_ch_ua=header_value(headers, "sec-ch-ua"),
         sec_ch_ua_mobile=header_value(headers, "sec-ch-ua-mobile", "?0"),
         sec_ch_ua_platform=header_value(headers, "sec-ch-ua-platform", '"Windows"'),
-    )
+    ))
 
 
 def extract_state_from_har_path(path: Path) -> tuple[HarState, str]:
@@ -2292,32 +3273,60 @@ def extract_state_from_har_path(path: Path) -> tuple[HarState, str]:
         har.clear()
 
 
-def extract_state_via_worker(path: Path, timeout_sec: int = 120) -> tuple[HarState, str]:
+def extract_state_via_worker(
+    path: Path,
+    timeout_sec: float = HAR_EXTRACT_TIMEOUT_SECONDS,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[HarState, str]:
+    """Parse a potentially large HAR in an owned, cancellable helper process."""
     script_path = Path(__file__).resolve()
-    completed = subprocess.run(
-        [sys.executable, str(script_path), "--extract-state-json", "--har", str(path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_sec,
-        check=False,
-    )
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        raise RuntimeError(f"HAR 状态提取 worker 失败，退出码 {completed.returncode}: {stderr[-500:]}")
-    payload = json.loads(completed.stdout)
+    proc: subprocess.Popen[str] | None = None
+    stdout = ""
+    stderr = ""
+    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, str(script_path), "--extract-state-json", "--har", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        while True:
+            if cancel_check is not None:
+                cancel_check()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"HAR 状态提取超时（{max(0.0, float(timeout_sec)):g} 秒）")
+            try:
+                stdout, stderr = proc.communicate(timeout=min(HELPER_PROCESS_POLL_SECONDS, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    except BaseException:
+        if proc is not None:
+            _terminate_subprocess(proc)
+        raise
+    if proc.returncode != 0:
+        detail = (stderr or "").strip()
+        raise RuntimeError(f"HAR 状态提取 worker 失败，退出码 {proc.returncode}: {detail[-500:]}")
+    payload = json.loads(stdout)
     return har_state_from_dict(payload.get("state") or {}), str(payload.get("har_fp") or "")
 
 
-def extract_state_from_uploaded_bytes(raw: bytes) -> tuple[HarState, str]:
+def extract_state_from_uploaded_bytes(
+    raw: bytes,
+    *,
+    cancel_check: Callable[[], None] | None = None,
+) -> tuple[HarState, str]:
     tmp_name = ""
     try:
         with tempfile.NamedTemporaryFile(prefix="glm2api-upload-", suffix=".har", delete=False) as f:
             tmp_name = f.name
             f.write(raw)
-        return extract_state_via_worker(Path(tmp_name))
+        return extract_state_via_worker(Path(tmp_name), cancel_check=cancel_check)
     finally:
         if tmp_name:
             try:
@@ -2445,13 +3454,60 @@ def request_headers(state: HarState, signature: str, accept: str = "*/*") -> dic
     return headers
 
 
-def http_json(method: str, url: str, headers: dict[str, str], payload: dict[str, Any] | None = None) -> Any:
+def read_limited_upstream_response(response: Any, max_bytes: int, *, kind: str) -> bytes:
+    """Read one non-stream upstream response with an explicit memory ceiling."""
+    global _UPSTREAM_RESPONSE_REJECTED_TOTAL
+    limit = max(1, int(max_bytes))
+    declared = 0
+    response_headers = getattr(response, "headers", None)
+    if response_headers is not None:
+        try:
+            declared = max(0, int(response_headers.get("Content-Length") or 0))
+        except (TypeError, ValueError):
+            declared = 0
+    if declared > limit:
+        with _UPSTREAM_RESPONSE_STATS_LOCK:
+            _UPSTREAM_RESPONSE_REJECTED_TOTAL += 1
+        log_event(
+            "upstream_response_too_large",
+            level=logging.WARNING,
+            response_kind=kind,
+            declared_bytes=declared,
+            max_bytes=limit,
+        )
+        raise UpstreamResponseTooLarge(f"上游 {kind} 响应超过 {limit} 字节限制")
+    raw = response.read(limit + 1)
+    if not isinstance(raw, (bytes, bytearray)):
+        raise UpstreamRequestError(f"上游 {kind} 响应不是字节流")
+    if len(raw) > limit:
+        with _UPSTREAM_RESPONSE_STATS_LOCK:
+            _UPSTREAM_RESPONSE_REJECTED_TOTAL += 1
+        log_event(
+            "upstream_response_too_large",
+            level=logging.WARNING,
+            response_kind=kind,
+            observed_bytes=len(raw),
+            max_bytes=limit,
+        )
+        raise UpstreamResponseTooLarge(f"上游 {kind} 响应超过 {limit} 字节限制")
+    return bytes(raw)
+
+
+def http_json(
+    method: str,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any] | None = None,
+    *,
+    max_response_bytes: int = MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+    timeout: float = 60.0,
+) -> Any:
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     req = Request(url, data=data, headers=headers, method=method)
-    with urlopen(req, timeout=60) as resp:
-        raw = resp.read()
+    with urlopen(req, timeout=max(0.1, float(timeout))) as resp:
+        raw = read_limited_upstream_response(resp, max_response_bytes, kind="JSON")
         text = raw.decode("utf-8", errors="replace")
         parsed = json_or_none(text)
         return parsed if parsed is not None else text
@@ -2485,9 +3541,13 @@ def chat_control_headers(state: HarState, with_auth: bool = False) -> dict[str, 
 
 
 def http_error_summary(exc: HTTPError) -> str:
+    global _UPSTREAM_ERROR_TRUNCATED_TOTAL
     body = ""
+    truncated = False
     try:
-        body = exc.read().decode("utf-8", errors="replace").strip()
+        raw = exc.read(MAX_UPSTREAM_ERROR_RESPONSE_BYTES + 1)
+        truncated = len(raw) > MAX_UPSTREAM_ERROR_RESPONSE_BYTES
+        body = raw[:MAX_UPSTREAM_ERROR_RESPONSE_BYTES].decode("utf-8", errors="replace").strip()
     except Exception:
         body = ""
     finally:
@@ -2501,18 +3561,33 @@ def http_error_summary(exc: HTTPError) -> str:
         summary += f": {reason}"
     if body:
         summary += f": {body[:300]}"
+    if truncated:
+        with _UPSTREAM_RESPONSE_STATS_LOCK:
+            _UPSTREAM_ERROR_TRUNCATED_TOTAL += 1
+        summary += " [error body truncated]"
     return summary
 
 
-def delete_zai_chat(state: HarState, chat_id: str) -> bool:
+def delete_zai_chat(
+    state: HarState,
+    chat_id: str,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
     chat_id = require_uuid(chat_id, "chat_id")
     last_error = ""
     delete_started = time.time()
     # Occasional upstream TLS resets ("UNEXPECTED_EOF_WHILE_READING") hit DELETE;
     # one spaced retry keeps auto-delete reliable.
     for attempt in range(2):
+        if cancel_check is not None and cancel_check():
+            raise ServiceShuttingDown("auto-delete deferred during shutdown")
         if attempt:
-            time.sleep(0.8)
+            deadline = time.monotonic() + 0.8
+            while time.monotonic() < deadline:
+                if cancel_check is not None and cancel_check():
+                    raise ServiceShuttingDown("auto-delete deferred during shutdown")
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
         try:
             for with_auth in (False, True):
                 try:
@@ -2520,6 +3595,7 @@ def delete_zai_chat(state: HarState, chat_id: str) -> bool:
                         "DELETE",
                         f"{BASE_URL}/api/v1/chats/{chat_id}",
                         chat_control_headers(state, with_auth=with_auth),
+                        timeout=AUTO_DELETE_REQUEST_TIMEOUT_SECONDS,
                     )
                 except HTTPError as exc:
                     last_error = http_error_summary(exc)
@@ -2529,7 +3605,7 @@ def delete_zai_chat(state: HarState, chat_id: str) -> bool:
                         return True
                     if exc.code in {401, 403} and not with_auth:
                         continue
-                    raise RuntimeError(f"删除对话失败: {last_error}") from exc
+                    raise UpstreamRequestError(f"删除对话失败: {last_error}") from exc
                 if result is True:
                     log_event(
                         "upstream_chat_deleted",
@@ -2543,7 +3619,7 @@ def delete_zai_chat(state: HarState, chat_id: str) -> bool:
             last_error = f"urlopen error: {getattr(exc, 'reason', exc)}"
             continue
         break
-    raise RuntimeError(f"删除对话失败: {last_error or 'unknown error'}")
+    raise UpstreamRequestError(f"删除对话失败: {last_error or 'unknown error'}")
 
 
 # ---------------------------------------------------------------------------
@@ -2566,9 +3642,9 @@ def _chat_control_get(state: HarState, url: str, action: str) -> Any:
             if exc.code in {401, 403} and not with_auth:
                 continue
             if exc.code == 404:
-                raise RuntimeError(f"{action}: 对话不存在或已被删除") from exc
-            raise RuntimeError(f"{action}失败: {last_error}") from exc
-    raise RuntimeError(f"{action}失败: {last_error or 'unknown error'}")
+                raise UpstreamRequestError(f"{action}: 对话不存在或已被删除") from exc
+            raise UpstreamRequestError(f"{action}失败: {last_error}") from exc
+    raise UpstreamRequestError(f"{action}失败: {last_error or 'unknown error'}")
 
 
 def list_zai_chats(state: HarState, page: int = 1) -> list[dict[str, Any]]:
@@ -2577,7 +3653,7 @@ def list_zai_chats(state: HarState, page: int = 1) -> list[dict[str, Any]]:
     result = _chat_control_get(state, f"{BASE_URL}/api/v1/chats/?page={page}&type=default", "获取对话列表")
     if isinstance(result, list):
         return [item for item in result if isinstance(item, dict)]
-    raise RuntimeError(f"获取对话列表失败: unexpected payload {str(result)[:200]}")
+    raise UpstreamRequestError(f"获取对话列表失败: unexpected payload {str(result)[:200]}")
 
 
 def get_zai_chat_detail(state: HarState, chat_id: str) -> dict[str, Any]:
@@ -2585,7 +3661,7 @@ def get_zai_chat_detail(state: HarState, chat_id: str) -> dict[str, Any]:
     result = _chat_control_get(state, f"{BASE_URL}/api/v1/chats/{chat_id}", "获取对话详情")
     if isinstance(result, dict) and isinstance(result.get("chat"), dict):
         return result
-    raise RuntimeError(f"获取对话详情失败: unexpected payload {str(result)[:200]}")
+        raise UpstreamRequestError(f"获取对话详情失败: unexpected payload {str(result)[:200]}")
 
 
 def normalize_history_message_content(value: Any) -> str:
@@ -2678,24 +3754,75 @@ HISTORY_SCHEMA = "glm2api.history.v4"
 _HISTORY_CONF = {"max_records": 300}
 # 兼容旧测试/外部引用的只读别名
 HISTORY_MAX_RECORDS = 300
+# detail 文件总量预算；与条数上限同时生效。即使单条记录超过预算，也始终
+# 保留最新一条，避免刚完成的请求在历史页中立即消失。
+HISTORY_MAX_DETAIL_BYTES = 256 * 1024 * 1024
+MAX_HISTORY_INDEX_BYTES = 8 * 1024 * 1024
+MAX_HISTORY_DETAIL_FILE_BYTES = 16 * 1024 * 1024
+MAX_HISTORY_DETAIL_SCAN_FILES = 4096
 HISTORY_PROMPT_CHARS = 8_000
 HISTORY_MSG_CHARS = 6_000
 HISTORY_MESSAGES_MAX = 30
 HISTORY_CONTEXT_CHARS = 16_000
-HISTORY_CONTEXT_FILES_MAX = 4
+HISTORY_CONTEXT_FILES_MAX = 32
 HISTORY_CONTEXT_FILE_CHARS = 80_000
 HISTORY_FINAL_CHARS = 40_000
 HISTORY_ANSWER_CHARS = 30_000
+HISTORY_ACCOUNT_FP_RE = re.compile(r"^[0-9a-f]{16}$", re.IGNORECASE)
+HISTORY_STORAGE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def history_account_fingerprint(value: Any) -> str:
+    """Normalize history account labels to a non-reversible sha16 fingerprint."""
+    account = str(value or "").strip()
+    return sha16(account) if account else ""
+
+
+def history_account_value(record: dict[str, Any]) -> str:
+    account = str(record.get("account") or "").strip()
+    if int(record.get("account_fp_version") or 0) == 1 and HISTORY_ACCOUNT_FP_RE.fullmatch(account):
+        return account.lower()
+    return history_account_fingerprint(account)
+
+
+def sanitize_history_account(record: dict[str, Any]) -> bool:
+    """Hash legacy raw/partial account labels in place; return whether changed."""
+    old = str(record.get("account") or "").strip()
+    old_version = int(record.get("account_fp_version") or 0)
+    if old_version == 1 and (not old or HISTORY_ACCOUNT_FP_RE.fullmatch(old)):
+        return False
+    record["account"] = history_account_fingerprint(old)
+    record["account_fp_version"] = 1
+    return True
 HISTORY_THINKING_CHARS = 20_000
 HISTORY_PREVIEW_CHARS = 160
 HISTORY_FILES_MAX = 20
 # 详情页每 750ms 轮询一次；按同频率持久化即可保持实时感，同时避免此前
 # 250ms 频率造成 detail + 完整索引每秒约 8 次原子替换。
 HISTORY_PROGRESS_INTERVAL_SECONDS = 0.75
-_HISTORY_LOCK = threading.Lock()
+_HISTORY_LOCK = threading.RLock()
 _HISTORY_CACHE: list[dict[str, Any]] | None = None
 _HISTORY_DIRTY: set[str] = set()
 _HISTORY_DELETED: set[str] = set()
+_HISTORY_STORE_ERROR = ""
+_HISTORY_STORE_ERROR_AT = ""
+
+
+def _history_store_failure(event: str, exc: BaseException, **fields: Any) -> str:
+    global _HISTORY_STORE_ERROR, _HISTORY_STORE_ERROR_AT
+    error = client_error_message(exc, fallback="history store operation failed")
+    with _HISTORY_LOCK:
+        _HISTORY_STORE_ERROR = error
+        _HISTORY_STORE_ERROR_AT = datetime.now().astimezone().isoformat(timespec="seconds")
+    log_event(event, error=error, **fields)
+    return error
+
+
+def _history_store_clear_error() -> None:
+    global _HISTORY_STORE_ERROR, _HISTORY_STORE_ERROR_AT
+    with _HISTORY_LOCK:
+        _HISTORY_STORE_ERROR = ""
+        _HISTORY_STORE_ERROR_AT = ""
 
 
 def history_display_content(content: Any) -> str:
@@ -2795,6 +3922,8 @@ def history_context_files_snapshot(files: Any) -> list[dict[str, Any]]:
                 "content": content[:HISTORY_CONTEXT_FILE_CHARS],
                 "original_chars": original_chars,
                 "truncated": original_chars > HISTORY_CONTEXT_FILE_CHARS,
+                "part": max(1, int(item.get("part") or 1)),
+                "parts": max(1, int(item.get("parts") or 1)),
             }
         )
     return snapshot
@@ -2818,20 +3947,184 @@ def _history_record_title(user_input: str) -> str:
 
 
 def _history_detail_path(record_id: str) -> Path:
-    return HISTORY_DETAIL_DIR / f"{record_id}.json"
+    normalized = str(record_id or "")
+    if not HISTORY_STORAGE_ID_RE.fullmatch(normalized):
+        raise ValueError("history storage id is invalid")
+    return HISTORY_DETAIL_DIR / f"{normalized}.json"
 
 
 def _history_read_detail_locked(record_id: str) -> dict[str, Any] | None:
     try:
-        env = json.loads(_history_detail_path(record_id).read_text(encoding="utf-8"))
+        env = read_json_file_limited(
+            _history_detail_path(record_id),
+            MAX_HISTORY_DETAIL_FILE_BYTES,
+            label="history detail",
+        )
     except FileNotFoundError:
         return None
     except Exception as exc:
-        log_event("history_store_detail_read_error", record_id_fp=sha16(record_id), error=str(exc)[:200])
+        _history_store_failure("history_store_detail_read_error", exc, record_id_fp=sha16(record_id))
         return None
     if isinstance(env, dict) and isinstance(env.get("record"), dict):
-        return env["record"]
+        record = env["record"]
+        if str(record.get("id") or "") == record_id:
+            return record
+        log_event("history_store_detail_id_mismatch", record_id_fp=sha16(record_id))
     return None
+
+
+def _history_reconcile_unindexed_details_locked(
+    records: list[dict[str, Any]],
+    index_updated_ms: int = 0,
+) -> dict[str, int]:
+    """Recover newer orphan details and remove older failed-delete remnants."""
+    known = {str(record.get("id") or "") for record in records}
+    recovered = 0
+    stale_removed = 0
+    scan_truncated = False
+    try:
+        candidates: list[Path] = []
+        for path in HISTORY_DETAIL_DIR.glob("*.json"):
+            if len(candidates) >= MAX_HISTORY_DETAIL_SCAN_FILES:
+                scan_truncated = True
+                break
+            candidates.append(path)
+        candidates.sort()
+    except OSError as exc:
+        _history_store_failure("history_store_detail_scan_error", exc)
+        return {"recovered": 0, "stale_removed": 0}
+    if scan_truncated:
+        log_event(
+            "history_store_detail_scan_truncated",
+            level=logging.WARNING,
+            max_files=MAX_HISTORY_DETAIL_SCAN_FILES,
+        )
+    for path in candidates:
+        record_id = path.stem
+        if not record_id or record_id in known:
+            continue
+        detail = _history_read_detail_locked(record_id)
+        if detail is None or str(detail.get("id") or "") != record_id:
+            continue
+        try:
+            detail_modified_ms = int(path.stat().st_mtime * 1000)
+        except OSError:
+            detail_modified_ms = 0
+        if index_updated_ms > 0 and detail_modified_ms < index_updated_ms:
+            # The index was committed after this detail. It is therefore a
+            # remnant of a delete whose unlink failed, not a missing index row.
+            try:
+                path.unlink(missing_ok=True)
+            except OSError as exc:
+                _history_store_failure(
+                    "history_store_detail_delete_error",
+                    exc,
+                    record_id_fp=sha16(record_id),
+                )
+            else:
+                stale_removed += 1
+            continue
+        if sanitize_history_account(detail):
+            _HISTORY_DIRTY.add(record_id)
+        records.append(detail)
+        known.add(record_id)
+        recovered += 1
+    if recovered:
+        def created_at(record: dict[str, Any]) -> int:
+            try:
+                return int(record.get("created_at") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        records.sort(key=created_at)
+    return {"recovered": recovered, "stale_removed": stale_removed}
+
+
+def _history_record_size_bytes(record: dict[str, Any]) -> int:
+    """Return the UTF-8 JSON size used by one persisted detail envelope."""
+    try:
+        payload = json.dumps({"schema": HISTORY_SCHEMA, "record": record}, ensure_ascii=False)
+        return len(payload.encode("utf-8"))
+    except Exception:
+        return json_size_bytes({"schema": HISTORY_SCHEMA, "record": record})
+
+
+def _history_record_retained_size_locked(record: dict[str, Any]) -> int:
+    """Use the current in-memory size for dirty records, otherwise the file size."""
+    record_id = str(record.get("id") or "")
+    if record_id and record_id not in _HISTORY_DIRTY:
+        try:
+            return max(0, int(_history_detail_path(record_id).stat().st_size))
+        except OSError:
+            pass
+    return _history_record_size_bytes(record)
+
+
+def _history_enforce_limits_locked(records: list[dict[str, Any]] | None = None) -> dict[str, int]:
+    """Evict oldest details by count/bytes while always retaining the newest item."""
+    target = records if records is not None else (_HISTORY_CACHE or [])
+    max_records = max(1, int(_HISTORY_CONF.get("max_records") or HISTORY_MAX_RECORDS))
+    max_bytes = max(1, int(HISTORY_MAX_DETAIL_BYTES))
+    sizes = [_history_record_retained_size_locked(record) for record in target]
+    retained_bytes = sum(sizes)
+    evicted = 0
+    while len(target) > 1 and (len(target) > max_records or retained_bytes > max_bytes):
+        old = target.pop(0)
+        retained_bytes -= sizes.pop(0)
+        record_id = str(old.get("id") or "")
+        if record_id:
+            _HISTORY_DELETED.add(record_id)
+            _HISTORY_DIRTY.discard(record_id)
+        evicted += 1
+    return {
+        "evicted": evicted,
+        "records": len(target),
+        "detail_bytes": max(0, retained_bytes),
+    }
+
+
+def history_store_status() -> dict[str, Any]:
+    """Return bounded, content-free disk usage metrics for the status page."""
+    with _HISTORY_LOCK:
+        detail_files = 0
+        detail_bytes = 0
+        detail_scan_truncated = False
+        try:
+            for path in HISTORY_DETAIL_DIR.glob("*.json"):
+                if detail_files >= MAX_HISTORY_DETAIL_SCAN_FILES:
+                    detail_scan_truncated = True
+                    break
+                try:
+                    detail_bytes += max(0, int(path.stat().st_size))
+                    detail_files += 1
+                except OSError:
+                    continue
+        except OSError:
+            pass
+        try:
+            index_bytes = max(0, int(HISTORY_STORE_PATH.stat().st_size))
+        except OSError:
+            index_bytes = 0
+        records = len(_HISTORY_CACHE) if _HISTORY_CACHE is not None else detail_files
+        return {
+            "records": records,
+            "detail_files": detail_files,
+            "detail_bytes": detail_bytes,
+            "index_bytes": index_bytes,
+            "bytes": detail_bytes + index_bytes,
+            "max_records": max(1, int(_HISTORY_CONF.get("max_records") or HISTORY_MAX_RECORDS)),
+            "max_detail_bytes": max(1, int(HISTORY_MAX_DETAIL_BYTES)),
+            "max_index_bytes": MAX_HISTORY_INDEX_BYTES,
+            "max_detail_file_bytes": MAX_HISTORY_DETAIL_FILE_BYTES,
+            "max_detail_scan_files": MAX_HISTORY_DETAIL_SCAN_FILES,
+            "detail_scan_truncated": detail_scan_truncated,
+            "over_detail_budget": detail_bytes > max(1, int(HISTORY_MAX_DETAIL_BYTES)),
+            "persisted": not bool(_HISTORY_STORE_ERROR or _HISTORY_DIRTY or _HISTORY_DELETED),
+            "pending_writes": len(_HISTORY_DIRTY),
+            "pending_deletes": len(_HISTORY_DELETED),
+            "error": _HISTORY_STORE_ERROR,
+            "error_at": _HISTORY_STORE_ERROR_AT,
+        }
 
 
 def _history_load_locked() -> None:
@@ -2839,51 +4132,87 @@ def _history_load_locked() -> None:
     try:
         HISTORY_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        log_event("history_store_dir_error", error=str(exc)[:200])
+        _history_store_failure("history_store_dir_error", exc)
     raw = None
     try:
-        raw = json.loads(HISTORY_STORE_PATH.read_text(encoding="utf-8"))
+        raw = read_json_file_limited(HISTORY_STORE_PATH, MAX_HISTORY_INDEX_BYTES, label="history index")
     except FileNotFoundError:
         pass
     except Exception as exc:
-        log_event("history_store_index_read_error", error=str(exc)[:200])
+        _history_store_failure("history_store_index_read_error", exc)
 
     if isinstance(raw, dict) and str(raw.get("schema") or "") in {HISTORY_SCHEMA, "glm2api.history.v3"}:
         # v3/v4：索引只存摘要（v3 仅 id 顺序），正文读 detail 目录。
+        retained_limit = max(1, int(_HISTORY_CONF.get("max_records") or HISTORY_MAX_RECORDS))
         if str(raw.get("schema") or "") == HISTORY_SCHEMA:
+            source_items = raw.get("items") if isinstance(raw.get("items"), list) else []
             order = [
                 str(item.get("id") or "")
-                for item in (raw.get("items") or [])
+                for item in source_items[-retained_limit:]
                 if isinstance(item, dict)
             ]
         else:
-            order = [str(rid) for rid in (raw.get("ids") or []) if isinstance(rid, str)]
+            source_ids = raw.get("ids") if isinstance(raw.get("ids"), list) else []
+            order = [str(rid) for rid in source_ids[-retained_limit:] if isinstance(rid, str)]
+        order = list(dict.fromkeys(rid for rid in order if HISTORY_STORAGE_ID_RE.fullmatch(rid)))
         records: list[dict[str, Any]] = []
+        account_migrated = 0
         for rid in order:
             if not rid:
                 continue
             detail = _history_read_detail_locked(rid)
             if detail is not None:
+                if sanitize_history_account(detail):
+                    _HISTORY_DIRTY.add(rid)
+                    account_migrated += 1
                 records.append(detail)
+        try:
+            index_updated_ms = int(raw.get("updated") or 0)
+        except (TypeError, ValueError):
+            index_updated_ms = 0
+        reconciled = _history_reconcile_unindexed_details_locked(records, index_updated_ms)
+        recovered = reconciled["recovered"]
         _HISTORY_CACHE = records
+        retention = _history_enforce_limits_locked(records)
         if str(raw.get("schema") or "") != HISTORY_SCHEMA and records:
             # 旧 v3 ids 索引一次性升级为 v4 摘要索引。
             _HISTORY_DIRTY.update(r["id"] for r in records)
             _history_persist_locked()
             log_event("history_store_migrated", count=len(records))
+        elif account_migrated or recovered or retention["evicted"]:
+            _history_persist_locked()
+            if account_migrated:
+                log_event("history_account_migrated", count=account_migrated)
+            if recovered:
+                log_event("history_store_recovered", count=recovered)
+        if reconciled["stale_removed"]:
+            log_event("history_store_stale_details_removed", count=reconciled["stale_removed"])
         return
 
     # 旧格式（v2 单文件 / v1 单文件）整体迁移到 v3。
     items: list[dict[str, Any]] = []
     if isinstance(raw, dict) and isinstance(raw.get("records"), list):
-        items = [item for item in raw["records"] if isinstance(item, dict)]
+        retained_limit = max(1, int(_HISTORY_CONF.get("max_records") or HISTORY_MAX_RECORDS))
+        items = [item for item in raw["records"][-retained_limit:] if isinstance(item, dict)]
         if str(raw.get("schema") or "") != "glm2api.history.v2":
             items = [_adapt_v1_history_record(item) for item in items]
+        for item in items:
+            if not HISTORY_STORAGE_ID_RE.fullmatch(str(item.get("id") or "")):
+                item["id"] = "req_" + uuid.uuid4().hex[:24]
+    account_migrated = sum(1 for item in items if sanitize_history_account(item))
+    reconciled = _history_reconcile_unindexed_details_locked(items)
+    recovered = reconciled["recovered"]
     _HISTORY_CACHE = items
     if items:
         _HISTORY_DIRTY.update(str(item.get("id") or "") for item in items)
+        _history_enforce_limits_locked(items)
         _history_persist_locked()
-        log_event("history_store_migrated", count=len(items))
+        log_event(
+            "history_store_migrated",
+            count=len(items),
+            account_migrated=account_migrated,
+            recovered=recovered,
+        )
 
 
 def _history_records_locked() -> list[dict[str, Any]]:
@@ -2893,7 +4222,7 @@ def _history_records_locked() -> list[dict[str, Any]]:
         try:
             _history_load_locked()
         except Exception as exc:
-            log_event("history_store_load_error", error=str(exc)[:200])
+            _history_store_failure("history_store_load_error", exc)
     return _HISTORY_CACHE
 
 
@@ -2953,7 +4282,7 @@ def _history_summary_locked(record: dict[str, Any]) -> dict[str, Any]:
         "status": str(record.get("status") or ""),
         "surface": str(record.get("surface") or ""),
         "model": str(record.get("model") or ""),
-        "account": str(record.get("account") or ""),
+        "account": history_account_value(record),
         "caller": str(record.get("caller") or ""),
         "stream": bool(record.get("stream")),
         "created_at": record.get("created_at"),
@@ -2971,6 +4300,9 @@ def _history_summary_locked(record: dict[str, Any]) -> dict[str, Any]:
         "context_file_fallback": str(record.get("context_file_fallback") or ""),
         "context_files": len(record.get("context_files") or []),
         "finish_reason": str(record.get("finish_reason") or ""),
+        "tool_calls_count": max(0, int(record.get("tool_calls_count") or 0)),
+        "tool_calls_source": str(record.get("tool_calls_source") or ""),
+        "tool_retry_count": max(0, int(record.get("tool_retry_count") or 0)),
     }
 
 
@@ -2982,19 +4314,23 @@ def _history_write_atomic_locked(path: Path, body: str) -> None:
     atomic_write_text(path, body, durable=False)
 
 
-def _history_persist_locked() -> None:
+def _history_persist_locked() -> bool:
     """脏 detail 单条重写 + 小索引；删除的 detail 文件一并清理。"""
+    directory_failed = False
     try:
         HISTORY_DETAIL_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
-        log_event("history_store_dir_error", error=str(exc)[:200])
+        directory_failed = True
+        _history_store_failure("history_store_dir_error", exc)
     deleted_done: set[str] = set()
     dirty_done: set[str] = set()
+    delete_failed = False
     for rid in sorted(_HISTORY_DELETED):
         try:
             _history_detail_path(rid).unlink(missing_ok=True)
         except Exception as exc:
-            log_event("history_store_detail_delete_error", record_id_fp=sha16(rid), error=str(exc)[:200])
+            delete_failed = True
+            _history_store_failure("history_store_detail_delete_error", exc, record_id_fp=sha16(rid))
         else:
             deleted_done.add(rid)
     dirty_ids = sorted(_HISTORY_DIRTY)
@@ -3013,42 +4349,53 @@ def _history_persist_locked() -> None:
             continue
         try:
             payload = json.dumps({"schema": HISTORY_SCHEMA, "record": record}, ensure_ascii=False)
-            _history_write_atomic_locked(_history_detail_path(rid), payload)
+            _history_write_atomic_locked(
+                _history_detail_path(rid),
+                ensure_utf8_size(payload, MAX_HISTORY_DETAIL_FILE_BYTES, label="history detail"),
+            )
         except Exception as exc:
             dirty_failed = True
-            log_event("history_store_detail_write_error", record_id_fp=sha16(rid), error=str(exc)[:200])
+            _history_store_failure("history_store_detail_write_error", exc, record_id_fp=sha16(rid))
         else:
             dirty_done.add(rid)
     # Never publish an index whose referenced detail write failed. Keep every
     # pending marker so the next history mutation retries the complete batch.
     if dirty_failed:
-        return
-    index = json.dumps(
-        {
-            "schema": HISTORY_SCHEMA,
-            "limit": max(1, int(_HISTORY_CONF.get("max_records") or 300)),
-            "updated": int(time.time() * 1000),
-            "items": [_history_summary_locked(r) for r in _HISTORY_CACHE],
-        },
-        ensure_ascii=False,
-    )
+        return False
     try:
-        _history_write_atomic_locked(HISTORY_STORE_PATH, index)
+        index = json.dumps(
+            {
+                "schema": HISTORY_SCHEMA,
+                "limit": max(1, int(_HISTORY_CONF.get("max_records") or 300)),
+                "updated": int(time.time() * 1000),
+                "items": [_history_summary_locked(r) for r in _HISTORY_CACHE],
+            },
+            ensure_ascii=False,
+        )
+        _history_write_atomic_locked(
+            HISTORY_STORE_PATH,
+            ensure_utf8_size(index, MAX_HISTORY_INDEX_BYTES, label="history index"),
+        )
     except Exception as exc:
-        log_event("history_store_index_write_error", error=str(exc)[:200])
-        return
+        _history_store_failure("history_store_index_write_error", exc)
+        return False
     _HISTORY_DIRTY.difference_update(dirty_done)
     _HISTORY_DELETED.difference_update(deleted_done)
+    if directory_failed or delete_failed:
+        return False
+    _history_store_clear_error()
+    return True
 
 
 def _history_upsert_locked(record: dict[str, Any]) -> None:
     records = _history_records_locked()
+    record_id = str(record.get("id") or "")
+    if record_id:
+        # Mark only after a potential lazy load/migration. A migration persist
+        # cannot then mistake this not-yet-appended record for a stale marker.
+        _HISTORY_DIRTY.add(record_id)
     records.append(record)
-    cap = max(1, int(_HISTORY_CONF.get("max_records") or 300))
-    if len(records) > cap:
-        for old in records[: len(records) - cap]:
-            _HISTORY_DELETED.add(str(old.get("id") or ""))
-        del records[: len(records) - cap]
+    _history_enforce_limits_locked(records)
 
 
 def start_history_record(
@@ -3079,7 +4426,8 @@ def start_history_record(
         "status": "streaming",
         "surface": str(surface or ""),
         "model": str(model or ""),
-        "account": str(account or ""),
+        "account": history_account_fingerprint(account),
+        "account_fp_version": 1,
         "caller": caller,
         "stream": bool(stream),
         "created_at": now_ms,
@@ -3101,11 +4449,15 @@ def start_history_record(
         "content": "",
         "error": "",
         "finish_reason": "",
+        "tool_calls_count": 0,
+        "tool_call_names": [],
+        "tool_calls_source": "",
+        "tool_retry_count": 0,
+        "tool_retry_error": "",
     }
     try:
         with _HISTORY_LOCK:
             _history_upsert_locked(record)
-            _HISTORY_DIRTY.add(str(record["id"]))
             _history_persist_locked()
         return str(record["id"])
     except Exception as exc:
@@ -3158,6 +4510,11 @@ def restart_history_record(record_id: str, final_prompt: str) -> None:
             record["content"] = ""
             record["error"] = ""
             record["finish_reason"] = ""
+            record["tool_calls_count"] = 0
+            record["tool_call_names"] = []
+            record["tool_calls_source"] = ""
+            record["tool_retry_count"] = max(0, int(record.get("tool_retry_count") or 0)) + 1
+            record["tool_retry_error"] = ""
             record["updated_at"] = int(time.time() * 1000)
             _HISTORY_DIRTY.add(record_id)
             _history_persist_locked()
@@ -3172,7 +4529,7 @@ def finish_history_record(
     content: str = "",
     reasoning: str = "",
     error: str = "",
-    elapsed_ms: int = 0,
+    elapsed_ms: int | None = None,
     chat_id: str = "",
     status_code: int = 0,
     finish_reason: str = "",
@@ -3192,7 +4549,8 @@ def finish_history_record(
             record["content"] = str(content or "")[:HISTORY_ANSWER_CHARS]
             record["reasoning"] = str(reasoning or "")[:HISTORY_THINKING_CHARS]
             record["error"] = str(error or "")[:500]
-            record["elapsed_ms"] = max(0, int(elapsed_ms or 0))
+            if elapsed_ms is not None:
+                record["elapsed_ms"] = max(0, int(elapsed_ms or 0))
             record["status_code"] = int(status_code or (200 if status in {"success", "stopped"} else 0))
             record["finish_reason"] = str(finish_reason or ("stop" if status == "success" else ""))
             prompt_basis = str(record.get("final_prompt") or record.get("user_input") or "")
@@ -3212,6 +4570,7 @@ def finish_history_record(
             if status in {"success", "error", "stopped"}:
                 record["completed_at"] = now_ms
             _HISTORY_DIRTY.add(record_id)
+            _history_enforce_limits_locked()
             _history_persist_locked()
         log_event(
             "history_recorded",
@@ -3222,6 +4581,30 @@ def finish_history_record(
         )
     except Exception as exc:
         log_event("history_store_write_error", stage="finish", error=str(exc)[:200])
+
+
+def update_history_protocol_result(record_id: str, turn: ProtocolTurn | None = None, error: str = "") -> None:
+    """Attach protocol-conversion outcome without storing tool arguments."""
+    if not record_id:
+        return
+    try:
+        with _HISTORY_LOCK:
+            record = _history_find_locked(record_id)
+            if record is None:
+                return
+            if turn is not None:
+                record["finish_reason"] = "tool_calls" if turn.tool_calls else "stop"
+                record["tool_calls_count"] = len(turn.tool_calls)
+                record["tool_call_names"] = [call.name for call in turn.tool_calls[:32]]
+                record["tool_calls_source"] = str(turn.tool_calls_source or "")[:40]
+                record["tool_retry_error"] = ""
+            if error:
+                record["tool_retry_error"] = str(error)[:300]
+            record["updated_at"] = int(time.time() * 1000)
+            _HISTORY_DIRTY.add(record_id)
+            _history_persist_locked()
+    except Exception as exc:
+        log_event("history_store_write_error", stage="protocol_result", error=str(exc)[:200])
 
 
 def history_preview(record: dict[str, Any]) -> str:
@@ -3290,6 +4673,10 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
                 "delivery_mode": history_delivery_mode(record),
                 "fallback": bool(record.get("context_file_fallback")),
                 "usage": dict(record.get("usage") or {}) if isinstance(record.get("usage"), dict) else {},
+                "finish_reason": str(record.get("finish_reason") or ""),
+                "tool_calls_count": max(0, int(record.get("tool_calls_count") or 0)),
+                "tool_calls_source": str(record.get("tool_calls_source") or ""),
+                "tool_retry_count": max(0, int(record.get("tool_retry_count") or 0)),
             }
             for record in records
         ]
@@ -3302,6 +4689,11 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
     token_totals = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
     file_delivery_requests = 0
     fallback_requests = 0
+    tool_turns = 0
+    tool_calls_total = 0
+    tool_retry_requests = 0
+    tool_retry_successes = 0
+    thinking_recovered_turns = 0
     latest_at = 0
     window_rows = 0
     for row in rows:
@@ -3330,6 +4722,17 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
             file_delivery_requests += 1
         if row["fallback"]:
             fallback_requests += 1
+        tool_calls_count = int(row["tool_calls_count"])
+        tool_retry_count = int(row["tool_retry_count"])
+        if tool_calls_count > 0 or row["finish_reason"] == "tool_calls":
+            tool_turns += 1
+            tool_calls_total += tool_calls_count
+        if tool_retry_count > 0:
+            tool_retry_requests += 1
+            if status == "success":
+                tool_retry_successes += 1
+        if row["tool_calls_source"] in {"thinking", "thinking_retry"}:
+            thinking_recovered_turns += 1
         usage = row["usage"]
         for key in token_totals:
             token_totals[key] += max(0, int(usage.get(key) or 0))
@@ -3373,6 +4776,17 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
         "file_delivery_requests": file_delivery_requests,
         "file_delivery_rate": round(file_delivery_requests / window_rows, 4) if window_rows else 0.0,
         "fallback_requests": fallback_requests,
+        "tools": {
+            "turns": tool_turns,
+            "calls": tool_calls_total,
+            "turn_rate": round(tool_turns / window_rows, 4) if window_rows else 0.0,
+            "format_retry_requests": tool_retry_requests,
+            "format_retry_successes": tool_retry_successes,
+            "format_retry_success_rate": round(tool_retry_successes / tool_retry_requests, 4)
+            if tool_retry_requests
+            else 0.0,
+            "thinking_recovered_turns": thinking_recovered_turns,
+        },
         "models": models[:12],
         "surfaces": [{"surface": name, "count": count} for name, count in surface_counts.most_common(12)],
         "callers": dict(caller_counts),
@@ -3393,7 +4807,7 @@ def local_history_summary(text: str = "", status: str = "") -> list[dict[str, An
             "status": str(record.get("status") or ""),
             "surface": str(record.get("surface") or ""),
             "model": str(record.get("model") or ""),
-            "account": str(record.get("account") or ""),
+            "account": history_account_value(record),
             "caller": str(record.get("caller") or ""),
             "stream": bool(record.get("stream")),
             "created_at": record.get("created_at"),
@@ -3409,6 +4823,9 @@ def local_history_summary(text: str = "", status: str = "") -> list[dict[str, An
             "context_file_fallback": str(record.get("context_file_fallback") or ""),
             "context_files": len(record.get("context_files") or []),
             "finish_reason": str(record.get("finish_reason") or ""),
+            "tool_calls_count": max(0, int(record.get("tool_calls_count") or 0)),
+            "tool_calls_source": str(record.get("tool_calls_source") or ""),
+            "tool_retry_count": max(0, int(record.get("tool_retry_count") or 0)),
         }
         if status_filter and summary["status"] != status_filter:
             continue
@@ -3487,58 +4904,111 @@ def get_local_history_record(record_id: str) -> dict[str, Any] | None:
     return None
 
 
-def purge_local_history(chat_id: str) -> int:
+def purge_local_history(chat_id: str, result_out: dict[str, Any] | None = None) -> int:
     """删除指定会话的全部本地镜像记录，返回移除条数。"""
     chat_id = str(chat_id or "")
+    removed = 0
     try:
         with _HISTORY_LOCK:
             records = _history_records_locked()
             kept = [r for r in records if str(r.get("chat_id") or "") != chat_id]
             removed = len(records) - len(kept)
+            persisted = True
             if removed:
                 _HISTORY_DELETED.update(str(r.get("id") or "") for r in records if str(r.get("chat_id") or "") == chat_id)
                 _HISTORY_CACHE[:] = kept
-                _history_persist_locked()
+                persisted = _history_persist_locked()
+            if isinstance(result_out, dict):
+                result_out.update(
+                    {
+                        "removed": removed,
+                        "persisted": persisted,
+                        "error": _HISTORY_STORE_ERROR if not persisted else "",
+                    }
+                )
             return removed
     except Exception as exc:
-        log_event("history_store_write_error", error=str(exc)[:200])
-        return 0
+        error = _history_store_failure("history_store_write_error", exc, operation="purge_chat")
+        if isinstance(result_out, dict):
+            result_out.update({"removed": removed, "persisted": False, "error": error})
+        return removed
 
 
-def purge_history_record(record_id: str) -> int:
+def purge_history_record(record_id: str, result_out: dict[str, Any] | None = None) -> int:
     """删除单条请求镜像记录，返回移除条数（0/1）。"""
     record_id = str(record_id or "")
+    removed = 0
     try:
         with _HISTORY_LOCK:
             records = _history_records_locked()
             kept = [r for r in records if str(r.get("id") or "") != record_id]
             removed = len(records) - len(kept)
+            persisted = True
             if removed:
                 _HISTORY_DELETED.add(record_id)
                 _HISTORY_CACHE[:] = kept
-                _history_persist_locked()
+                persisted = _history_persist_locked()
+            if isinstance(result_out, dict):
+                result_out.update(
+                    {
+                        "removed": removed,
+                        "persisted": persisted,
+                        "error": _HISTORY_STORE_ERROR if not persisted else "",
+                    }
+                )
             return removed
     except Exception as exc:
-        log_event("history_store_write_error", error=str(exc)[:200])
-        return 0
+        error = _history_store_failure("history_store_write_error", exc, operation="purge_record")
+        if isinstance(result_out, dict):
+            result_out.update({"removed": removed, "persisted": False, "error": error})
+        return removed
 
 
-def clear_local_history() -> int:
+def clear_local_history(result_out: dict[str, Any] | None = None) -> int:
     """清空全部请求镜像记录，返回移除条数。"""
+    removed = 0
     try:
         with _HISTORY_LOCK:
             records = _history_records_locked()
             removed = len(records)
             _HISTORY_DELETED.update(str(r.get("id") or "") for r in records)
             _HISTORY_CACHE.clear()
-            _history_persist_locked()
+            persisted = _history_persist_locked()
+            if isinstance(result_out, dict):
+                result_out.update(
+                    {
+                        "removed": removed,
+                        "persisted": persisted,
+                        "error": _HISTORY_STORE_ERROR if not persisted else "",
+                    }
+                )
             return removed
     except Exception as exc:
-        log_event("history_store_write_error", error=str(exc)[:200])
-        return 0
+        error = _history_store_failure("history_store_write_error", exc, operation="clear")
+        if isinstance(result_out, dict):
+            result_out.update({"removed": removed, "persisted": False, "error": error})
+        return removed
 
 
-def delete_zai_file(state: HarState, file_id: str) -> bool:
+def require_upstream_file_id(value: Any) -> str:
+    file_id = str(value or "").strip()
+    if (
+        not file_id
+        or len(file_id) > 256
+        or any(ch.isspace() for ch in file_id)
+        or "/" in file_id
+        or "\\" in file_id
+    ):
+        raise ValueError("invalid file id")
+    return file_id
+
+
+def delete_zai_file(
+    state: HarState,
+    file_id: str,
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+) -> bool:
     """Best-effort removal of an uploaded file that never reached a chat.
 
     The upstream file deletion endpoint is optional: 404 means the file is
@@ -3546,16 +5016,17 @@ def delete_zai_file(state: HarState, file_id: str) -> bool:
     are treated as a completed no-op. Returns False only for a 405 no-op,
     True when the file is gone or deleted.
     """
-    file_id = str(file_id or "").strip()
-    if not file_id or any(ch.isspace() for ch in file_id) or "/" in file_id or "\\" in file_id:
-        raise ValueError("invalid file id")
+    file_id = require_upstream_file_id(file_id)
     last_error = ""
     for with_auth in (False, True):
+        if cancel_check is not None and cancel_check():
+            raise ServiceShuttingDown("file cleanup deferred during shutdown")
         try:
             result = http_json(
                 "DELETE",
                 f"{BASE_URL}/api/v1/files/{file_id}",
                 chat_control_headers(state, with_auth=with_auth),
+                timeout=AUTO_DELETE_REQUEST_TIMEOUT_SECONDS,
             )
         except HTTPError as exc:
             if exc.code in {404, 405}:
@@ -3568,12 +5039,12 @@ def delete_zai_file(state: HarState, file_id: str) -> bool:
             last_error = http_error_summary(exc)
             if exc.code in {401, 403} and not with_auth:
                 continue
-            raise RuntimeError(f"删除附件失败: {last_error}") from exc
+            raise UpstreamRequestError(f"删除附件失败: {last_error}") from exc
         if result is None or result is True or isinstance(result, dict):
             return True
         last_error = str(result)[:300]
         break
-    raise RuntimeError(f"删除附件失败: {last_error or 'unknown error'}")
+    raise UpstreamRequestError(f"删除附件失败: {last_error or 'unknown error'}")
 
 
 def stop_zai_task(state: HarState, assistant_message_id: str) -> dict[str, Any]:
@@ -3586,17 +5057,30 @@ def stop_zai_task(state: HarState, assistant_message_id: str) -> dict[str, Any]:
                 f"{BASE_URL}/api/tasks/stop/{assistant_message_id}",
                 chat_control_headers(state, with_auth=with_auth),
                 {},
+                timeout=UPSTREAM_STOP_TIMEOUT_SECONDS,
             )
         except HTTPError as exc:
             last_error = http_error_summary(exc)
+            if exc.code == 404:
+                # The task may have completed between the last SSE chunk and
+                # the user's stop click. It is already no longer running.
+                return {"status": True, "already_stopped": True}
             if exc.code in {401, 403} and not with_auth:
                 continue
-            raise RuntimeError(f"停止生成失败: {last_error}") from exc
-        if isinstance(result, dict) and coerce_bool(result.get("status"), False):
-            return result
+            raise UpstreamRequestError(f"停止生成失败: {last_error}") from exc
+        # Captured browser traffic uses both `{}` and `{status: true}` for a
+        # successful stop. HTTP 204/empty bodies are equivalent acknowledgments.
+        if result is None or result == "" or result is True:
+            return {"status": True, "empty_ack": True}
+        if isinstance(result, dict):
+            if not result:
+                return {"status": True, "empty_ack": True}
+            acknowledged = _first_body_value(result, ("status", "success", "ok"), _MISSING)
+            if acknowledged is not _MISSING and coerce_bool(acknowledged, False):
+                return {**result, "status": True}
         last_error = str(result)[:300]
         break
-    raise RuntimeError(f"停止生成失败: {last_error or 'unknown error'}")
+    raise UpstreamRequestError(f"停止生成失败: {last_error or 'unknown error'}")
 
 
 def safe_filename(name: str, fallback: str = "upload.bin") -> str:
@@ -3658,6 +5142,7 @@ def _upload_file_stream_to_zai(
     content_type: str,
     content_length: int,
     chunk_factory: Callable[[], Iterable[bytes]],
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     """Send multipart data in chunks so a local upload is never duplicated in RAM."""
     filename = safe_filename(filename)
@@ -3675,7 +5160,9 @@ def _upload_file_stream_to_zai(
     for with_auth in (False, True):
         conn: http.client.HTTPConnection | None = None
         try:
-            conn = connection_type(parsed.hostname, port=port, timeout=180)
+            if cancel_check is not None:
+                cancel_check()
+            conn = connection_type(parsed.hostname, port=port, timeout=UPSTREAM_FILE_IDLE_TIMEOUT_SECONDS)
             conn.putrequest("POST", target)
             headers = upload_file_headers(state, boundary, with_auth=with_auth)
             headers["Content-Length"] = str(total_length)
@@ -3685,15 +5172,23 @@ def _upload_file_stream_to_zai(
             conn.send(head)
             sent = 0
             for chunk in chunk_factory():
+                if cancel_check is not None:
+                    cancel_check()
                 if not chunk:
                     continue
                 sent += len(chunk)
                 conn.send(chunk)
             if sent != content_length:
                 raise RuntimeError(f"附件读取长度异常: expected {content_length}, sent {sent}")
+            if cancel_check is not None:
+                cancel_check()
             conn.send(tail)
             response = conn.getresponse()
-            text = response.read(1024 * 1024).decode("utf-8", errors="replace")
+            text = read_limited_upstream_response(
+                response,
+                MAX_UPSTREAM_UPLOAD_RESPONSE_BYTES,
+                kind="upload",
+            ).decode("utf-8", errors="replace")
             if 200 <= response.status < 300:
                 obj = json_or_none(text)
                 if isinstance(obj, dict) and obj.get("id"):
@@ -3704,13 +5199,15 @@ def _upload_file_stream_to_zai(
             if response.status in {401, 403} and not with_auth:
                 continue
             break
+        except ServiceShuttingDown:
+            raise
         except (OSError, TimeoutError, http.client.HTTPException) as exc:
             last_error = f"上传连接失败: {exc}"
             break
         finally:
             if conn is not None:
                 conn.close()
-    raise RuntimeError(f"上传文件失败: {last_error or 'unknown error'}")
+    raise UpstreamRequestError(f"上传文件失败: {last_error or 'unknown error'}")
 
 
 def upload_file_to_zai(state: HarState, filename: str, raw: bytes, content_type: str = "") -> dict[str, Any]:
@@ -3726,6 +5223,7 @@ def upload_file_path_to_zai(
     path: Path,
     filename: str = "",
     content_type: str = "",
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     path = Path(path)
     if not path.is_file():
@@ -3738,7 +5236,14 @@ def upload_file_path_to_zai(
             for chunk in iter(lambda: f.read(UPLOAD_STREAM_CHUNK_BYTES), b""):
                 yield chunk
 
-    return _upload_file_stream_to_zai(state, filename, content_type, size, file_chunks)
+    return _upload_file_stream_to_zai(
+        state,
+        filename,
+        content_type,
+        size,
+        file_chunks,
+        cancel_check=cancel_check,
+    )
 
 
 def completion_file_ref(item: dict[str, Any], user_msg_id: str) -> dict[str, Any]:
@@ -3856,7 +5361,7 @@ def new_chat(state: HarState, prompt: str, options: ChatOptions | None = None) -
         headers["X-Device-ID"] = state.device_id
     resp = http_json("POST", f"{BASE_URL}/api/v1/chats/new", headers, {"chat": chat})
     if not isinstance(resp, dict) or not resp.get("id"):
-        raise RuntimeError(f"创建 chat 失败: {str(resp)[:300]}")
+        raise UpstreamRequestError(f"创建 chat 失败: {str(resp)[:300]}")
     return str(resp["id"]), user_msg_id
 
 
@@ -3924,6 +5429,117 @@ def completion_payload(
     return payload
 
 
+def iter_upstream_chunks_with_heartbeat(
+    response: Any,
+    idle_interval_sec: float,
+) -> Iterable[bytes | None]:
+    """Read a blocking upstream body without starving downstream SSE heartbeats.
+
+    ``urllib`` blocks inside ``HTTPResponse.__iter__`` until a line arrives. A
+    bounded reader queue keeps that blocking operation off the request thread;
+    ``None`` means the upstream connection is alive but produced no bytes for
+    one heartbeat interval. Closing this iterator also closes the response to
+    unblock and retire the daemon reader after a downstream disconnect.
+    """
+
+    interval = max(0.05, float(idle_interval_sec))
+    items: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=max(1, int(UPSTREAM_READER_QUEUE_SIZE)))
+    stop = threading.Event()
+    reader_done = threading.Event()
+
+    def offer(kind: str, value: Any = None) -> bool:
+        while not stop.is_set():
+            try:
+                items.put((kind, value), timeout=min(0.1, interval))
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def read_response() -> None:
+        global _UPSTREAM_READERS_ACTIVE, _UPSTREAM_READERS_PEAK, _UPSTREAM_READERS_STARTED
+        global _UPSTREAM_READER_ERRORS_TOTAL
+        with _UPSTREAM_READER_STATS_LOCK:
+            _UPSTREAM_READERS_ACTIVE += 1
+            _UPSTREAM_READERS_STARTED += 1
+            _UPSTREAM_READERS_PEAK = max(_UPSTREAM_READERS_PEAK, _UPSTREAM_READERS_ACTIVE)
+        try:
+            for chunk in response:
+                if not offer("chunk", chunk):
+                    return
+        except BaseException as exc:
+            with _UPSTREAM_READER_STATS_LOCK:
+                _UPSTREAM_READER_ERRORS_TOTAL += 1
+            offer("error", exc)
+        finally:
+            with _UPSTREAM_READER_STATS_LOCK:
+                _UPSTREAM_READERS_ACTIVE = max(0, _UPSTREAM_READERS_ACTIVE - 1)
+            reader_done.set()
+            offer("done")
+
+    reader = threading.Thread(target=read_response, name="upstream-sse-reader", daemon=True)
+    reader.start()
+    try:
+        while True:
+            try:
+                kind, value = items.get(timeout=interval)
+            except queue.Empty:
+                global _UPSTREAM_HEARTBEATS_TOTAL
+                with _UPSTREAM_READER_STATS_LOCK:
+                    _UPSTREAM_HEARTBEATS_TOTAL += 1
+                yield None
+                continue
+            if kind == "chunk":
+                yield value
+                continue
+            if kind == "error":
+                if isinstance(value, BaseException):
+                    raise value
+                raise RuntimeError(str(value))
+            return
+    finally:
+        global _UPSTREAM_READER_FORCED_CLOSES_TOTAL
+        stop.set()
+        if not reader_done.is_set():
+            with _UPSTREAM_READER_STATS_LOCK:
+                _UPSTREAM_READER_FORCED_CLOSES_TOTAL += 1
+            close = getattr(response, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        if reader.is_alive():
+            reader.join(timeout=0.5)
+
+
+def upstream_reader_status() -> dict[str, int]:
+    """Return content-free reader health counters for status and metrics."""
+    with _UPSTREAM_READER_STATS_LOCK:
+        return {
+            "active": max(0, int(_UPSTREAM_READERS_ACTIVE)),
+            "peak": max(0, int(_UPSTREAM_READERS_PEAK)),
+            "started_total": max(0, int(_UPSTREAM_READERS_STARTED)),
+            "heartbeats_total": max(0, int(_UPSTREAM_HEARTBEATS_TOTAL)),
+            "errors_total": max(0, int(_UPSTREAM_READER_ERRORS_TOTAL)),
+            "forced_closes_total": max(0, int(_UPSTREAM_READER_FORCED_CLOSES_TOTAL)),
+            "queue_size": max(1, int(UPSTREAM_READER_QUEUE_SIZE)),
+        }
+
+
+def sse_heartbeat_status() -> dict[str, int | float]:
+    """Return content-free downstream heartbeat health counters."""
+    with _SSE_HEARTBEAT_STATS_LOCK:
+        return {
+            "active": max(0, int(_SSE_HEARTBEAT_PUMPS_ACTIVE)),
+            "peak": max(0, int(_SSE_HEARTBEAT_PUMPS_PEAK)),
+            "started_total": max(0, int(_SSE_HEARTBEAT_PUMPS_STARTED)),
+            "sent_total": max(0, int(_SSE_HEARTBEATS_SENT_TOTAL)),
+            "errors_total": max(0, int(_SSE_HEARTBEAT_ERRORS_TOTAL)),
+            "interval_seconds": max(0.0, float(SSE_KEEPALIVE_INTERVAL_SECONDS)),
+        }
+
+
 def stream_zai_completion(
     state: HarState,
     prompt: str,
@@ -3944,7 +5560,9 @@ def stream_zai_completion(
     history_ctx: dict[str, Any] | None = None,
     retry_wait_sec: float = DEFAULT_UPSTREAM_RETRY_WAIT_SEC,
     retry_attempts: int = DEFAULT_UPSTREAM_RETRY_ATTEMPTS,
+    cancel_check: Callable[[], None] | None = None,
 ) -> Any:
+    global _UPSTREAM_STREAM_INCOMPLETE_TOTAL
     options = options or ChatOptions()
     assistant_msg_id = require_uuid(assistant_msg_id, "assistant_message_id") if assistant_msg_id else str(uuid.uuid4())
     retry_attempts = max(1, int(retry_attempts))
@@ -3958,6 +5576,9 @@ def stream_zai_completion(
     # 本地请求镜像积累：phase=thinking 进 reasoning，其余进 content；重试换会话时清零。
     answer_parts: list[str] = []
     thinking_parts: list[str] = []
+    answer_chars = 0
+    thinking_chars = 0
+    stream_budget = UpstreamStreamBudget()
     # ds2api 同款两阶段镜像：流开始前落 streaming 记录（含出站消息/文件/最终 prompt），
     # 结束时更新为 success/stopped/error；客户端断开与上游失败也保留已读内容。
     # 同一 history_ctx 复用同一条记录（面板降级重试不会产生两条记录）。
@@ -4013,6 +5634,8 @@ def stream_zai_completion(
         while True:
             attempt += 1
             last_attempt = attempt >= retry_attempts
+            if cancel_check is not None:
+                cancel_check()
             if own_chat:
                 try:
                     chat_id, user_msg_id = new_chat(state, prompt, options=options)
@@ -4028,7 +5651,7 @@ def stream_zai_completion(
                             wait_sec=wait_sec,
                             error=str(exc)[:200],
                         )
-                        time.sleep(wait_sec)
+                        interruptible_wait(wait_sec, cancel_check)
                         continue
                     raise
                 log_event("upstream_chat_created", chat_id_fp=sha16(str(chat_id or "")), model=options.model, attempt=attempt)
@@ -4045,18 +5668,26 @@ def stream_zai_completion(
                         "mode": options.mode,
                     }
                 )
+            if cancel_check is not None:
+                cancel_check()
             captcha = captcha_verify_param
             if fresh_captcha_browser:
                 # 每个 attempt 重新求解：繁忙失败的那次请求可能已消费掉旧 captcha。
                 # 上游刚以 F018/F019 拒绝过验证码时强制现场重解，绝不再取可能超龄的池码。
+                captcha_kwargs: dict[str, Any] = {
+                    "timeout_ms": captcha_timeout_ms,
+                    "chrome_path": chrome_path,
+                    "headless": captcha_headless,
+                    "force_fresh": force_fresh_captcha,
+                }
+                # 保持未启用取消机制时的旧调用签名，避免破坏现有嵌入方和测试桩。
+                if cancel_check is not None:
+                    captcha_kwargs["cancel_check"] = cancel_check
                 captcha = resolve_fresh_captcha(
                     state,
                     options.model,
                     _CAPTCHA_WORKER,
-                    timeout_ms=captcha_timeout_ms,
-                    chrome_path=chrome_path,
-                    headless=captcha_headless,
-                    force_fresh=force_fresh_captcha,
+                    **captcha_kwargs,
                 )
                 log_event(
                     "fresh_captcha_ready" if captcha else "fresh_captcha_empty",
@@ -4065,6 +5696,8 @@ def stream_zai_completion(
                     **describe_captcha_verify_param(captcha),
                 )
                 force_fresh_captcha = False
+            if cancel_check is not None:
+                cancel_check()
             query, signature = query_params(state, prompt, chat_id)
             payload = completion_payload(
                 state,
@@ -4105,9 +5738,9 @@ def stream_zai_completion(
                         wait_sec=wait_sec,
                         error=summary[:200],
                     )
-                    time.sleep(wait_sec)
+                    interruptible_wait(wait_sec, cancel_check)
                     continue
-                raise RuntimeError(summary) from exc
+                raise UpstreamRequestError(summary) from exc
             except (URLError, TimeoutError, OSError) as exc:
                 log_event(
                     "upstream_connect_failed",
@@ -4116,17 +5749,38 @@ def stream_zai_completion(
                     error=str(exc)[:300],
                 )
                 raise
+            if cancel_check is not None:
+                try:
+                    cancel_check()
+                except BaseException:
+                    close_response = getattr(resp, "close", None)
+                    if callable(close_response):
+                        close_response()
+                    raise
             with resp:
                 log_event("upstream_stream_open", chat_id_fp=sha16(str(chat_id or "")), model=options.model, attempt=attempt)
                 buffer = ""
                 event_count = 0
                 stream_started = time.time()
                 retry_transient = ""
+                retry_incomplete = False
+                terminal_received = False
+                if isinstance(context_out, dict):
+                    context_out.pop("_stream_incomplete", None)
                 try:
-                    for chunk in resp:
+                    chunks = iter_upstream_chunks_with_heartbeat(
+                        resp,
+                        SSE_KEEPALIVE_INTERVAL_SECONDS,
+                    )
+                    for chunk in chunks:
+                        if cancel_check is not None:
+                            cancel_check()
+                        if chunk is None:
+                            yield UPSTREAM_IDLE_HEARTBEAT_EVENT
+                            continue
                         text = chunk.decode("utf-8", errors="replace")
                         buffer += text
-                        if len(buffer) > MAX_SSE_BUFFER_BYTES:
+                        if len(buffer.encode("utf-8")) > MAX_SSE_BUFFER_BYTES:
                             raise RuntimeError("上游 SSE 事件超过本地缓冲上限")
                         while True:
                             framed = pop_sse_event(buffer)
@@ -4136,6 +5790,9 @@ def stream_zai_completion(
                             event = event.strip()
                             if not event:
                                 continue
+                            stream_budget.observe_event(event)
+                            if is_upstream_terminal_event(event):
+                                terminal_received = True
                             error = extract_error_from_event(event)
                             if (
                                 error
@@ -4149,15 +5806,35 @@ def stream_zai_completion(
                                 break
                             delta, _phase = extract_delta_from_event(event)
                             if delta:
+                                stream_budget.observe_delta(delta)
                                 content_emitted = True
-                                (thinking_parts if _phase.lower() == "thinking" else answer_parts).append(delta)
+                                if _phase.lower() == "thinking":
+                                    thinking_chars = append_text_prefix(
+                                        thinking_parts,
+                                        delta,
+                                        thinking_chars,
+                                        HISTORY_THINKING_CHARS,
+                                    )
+                                else:
+                                    answer_chars = append_text_prefix(
+                                        answer_parts,
+                                        delta,
+                                        answer_chars,
+                                        HISTORY_ANSWER_CHARS,
+                                    )
                                 _hist_progress_tick()
                             event_count += 1
                             yield event
                         if retry_transient:
+                            close_chunks = getattr(chunks, "close", None)
+                            if callable(close_chunks):
+                                close_chunks()
                             break
                     if not retry_transient and buffer.strip():
                         event = buffer.strip()
+                        stream_budget.observe_event(event)
+                        if is_upstream_terminal_event(event):
+                            terminal_received = True
                         error = extract_error_from_event(event)
                         if (
                             error
@@ -4170,11 +5847,48 @@ def stream_zai_completion(
                         else:
                             delta, _phase = extract_delta_from_event(event)
                             if delta:
+                                stream_budget.observe_delta(delta)
                                 content_emitted = True
-                                (thinking_parts if _phase.lower() == "thinking" else answer_parts).append(delta)
+                                if _phase.lower() == "thinking":
+                                    thinking_chars = append_text_prefix(
+                                        thinking_parts,
+                                        delta,
+                                        thinking_chars,
+                                        HISTORY_THINKING_CHARS,
+                                    )
+                                else:
+                                    answer_chars = append_text_prefix(
+                                        answer_parts,
+                                        delta,
+                                        answer_chars,
+                                        HISTORY_ANSWER_CHARS,
+                                    )
                                 _hist_progress_tick()
                             event_count += 1
                             yield event
+                    if not retry_transient and not terminal_received:
+                        message = "上游中断：SSE 在完成标记前结束"
+                        with _UPSTREAM_RESPONSE_STATS_LOCK:
+                            _UPSTREAM_STREAM_INCOMPLETE_TOTAL += 1
+                        log_event(
+                            "upstream_stream_incomplete",
+                            level=logging.WARNING,
+                            chat_id_fp=sha16(str(chat_id or "")),
+                            model=options.model,
+                            attempt=attempt,
+                            max_attempts=retry_attempts,
+                            events=event_count,
+                            content_emitted=content_emitted,
+                        )
+                        if not content_emitted and not last_attempt and own_chat:
+                            retry_transient = message
+                            retry_incomplete = True
+                        else:
+                            if isinstance(context_out, dict):
+                                context_out["_stream_incomplete"] = True
+                            exc = UpstreamStreamIncomplete(message)
+                            exc.protocol_content_emitted = content_emitted
+                            raise exc
                 finally:
                     log_event(
                         "upstream_stream_done",
@@ -4185,13 +5899,20 @@ def stream_zai_completion(
                         elapsed_ms=int((time.time() - stream_started) * 1000),
                     )
                 if retry_transient:
-                    _best_effort_delete_upstream_chat(state, chat_id)
+                    _best_effort_delete_upstream_chat(
+                        state,
+                        chat_id,
+                        reason="stream_incomplete" if retry_incomplete else "retry",
+                    )
                     captcha_rejected = is_captcha_upstream_error(retry_transient)
                     if captcha_rejected:
                         # 验证码被拒（超龄/一次性已耗）：无需等待，强制下一轮现场重解。
                         force_fresh_captcha = True
                     answer_parts.clear()
                     thinking_parts.clear()
+                    answer_chars = 0
+                    thinking_chars = 0
+                    stream_budget.reset()
                     if hist_id:
                         # 重试换会话：立即清掉盘上残留的上一轮内容，不受节流限制。
                         update_history_progress(
@@ -4205,20 +5926,46 @@ def stream_zai_completion(
                         attempt=attempt,
                         max_attempts=retry_attempts,
                         wait_sec=wait_sec,
-                        reason="captcha_rejected" if captcha_rejected else "transient_busy",
+                        reason=(
+                            "captcha_rejected"
+                            if captcha_rejected
+                            else "stream_incomplete"
+                            if retry_incomplete
+                            else "transient_busy"
+                        ),
                         error=retry_transient[:200],
                     )
-                    time.sleep(wait_sec)
+                    interruptible_wait(wait_sec, cancel_check)
                     continue
-            # 成功读完整个上游流：finally 统一把镜像记录更新为 success。
+            if isinstance(context_out, dict):
+                context_out.pop("_stream_incomplete", None)
+            # 收到明确完成标记：finally 统一把镜像记录更新为 success。
             return
     except GeneratorExit:
-        # 客户端断开 / 停止生成：保留已读取的部分内容（含思维链）。
+        # 客户端断开 / 停止生成：保留已读取的部分内容（含思维链），
+        # 并清理已经创建的上游会话，避免半截 chat 留在官方历史中。
+        close_reason = str((context_out or {}).get("_stream_close_reason") or "client_disconnect")
+        if close_reason == "error":
+            hist_status = "error"
+            hist_error = str((context_out or {}).get("_stream_close_error") or "downstream stream adapter failed")[:500]
+        else:
+            hist_status = "stopped"
+            interrupted_chat_id = str((context_out or {}).get("chat_id") or chat_id or "").strip()
+            if interrupted_chat_id:
+                if isinstance(context_out, dict):
+                    context_out["_failed_cleanup_scheduled"] = True
+                _best_effort_delete_upstream_chat(
+                    state,
+                    interrupted_chat_id,
+                    reason="client_disconnect",
+                )
+        raise
+    except (BrokenPipeError, ConnectionResetError):
         hist_status = "stopped"
         raise
     except Exception as exc:
         hist_status = "error"
-        hist_error = str(exc)[:500]
+        hist_error = client_error_message(exc)[:500]
         raise
     finally:
         if hist_id:
@@ -4255,6 +6002,31 @@ def parse_sse_event(event: str) -> Any:
             data_lines.append(value[1:] if value.startswith(" ") else value)
     payload = "\n".join(data_lines).strip() if data_lines else str(event or "").strip()
     return json_or_none(payload)
+
+
+def is_upstream_terminal_event(event: str) -> bool:
+    """Recognize the two completion markers observed in official Z.ai streams."""
+    for line in str(event or "").splitlines():
+        field, separator, value = line.partition(":")
+        if separator and field.strip().lower() == "data" and value.strip() == "[DONE]":
+            return True
+    obj = parse_sse_event(event)
+    if obj == "[DONE]":
+        return True
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("done") is True:
+        return True
+    data = obj.get("data")
+    if data == "[DONE]":
+        return True
+    return isinstance(data, dict) and data.get("done") is True
+
+
+def is_sse_comment_event(event: str) -> bool:
+    """Return whether an SSE frame contains comments only (a heartbeat)."""
+    lines = [line.strip() for line in str(event or "").splitlines() if line.strip()]
+    return bool(lines) and all(line.startswith(":") for line in lines)
 
 
 def extract_delta_from_event(event: str) -> tuple[str, str]:
@@ -4342,22 +6114,378 @@ def is_retryable_upstream_error(message: str) -> bool:
     return is_transient_upstream_error(message) or is_captcha_upstream_error(message)
 
 
-def _best_effort_delete_upstream_chat(state: HarState, chat_id: str) -> None:
-    """重试前的旧会话清理：后台执行，失败只记日志，不阻断重试。"""
+def is_retryable_protocol_exception(exc: BaseException) -> bool:
+    """Only expose retryable status when no upstream semantic delta was seen."""
+    return not bool(getattr(exc, "protocol_content_emitted", False)) and is_retryable_upstream_error(str(exc))
+
+
+PENDING_DELETE_STORE_PATH = Path(__file__).with_name("pending_deletes.local.json")
+PENDING_DELETE_SCHEMA = "glm2api.pending_resource_deletes.v2"
+PENDING_DELETE_LEGACY_SCHEMA = "glm2api.pending_chat_deletes.v1"
+PENDING_DELETE_MAX_RECORDS = 256
+PENDING_DELETE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+MAX_PENDING_DELETE_STORE_BYTES = 512 * 1024
+_PENDING_DELETE_LOCK = threading.RLock()
+_PENDING_DELETE_CACHE: dict[str, dict[str, Any]] | None = None
+_PENDING_DELETE_STORE_ERROR = ""
+_PENDING_DELETE_REPLAY_LOCK = threading.Lock()
+_PENDING_DELETE_REPLAY_THREAD: threading.Thread | None = None
+_PENDING_DELETE_REPLAY_SCHEDULED = 0
+_PENDING_DELETE_REPLAY_UNMATCHED = 0
+_PENDING_DELETE_REPLAY_DEFERRED = 0
+
+
+def _normalize_pending_delete_resource(kind: str, resource_id: Any) -> tuple[str, str]:
+    kind = str(kind or "").strip().lower()
+    if kind == "chat":
+        return kind, require_uuid(resource_id, "chat_id")
+    if kind == "file":
+        return kind, require_upstream_file_id(resource_id)
+    raise ValueError("pending delete resource kind is invalid")
+
+
+def _pending_delete_record_id(account_fp: str, kind: str, resource_id: str) -> str:
+    return hashlib.sha256(f"{account_fp}:{kind}:{resource_id}".encode("utf-8")).hexdigest()[:32]
+
+
+def _pending_delete_records_locked() -> dict[str, dict[str, Any]]:
+    global _PENDING_DELETE_CACHE, _PENDING_DELETE_STORE_ERROR
+    if _PENDING_DELETE_CACHE is not None:
+        return _PENDING_DELETE_CACHE
+    records: dict[str, dict[str, Any]] = {}
+    try:
+        payload = read_json_file_limited(
+            PENDING_DELETE_STORE_PATH,
+            MAX_PENDING_DELETE_STORE_BYTES,
+            label="pending delete store",
+        )
+        if not isinstance(payload, dict) or payload.get("schema") not in {
+            PENDING_DELETE_SCHEMA,
+            PENDING_DELETE_LEGACY_SCHEMA,
+        }:
+            raise ValueError("pending delete store schema is invalid")
+        legacy = payload.get("schema") == PENDING_DELETE_LEGACY_SCHEMA
+        items = payload.get("items")
+        if not isinstance(items, list):
+            raise ValueError("pending delete store items must be a list")
+        now_ms = int(time.time() * 1000)
+        oldest_ms = now_ms - PENDING_DELETE_MAX_AGE_SECONDS * 1000
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            account_fp = str(raw.get("account_fp") or "").lower()
+            if not re.fullmatch(r"[0-9a-f]{16}", account_fp):
+                continue
+            try:
+                kind, resource_id = _normalize_pending_delete_resource(
+                    "chat" if legacy else str(raw.get("kind") or ""),
+                    raw.get("chat_id") if legacy else raw.get("resource_id"),
+                )
+            except ValueError:
+                continue
+            created_at = max(0, int(raw.get("created_at") or now_ms))
+            if created_at < oldest_ms:
+                continue
+            record_id = _pending_delete_record_id(account_fp, kind, resource_id)
+            records[record_id] = {
+                "id": record_id,
+                "account_fp": account_fp,
+                "kind": kind,
+                "resource_id": resource_id,
+                "reason": str(raw.get("reason") or "cleanup")[:80],
+                "created_at": created_at,
+                "updated_at": max(created_at, int(raw.get("updated_at") or created_at)),
+                "attempts": max(0, int(raw.get("attempts") or 0)),
+                "last_error": str(raw.get("last_error") or "")[:300],
+            }
+        if len(records) > PENDING_DELETE_MAX_RECORDS:
+            newest = sorted(
+                records.values(),
+                key=lambda item: (
+                    1 if item.get("kind") == "chat" else 0,
+                    int(item["created_at"]),
+                ),
+                reverse=True,
+            )
+            records = {item["id"]: item for item in newest[:PENDING_DELETE_MAX_RECORDS]}
+        _PENDING_DELETE_STORE_ERROR = ""
+    except FileNotFoundError:
+        _PENDING_DELETE_STORE_ERROR = ""
+    except Exception as exc:
+        _PENDING_DELETE_STORE_ERROR = client_error_message(exc, fallback="pending delete store load failed")
+        log_event("pending_delete_store_load_error", level=logging.WARNING, error=_PENDING_DELETE_STORE_ERROR)
+    _PENDING_DELETE_CACHE = records
+    return records
+
+
+def _pending_delete_persist_locked() -> bool:
+    global _PENDING_DELETE_STORE_ERROR
+    records = _pending_delete_records_locked()
+    try:
+        if not records:
+            PENDING_DELETE_STORE_PATH.unlink(missing_ok=True)
+        else:
+            payload = {
+                "schema": PENDING_DELETE_SCHEMA,
+                "updated_at": int(time.time() * 1000),
+                "items": sorted(records.values(), key=lambda item: int(item["created_at"])),
+            }
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+            atomic_write_text(
+                PENDING_DELETE_STORE_PATH,
+                ensure_utf8_size(text, MAX_PENDING_DELETE_STORE_BYTES, label="pending delete store"),
+            )
+        _PENDING_DELETE_STORE_ERROR = ""
+        return True
+    except Exception as exc:
+        _PENDING_DELETE_STORE_ERROR = client_error_message(exc, fallback="pending delete store write failed")
+        log_event("pending_delete_store_write_error", level=logging.ERROR, error=_PENDING_DELETE_STORE_ERROR)
+        return False
+
+
+def pending_resource_deletes_add(
+    state: HarState,
+    resources: Iterable[tuple[str, Any]],
+    reason: str,
+) -> list[tuple[str, str, str]]:
+    normalized: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for raw_kind, raw_id in resources:
+        try:
+            item = _normalize_pending_delete_resource(raw_kind, raw_id)
+        except ValueError:
+            log_event(
+                "pending_delete_invalid_resource",
+                level=logging.WARNING,
+                resource_kind=str(raw_kind or "")[:20],
+                resource_id_fp=sha16(str(raw_id or "")),
+            )
+            continue
+        if item not in seen:
+            normalized.append(item)
+            seen.add(item)
+    if not normalized:
+        return []
+    account_fp = sha16(state.user_id or state.token)
+    now_ms = int(time.time() * 1000)
+    added: list[tuple[str, str, str]] = []
+    with _PENDING_DELETE_LOCK:
+        records = _pending_delete_records_locked()
+        for kind, resource_id in normalized:
+            record_id = _pending_delete_record_id(account_fp, kind, resource_id)
+            previous = records.get(record_id)
+            records[record_id] = {
+                "id": record_id,
+                "account_fp": account_fp,
+                "kind": kind,
+                "resource_id": resource_id,
+                "reason": str(reason or "cleanup")[:80],
+                "created_at": int(previous.get("created_at") or now_ms) if previous else now_ms,
+                "updated_at": now_ms,
+                "attempts": max(0, int(previous.get("attempts") or 0)) if previous else 0,
+                "last_error": str(previous.get("last_error") or "")[:300] if previous else "",
+            }
+            added.append((kind, resource_id, record_id))
+        while len(records) > PENDING_DELETE_MAX_RECORDS:
+            # Chat cleanup is the primary consistency invariant. Under an
+            # extreme orphan-file flood, evict the oldest file intent first.
+            oldest = min(
+                records.values(),
+                key=lambda item: (
+                    0 if item.get("kind") == "file" else 1,
+                    int(item["created_at"]),
+                ),
+            )
+            records.pop(str(oldest["id"]), None)
+        _pending_delete_persist_locked()
+        retained = set(records)
+    return [item for item in added if item[2] in retained]
+
+
+def pending_resource_delete_add(state: HarState, kind: str, resource_id: Any, reason: str) -> str:
+    added = pending_resource_deletes_add(state, [(kind, resource_id)], reason)
+    return added[0][2] if added else ""
+
+
+def pending_chat_delete_add(state: HarState, chat_id: str, reason: str) -> str:
+    return pending_resource_delete_add(state, "chat", chat_id, reason)
+
+
+def pending_file_delete_add(state: HarState, file_id: str, reason: str) -> str:
+    return pending_resource_delete_add(state, "file", file_id, reason)
+
+
+def pending_resource_delete_failed(record_id: str, exc: BaseException) -> None:
+    with _PENDING_DELETE_LOCK:
+        record = _pending_delete_records_locked().get(str(record_id or ""))
+        if record is None:
+            return
+        record["updated_at"] = int(time.time() * 1000)
+        record["attempts"] = max(0, int(record.get("attempts") or 0)) + 1
+        record["last_error"] = client_error_message(exc, fallback=type(exc).__name__)[:300]
+        _pending_delete_persist_locked()
+
+
+def pending_resource_delete_completed(record_id: str) -> None:
+    with _PENDING_DELETE_LOCK:
+        records = _pending_delete_records_locked()
+        if records.pop(str(record_id or ""), None) is not None:
+            _pending_delete_persist_locked()
+
+
+def pending_chat_delete_status() -> dict[str, int | bool]:
+    with _PENDING_DELETE_LOCK:
+        records = _pending_delete_records_locked()
+        pending = len(records)
+        status: dict[str, int | bool] = {
+            "journal_pending": pending,
+            "journal_chat_pending": sum(1 for item in records.values() if item.get("kind") == "chat"),
+            "journal_file_pending": sum(1 for item in records.values() if item.get("kind") == "file"),
+            "journal_max_records": PENDING_DELETE_MAX_RECORDS,
+            "journal_store_max_bytes": MAX_PENDING_DELETE_STORE_BYTES,
+            "journal_store_error": bool(_PENDING_DELETE_STORE_ERROR),
+            "replay_scheduled": max(0, int(_PENDING_DELETE_REPLAY_SCHEDULED)),
+            "replay_unmatched": max(0, int(_PENDING_DELETE_REPLAY_UNMATCHED)),
+            "replay_deferred": max(0, int(_PENDING_DELETE_REPLAY_DEFERRED)),
+        }
+    with _PENDING_DELETE_REPLAY_LOCK:
+        status["replay_active"] = bool(
+            _PENDING_DELETE_REPLAY_THREAD is not None
+            and _PENDING_DELETE_REPLAY_THREAD.is_alive()
+        )
+    return status
+
+
+# Compatibility names retained for existing embedding/tests; the underlying
+# store now handles both chat and file resources.
+pending_chat_delete_failed = pending_resource_delete_failed
+pending_chat_delete_completed = pending_resource_delete_completed
+
+
+def _best_effort_delete_upstream_chat(
+    state: HarState,
+    chat_id: str,
+    *,
+    reason: str = "retry",
+) -> bool:
+    """后台清理上游会话，失败只记日志，不阻断调用方。"""
     if not chat_id:
-        return
+        return False
+
+    reason = str(reason or "retry").strip().lower() or "retry"
+    interrupted = reason in {
+        "interrupt",
+        "interrupted",
+        "client_cancel",
+        "client_disconnect",
+        "service_shutdown",
+        "stream_incomplete",
+        "stream_interrupted",
+    }
+    event_prefix = "interrupted_chat_cleanup" if interrupted else "retry_cleanup"
+    journal_id = pending_chat_delete_add(state, chat_id, reason)
+    if interrupted:
+        log_event(
+            f"{event_prefix}_scheduled",
+            chat_id_fp=sha16(chat_id),
+            reason=reason,
+        )
 
     def _work() -> None:
         try:
-            delete_zai_chat(state, chat_id)
+            delete_zai_chat(state, chat_id, cancel_check=_AUTO_DELETE_STOP.is_set)
         except Exception as exc:
+            pending_chat_delete_failed(journal_id, exc)
             log_event(
-                "retry_cleanup_delete_error",
+                f"{event_prefix}_delete_error",
                 chat_id_fp=sha16(chat_id),
                 error=str(exc)[:200],
+                reason=reason,
+            )
+            return
+        pending_chat_delete_completed(journal_id)
+        if interrupted:
+            log_event(
+                f"{event_prefix}_completed",
+                chat_id_fp=sha16(chat_id),
+                reason=reason,
             )
 
-    _submit_auto_delete(_work)
+    return _submit_auto_delete(_work, inline_on_backpressure=False)
+
+
+def _best_effort_delete_upstream_files(
+    state: HarState,
+    file_ids: Iterable[str],
+    *,
+    reason: str = "orphan_file",
+    event_prefix: str = "orphan_file_cleanup",
+    schedule_out: dict[str, Any] | None = None,
+) -> bool:
+    """Journal and asynchronously remove uploaded files without blocking a request."""
+    file_id_list: list[str] = []
+    seen: set[str] = set()
+    for value in file_ids:
+        try:
+            file_id = require_upstream_file_id(value)
+        except ValueError:
+            log_event(
+                f"{event_prefix}_invalid",
+                level=logging.WARNING,
+                file_id_fp=sha16(str(value or "")),
+            )
+            continue
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        file_id_list.append(file_id)
+    added = pending_resource_deletes_add(
+        state,
+        (("file", file_id) for file_id in file_id_list),
+        reason,
+    )
+    queued = [(resource_id, journal_id) for _kind, resource_id, journal_id in added]
+    if isinstance(schedule_out, dict):
+        schedule_out.update(
+            {
+                "validated_ids": list(file_id_list),
+                "journaled_ids": [resource_id for resource_id, _journal_id in queued],
+                "scheduled": False,
+            }
+        )
+    if not queued:
+        return False
+    log_event(f"{event_prefix}_scheduled", files=len(queued), reason=reason)
+
+    def _work() -> None:
+        for file_id, journal_id in queued:
+            try:
+                delete_zai_file(state, file_id, cancel_check=_AUTO_DELETE_STOP.is_set)
+            except Exception as exc:
+                pending_resource_delete_failed(journal_id, exc)
+                log_event(
+                    f"{event_prefix}_{'deferred' if isinstance(exc, ServiceShuttingDown) else 'error'}",
+                    file_id_fp=sha16(file_id),
+                    error=str(exc)[:200],
+                    reason=reason,
+                )
+                if isinstance(exc, ServiceShuttingDown):
+                    return
+                continue
+            pending_resource_delete_completed(journal_id)
+            log_event(f"{event_prefix}_completed", file_id_fp=sha16(file_id), reason=reason)
+
+    scheduled = _submit_auto_delete(_work, inline_on_backpressure=False)
+    if isinstance(schedule_out, dict):
+        schedule_out["scheduled"] = bool(scheduled)
+    if not scheduled:
+        log_event(
+            f"{event_prefix}_queue_failed",
+            level=logging.ERROR,
+            files=len(queued),
+            reason=reason,
+        )
+    return scheduled
 
 
 # ---------------------------------------------------------------------------
@@ -4365,19 +6493,311 @@ def _best_effort_delete_upstream_chat(state: HarState, chat_id: str) -> None:
 # ---------------------------------------------------------------------------
 _DELETE_EXECUTOR: ThreadPoolExecutor | None = None
 _DELETE_EXECUTOR_LOCK = threading.Lock()
+_DELETE_DRAINED = threading.Condition(_DELETE_EXECUTOR_LOCK)
+_DELETE_FUTURES: set[Future[Any]] = set()
+_DELETE_EXECUTOR_CLOSED = False
+_AUTO_DELETE_STOP = threading.Event()
+AUTO_DELETE_WORKERS = 2
+AUTO_DELETE_MAX_PENDING = 64
+_DELETE_PENDING = 0
+_DELETE_SUBMITTED_TOTAL = 0
+_DELETE_COMPLETED_TOTAL = 0
+_DELETE_CANCELLED_TOTAL = 0
+_DELETE_BACKPRESSURE_TOTAL = 0
 # 测试钩子：True 时删除任务在当前线程内联执行，保证测试确定性。
 _AUTO_DELETE_INLINE = False
 
 
-def _submit_auto_delete(fn: Callable[[], None]) -> None:
+def _submit_auto_delete(
+    fn: Callable[[], None],
+    *,
+    inline_on_backpressure: bool = True,
+) -> bool:
     if _AUTO_DELETE_INLINE:
         fn()
-        return
-    global _DELETE_EXECUTOR
+        return True
+    global _DELETE_EXECUTOR, _DELETE_PENDING, _DELETE_SUBMITTED_TOTAL, _DELETE_COMPLETED_TOTAL
+    global _DELETE_BACKPRESSURE_TOTAL
+    run_inline = False
+    future: Future[Any] | None = None
     with _DELETE_EXECUTOR_LOCK:
-        if _DELETE_EXECUTOR is None:
-            _DELETE_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="autodel")
-        _DELETE_EXECUTOR.submit(fn)
+        if _DELETE_EXECUTOR_CLOSED:
+            return False
+        if _DELETE_PENDING >= max(1, int(AUTO_DELETE_MAX_PENDING)):
+            _DELETE_BACKPRESSURE_TOTAL += 1
+            if inline_on_backpressure:
+                run_inline = True
+            else:
+                log_event(
+                    "auto_delete_backpressure_deferred",
+                    level=logging.WARNING,
+                    pending=_DELETE_PENDING,
+                    max_pending=AUTO_DELETE_MAX_PENDING,
+                )
+                return False
+        else:
+            if _DELETE_EXECUTOR is None:
+                _DELETE_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=AUTO_DELETE_WORKERS,
+                    thread_name_prefix="autodel",
+                )
+            _DELETE_PENDING += 1
+
+            def wrapped() -> None:
+                try:
+                    fn()
+                except Exception:
+                    # Task closures normally report upstream failures. Keep a
+                    # final guard so unexpected bugs are not buried in Future.
+                    LOG.exception("auto-delete background task failed")
+            try:
+                future = _DELETE_EXECUTOR.submit(wrapped)
+            except RuntimeError:
+                # The interpreter/service may be shutting down between the guard
+                # above and submit(). Report that cleanup was not accepted.
+                _DELETE_PENDING = max(0, _DELETE_PENDING - 1)
+                return False
+            _DELETE_FUTURES.add(future)
+            _DELETE_SUBMITTED_TOTAL += 1
+    if future is not None:
+        def completed(done: Future[Any]) -> None:
+            global _DELETE_PENDING, _DELETE_COMPLETED_TOTAL, _DELETE_CANCELLED_TOTAL
+            with _DELETE_DRAINED:
+                _DELETE_FUTURES.discard(done)
+                _DELETE_PENDING = max(0, _DELETE_PENDING - 1)
+                if done.cancelled():
+                    _DELETE_CANCELLED_TOTAL += 1
+                else:
+                    _DELETE_COMPLETED_TOTAL += 1
+                _DELETE_DRAINED.notify_all()
+
+        # Register outside _DELETE_EXECUTOR_LOCK: add_done_callback invokes
+        # synchronously when a very short task already finished.
+        future.add_done_callback(completed)
+    if run_inline:
+        # Queue saturation is exceptional. Backpressure bounds retained
+        # closures/account state while still preserving cleanup consistency.
+        log_event(
+            "auto_delete_backpressure",
+            level=logging.WARNING,
+            pending=AUTO_DELETE_MAX_PENDING,
+            max_pending=AUTO_DELETE_MAX_PENDING,
+        )
+        try:
+            fn()
+        except Exception:
+            LOG.exception("auto-delete inline fallback failed")
+            return False
+    return True
+
+
+def auto_delete_executor_status() -> dict[str, int | bool]:
+    """Return content-free queue health metrics for status/metrics endpoints."""
+    with _DELETE_EXECUTOR_LOCK:
+        max_pending = max(1, int(AUTO_DELETE_MAX_PENDING))
+        status: dict[str, int | bool] = {
+            "pending": max(0, int(_DELETE_PENDING)),
+            "max_pending": max_pending,
+            "workers": max(1, int(AUTO_DELETE_WORKERS)),
+            "saturated": _DELETE_PENDING >= max_pending,
+            "closed": bool(_DELETE_EXECUTOR_CLOSED),
+            "submitted_total": max(0, int(_DELETE_SUBMITTED_TOTAL)),
+            "completed_total": max(0, int(_DELETE_COMPLETED_TOTAL)),
+            "cancelled_total": max(0, int(_DELETE_CANCELLED_TOTAL)),
+            "backpressure_total": max(0, int(_DELETE_BACKPRESSURE_TOTAL)),
+        }
+    status.update(pending_chat_delete_status())
+    return status
+
+
+def _shutdown_auto_delete_executor(
+    timeout: float = 0.0,
+    *,
+    cancel_pending: bool = False,
+) -> dict[str, int | float | bool]:
+    """Stop cleanup intake and wait for a bounded drain when requested."""
+    global _DELETE_EXECUTOR, _DELETE_EXECUTOR_CLOSED
+    started = time.monotonic()
+    _AUTO_DELETE_STOP.set()
+    replay_stopped = _stop_pending_delete_replay(timeout=1.0)
+    with _DELETE_EXECUTOR_LOCK:
+        _DELETE_EXECUTOR_CLOSED = True
+        executor = _DELETE_EXECUTOR
+        _DELETE_EXECUTOR = None
+    if executor is not None:
+        # Journaled resource ids survive cancellation and are replayed on the next
+        # launch, so shutdown can remain bounded without losing cleanup intent.
+        executor.shutdown(wait=False, cancel_futures=False)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    if timeout > 0:
+        with _DELETE_DRAINED:
+            while _DELETE_PENDING:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                _DELETE_DRAINED.wait(timeout=remaining)
+    with _DELETE_EXECUTOR_LOCK:
+        drained = _DELETE_PENDING == 0
+    if executor is not None and not drained and cancel_pending:
+        executor.shutdown(wait=False, cancel_futures=True)
+        # Cancellation callbacks are synchronous, but briefly yield for a task
+        # that crossed from queued to running at the shutdown boundary.
+        with _DELETE_DRAINED:
+            _DELETE_DRAINED.wait_for(lambda: _DELETE_PENDING <= AUTO_DELETE_WORKERS, timeout=0.2)
+    with _DELETE_EXECUTOR_LOCK:
+        remaining = max(0, int(_DELETE_PENDING))
+    return {
+        "drained": remaining == 0,
+        "remaining": remaining,
+        "cancel_pending": bool(cancel_pending),
+        "replay_stopped": replay_stopped,
+        "elapsed_ms": int((time.monotonic() - started) * 1000),
+    }
+
+
+def _pending_delete_replay_work(record: dict[str, Any], state: HarState) -> Callable[[], None]:
+    record_id = str(record.get("id") or "")
+    kind = str(record.get("kind") or "")
+    resource_id = str(record.get("resource_id") or "")
+
+    def work() -> None:
+        try:
+            if kind == "chat":
+                delete_zai_chat(state, resource_id, cancel_check=_AUTO_DELETE_STOP.is_set)
+            elif kind == "file":
+                delete_zai_file(state, resource_id, cancel_check=_AUTO_DELETE_STOP.is_set)
+            else:
+                raise ValueError("pending delete resource kind is invalid")
+        except Exception as exc:
+            pending_resource_delete_failed(record_id, exc)
+            log_event(
+                "pending_delete_replay_error",
+                resource_kind=kind,
+                resource_id_fp=sha16(resource_id),
+                error=str(exc)[:200],
+            )
+            return
+        pending_resource_delete_completed(record_id)
+        log_event(
+            "pending_delete_replay_completed",
+            resource_kind=kind,
+            resource_id_fp=sha16(resource_id),
+        )
+
+    return work
+
+
+def _run_pending_delete_replay(entries: list[tuple[dict[str, Any], HarState]]) -> None:
+    global _PENDING_DELETE_REPLAY_THREAD, _PENDING_DELETE_REPLAY_SCHEDULED
+    global _PENDING_DELETE_REPLAY_DEFERRED
+    try:
+        for record, state in entries:
+            while not _AUTO_DELETE_STOP.is_set():
+                with _DELETE_DRAINED:
+                    while (
+                        _DELETE_PENDING >= max(1, int(AUTO_DELETE_MAX_PENDING))
+                        and not _DELETE_EXECUTOR_CLOSED
+                        and not _AUTO_DELETE_STOP.is_set()
+                    ):
+                        _DELETE_DRAINED.wait(timeout=0.25)
+                    if _DELETE_EXECUTOR_CLOSED or _AUTO_DELETE_STOP.is_set():
+                        return
+                if _submit_auto_delete(
+                    _pending_delete_replay_work(record, state),
+                    inline_on_backpressure=False,
+                ):
+                    with _PENDING_DELETE_REPLAY_LOCK:
+                        _PENDING_DELETE_REPLAY_SCHEDULED += 1
+                        _PENDING_DELETE_REPLAY_DEFERRED = max(0, _PENDING_DELETE_REPLAY_DEFERRED - 1)
+                    break
+                # Capacity may have been claimed between the condition check
+                # and submit. Wait for the next completion notification.
+                with _DELETE_DRAINED:
+                    _DELETE_DRAINED.wait(timeout=0.1)
+    finally:
+        with _PENDING_DELETE_REPLAY_LOCK:
+            if _PENDING_DELETE_REPLAY_THREAD is threading.current_thread():
+                _PENDING_DELETE_REPLAY_THREAD = None
+
+
+def _stop_pending_delete_replay(timeout: float = 1.0) -> bool:
+    with _PENDING_DELETE_REPLAY_LOCK:
+        thread = _PENDING_DELETE_REPLAY_THREAD
+    if thread is None or not thread.is_alive():
+        return True
+    with _DELETE_DRAINED:
+        _DELETE_DRAINED.notify_all()
+    thread.join(timeout=max(0.0, float(timeout)))
+    return not thread.is_alive()
+
+
+def replay_pending_deletes(profiles: dict[str, AccountProfile]) -> dict[str, int]:
+    """Resubmit every matching durable cleanup intent through a bounded feeder."""
+    global _PENDING_DELETE_REPLAY_THREAD, _PENDING_DELETE_REPLAY_SCHEDULED
+    global _PENDING_DELETE_REPLAY_UNMATCHED, _PENDING_DELETE_REPLAY_DEFERRED
+    with _PENDING_DELETE_LOCK:
+        records = [dict(item) for item in _pending_delete_records_locked().values()]
+    records.sort(
+        key=lambda item: (
+            0 if item.get("kind") == "chat" else 1,
+            int(item.get("created_at") or 0),
+        )
+    )
+    states_by_fp: dict[str, HarState] = {}
+    for profile in profiles.values():
+        account_fp = sha16(profile.state.user_id or profile.state.token)
+        states_by_fp.setdefault(account_fp, profile.state)
+    matched: list[tuple[dict[str, Any], HarState]] = []
+    unmatched = 0
+    for record in records:
+        state = states_by_fp.get(str(record.get("account_fp") or ""))
+        if state is None:
+            unmatched += 1
+            continue
+        matched.append((record, state))
+    with _PENDING_DELETE_REPLAY_LOCK:
+        existing = _PENDING_DELETE_REPLAY_THREAD
+        if existing is not None and existing.is_alive():
+            return {"retained": len(records), "scheduled": 0, "unmatched": unmatched}
+        _PENDING_DELETE_REPLAY_SCHEDULED = 0
+        _PENDING_DELETE_REPLAY_UNMATCHED = unmatched
+        _PENDING_DELETE_REPLAY_DEFERRED = len(matched)
+    scheduled = 0
+    if _AUTO_DELETE_INLINE:
+        for record, state in matched:
+            if _submit_auto_delete(
+                _pending_delete_replay_work(record, state),
+                inline_on_backpressure=False,
+            ):
+                scheduled += 1
+        with _PENDING_DELETE_REPLAY_LOCK:
+            _PENDING_DELETE_REPLAY_SCHEDULED = scheduled
+            _PENDING_DELETE_REPLAY_DEFERRED = max(0, len(matched) - scheduled)
+    elif matched:
+        thread = threading.Thread(
+            target=_run_pending_delete_replay,
+            args=(matched,),
+            name="pending-delete-replay",
+            daemon=True,
+        )
+        with _PENDING_DELETE_REPLAY_LOCK:
+            _PENDING_DELETE_REPLAY_THREAD = thread
+        thread.start()
+    if records:
+        log_event(
+            "pending_delete_replay_started",
+            retained=len(records),
+            scheduled=scheduled,
+            unmatched=unmatched,
+            deferred=max(0, len(matched) - scheduled),
+            background=not _AUTO_DELETE_INLINE,
+        )
+    return {"retained": len(records), "scheduled": scheduled, "unmatched": unmatched}
+
+
+# Old helper name remains callable for integrations built before file cleanup
+# intents shared the same durable journal.
+replay_pending_chat_deletes = replay_pending_deletes
 
 
 # ---------------------------------------------------------------------------
@@ -4394,6 +6814,8 @@ _CAPTCHA_POOL: deque[tuple[str, float]] = deque(maxlen=2)
 _CAPTCHA_POOL_LOCK = threading.Lock()
 _CAPTCHA_PREFETCHING = False
 _CAPTCHA_PREFETCH_ENABLED = True  # 测试钩子：False 时禁用后台预解
+_CAPTCHA_PREFETCH_STOP = threading.Event()
+_CAPTCHA_PREFETCH_THREAD: threading.Thread | None = None
 
 
 def _captcha_pool_take() -> str:
@@ -4409,8 +6831,13 @@ def _captcha_pool_take() -> str:
 
 def _schedule_captcha_prefetch(timeout_ms: int) -> None:
     """后台预解下一个验证码，填补被取走/消耗的名额。"""
-    global _CAPTCHA_PREFETCHING
-    if not _CAPTCHA_PREFETCH_ENABLED or not happydom_captcha_available():
+    global _CAPTCHA_PREFETCHING, _CAPTCHA_PREFETCH_THREAD
+    if (
+        not _CAPTCHA_PREFETCH_ENABLED
+        or _CAPTCHA_PREFETCH_STOP.is_set()
+        or _CAPTCHA_MODE not in {"auto", "happydom"}
+        or not happydom_captcha_available()
+    ):
         return
     with _CAPTCHA_POOL_LOCK:
         if _CAPTCHA_PREFETCHING:
@@ -4418,17 +6845,46 @@ def _schedule_captcha_prefetch(timeout_ms: int) -> None:
         _CAPTCHA_PREFETCHING = True
 
     def _work() -> None:
-        global _CAPTCHA_PREFETCHING
+        global _CAPTCHA_PREFETCHING, _CAPTCHA_PREFETCH_THREAD
+
+        def cancel_check() -> None:
+            if _CAPTCHA_PREFETCH_STOP.is_set():
+                raise ServiceShuttingDown("captcha prefetch is shutting down")
+
         try:
-            captcha = get_happydom_captcha(timeout_ms)
+            captcha = get_happydom_captcha(timeout_ms, cancel_check=cancel_check)
         except Exception:
             captcha = ""
         with _CAPTCHA_POOL_LOCK:
             _CAPTCHA_PREFETCHING = False
-            if captcha:
+            _CAPTCHA_PREFETCH_THREAD = None
+            if captcha and not _CAPTCHA_PREFETCH_STOP.is_set():
                 _CAPTCHA_POOL.append((captcha, time.monotonic()))
 
-    threading.Thread(target=_work, name="captcha-prefetch", daemon=True).start()
+    thread = threading.Thread(target=_work, name="captcha-prefetch", daemon=True)
+    with _CAPTCHA_POOL_LOCK:
+        if _CAPTCHA_PREFETCH_STOP.is_set():
+            _CAPTCHA_PREFETCHING = False
+            return
+        _CAPTCHA_PREFETCH_THREAD = thread
+    thread.start()
+
+
+def _shutdown_captcha_prefetch(timeout: float = 3.0) -> bool:
+    """Cancel the owned Node helper and wait briefly for the daemon thread."""
+    global _CAPTCHA_PREFETCHING, _CAPTCHA_PREFETCH_THREAD
+    _CAPTCHA_PREFETCH_STOP.set()
+    with _CAPTCHA_POOL_LOCK:
+        thread = _CAPTCHA_PREFETCH_THREAD
+        _CAPTCHA_POOL.clear()
+    if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+        thread.join(timeout=max(0.0, float(timeout)))
+    stopped = thread is None or not thread.is_alive()
+    if stopped:
+        with _CAPTCHA_POOL_LOCK:
+            _CAPTCHA_PREFETCHING = False
+            _CAPTCHA_PREFETCH_THREAD = None
+    return stopped
 
 
 def direct_prompt(
@@ -4452,7 +6908,7 @@ def direct_prompt(
     def cleanup_direct_chat() -> None:
         """CLI mode mirrors the web default: delete the created chat afterwards."""
         chat_id = str(context.get("chat_id") or "").strip()
-        if not options.delete_chat_after_completion or not chat_id:
+        if (not options.delete_chat_after_completion and not context.get("_stream_incomplete")) or not chat_id:
             return
         try:
             delete_zai_chat(state, chat_id)
@@ -4483,7 +6939,7 @@ def direct_prompt(
                 "user_input": prompt[:HISTORY_PROMPT_CHARS],
                 "messages": [{"role": "user", "content": prompt}],
                 "context_text": "",
-                "account": (state.user_id or "")[:8],
+                "account": state.user_id or "",
             },
         ):
             error = extract_error_from_event(event)
@@ -4572,6 +7028,10 @@ def prompt_from_openai_messages(messages: Any) -> str:
 # are used regardless of the client SDK.
 
 TOOL_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
+MAX_TOOL_DEFINITIONS = 128
+MAX_TOOL_DEFINITIONS_BYTES = 1024 * 1024
+MAX_TOOL_CALLS_PER_TURN = 64
+MAX_TOOL_ARGUMENTS_BYTES = 256 * 1024
 TOOL_JSON_WRAPPER_RE = re.compile(
     r"<glm2api_tool_calls>\s*(\{.*?\})\s*</glm2api_tool_calls\s*>",
     re.IGNORECASE | re.DOTALL,
@@ -4581,6 +7041,17 @@ TOOL_JSON_WRAPPER_RE = re.compile(
 TOOL_XML_BLOCK_RE = re.compile(
     r"<(?:\|?DSML\|?)?(?:glm2api_)?tool_calls\|?(?:\s[^>]*)?>.*?</(?:\|?DSML\|?)?(?:glm2api_)?tool_calls\|?\s*>",
     re.IGNORECASE | re.DOTALL,
+)
+CLAUDE_TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call\s*>", re.IGNORECASE | re.DOTALL)
+CLAUDE_TOOL_INPUT_CALL_RE = re.compile(
+    r"(?:^|\n)[ \t]*Tool:\s*([A-Za-z0-9_.:-]{1,128})\s*<tool_input>\s*(.*?)\s*</tool_input\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+CLAUDE_FUNCTION_CALL_BLOCK_RE = re.compile(
+    r"<function_call>\s*(.*?)\s*</function_call\s*>", re.IGNORECASE | re.DOTALL
+)
+CLAUDE_CALLING_HEADER_RE = re.compile(
+    r"\*\*Calling:\*\*\s*([A-Za-z0-9_.:-]{1,128})\s*", re.IGNORECASE
 )
 
 
@@ -4741,15 +7212,19 @@ def normalize_openai_messages_for_protocol(messages: Any) -> list[dict[str, Any]
     if not isinstance(messages, list):
         raise ValueError("messages must be a list")
     out: list[dict[str, Any]] = []
-    allowed_roles = {"system", "developer", "user", "assistant", "tool"}
+    allowed_roles = {"system", "developer", "user", "assistant", "tool", "function"}
+    pending_call_ids_by_name: dict[str, list[str]] = {}
     for index, raw in enumerate(messages):
         if not isinstance(raw, dict):
             continue
         role = str(raw.get("role") or "").strip().lower()
         if role not in allowed_roles:
             continue
+        legacy_function_result = role == "function"
         if role == "developer":
             role = "system"
+        elif role == "function":
+            role = "tool"
         text = protocol_content_text(raw.get("content")).strip()
         entry: dict[str, Any] = {"role": role, "content": text}
         if role == "assistant":
@@ -4769,9 +7244,20 @@ def normalize_openai_messages_for_protocol(messages: Any) -> list[dict[str, Any]
                     calls.append(normalized)
             if calls:
                 entry["tool_calls"] = calls
+                for call in calls:
+                    call_name = str(call.get("name") or "").strip()
+                    call_id = str(call.get("id") or "").strip()
+                    if call_name and call_id:
+                        pending_call_ids_by_name.setdefault(call_name, []).append(call_id)
         if role == "tool":
-            entry["tool_call_id"] = str(raw.get("tool_call_id") or raw.get("call_id") or "")
-            entry["name"] = str(raw.get("name") or "").strip()
+            call_id = str(raw.get("tool_call_id") or raw.get("call_id") or "").strip()
+            name = str(raw.get("name") or "").strip()
+            if not call_id and name and pending_call_ids_by_name.get(name):
+                call_id = pending_call_ids_by_name[name].pop(0)
+            if not call_id and legacy_function_result:
+                call_id = f"call_history_function_{index}"
+            entry["tool_call_id"] = call_id
+            entry["name"] = name
         if text or entry.get("reasoning_content") or entry.get("tool_calls") or role == "tool":
             out.append(entry)
     if not out:
@@ -4783,7 +7269,9 @@ def responses_input_item_to_message(item: dict[str, Any], fallback_index: int) -
     item_type = str(item.get("type") or "").strip().lower()
     if item_type == "message" or "role" in item:
         role = str(item.get("role") or "user").strip().lower()
-        if role not in {"system", "developer", "user", "assistant", "tool"}:
+        if role == "function":
+            role = "tool"
+        elif role not in {"system", "developer", "user", "assistant", "tool"}:
             role = "user"
         if role == "developer":
             role = "system"
@@ -4962,6 +7450,8 @@ def normalize_tool_definitions(raw_tools: Any, surface: str) -> list[dict[str, A
         return []
     if not isinstance(raw_tools, list):
         raise ValueError("tools must be a list")
+    if len(raw_tools) > MAX_TOOL_DEFINITIONS:
+        raise ValueError(f"tools exceeds the {MAX_TOOL_DEFINITIONS} definition limit")
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in raw_tools:
@@ -5006,6 +7496,9 @@ def normalize_tool_definitions(raw_tools: Any, surface: str) -> list[dict[str, A
                 "parameters": parameters,
             }
         )
+    definitions_bytes = json_size_bytes(out)
+    if definitions_bytes > MAX_TOOL_DEFINITIONS_BYTES:
+        raise ValueError(f"tool definitions exceed the {MAX_TOOL_DEFINITIONS_BYTES} byte limit")
     return out
 
 
@@ -5144,14 +7637,31 @@ OUTPUT_INTEGRITY_GUARD_PROMPT = (
     "produce only the correct content for the user."
 )
 CONTEXT_FILE_CACHE_TTL_SECONDS = 600
+CONTEXT_FILE_CACHE_MAX_ITEMS = 512
 _CONTEXT_FILE_CACHE: dict[tuple[str, str], tuple[dict[str, Any], float]] = {}
 _CONTEXT_FILE_CACHE_LOCK = threading.RLock()
 # 上传失败降级（对齐 ds2api 参考实现）：同一账号连续 N 次上下文文件上传失败后，
 # 在窗口期内自动回落模式 A（整段上下文进 prompt），避免连续失败触发更严风控。
 CONTEXT_UPLOAD_DEGRADE_THRESHOLD = 3
 CONTEXT_UPLOAD_DEGRADE_WINDOW_SEC = 30 * 60
+CONTEXT_UPLOAD_STATE_MAX_ITEMS = 512
 _CONTEXT_UPLOAD_FAILURES: dict[str, int] = {}
 _CONTEXT_UPLOAD_DEGRADED_UNTIL: dict[str, float] = {}
+
+
+def _cleanup_context_upload_state_locked(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else float(now)
+    for user_id, until in list(_CONTEXT_UPLOAD_DEGRADED_UNTIL.items()):
+        if now >= until:
+            _CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(user_id, None)
+            _CONTEXT_UPLOAD_FAILURES.pop(user_id, None)
+    max_items = max(1, int(CONTEXT_UPLOAD_STATE_MAX_ITEMS))
+    while len(set(_CONTEXT_UPLOAD_FAILURES) | set(_CONTEXT_UPLOAD_DEGRADED_UNTIL)) > max_items:
+        if _CONTEXT_UPLOAD_FAILURES:
+            _CONTEXT_UPLOAD_FAILURES.pop(next(iter(_CONTEXT_UPLOAD_FAILURES)), None)
+            continue
+        oldest = min(_CONTEXT_UPLOAD_DEGRADED_UNTIL, key=_CONTEXT_UPLOAD_DEGRADED_UNTIL.get)
+        _CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(oldest, None)
 
 
 def context_upload_degraded(user_id: str) -> bool:
@@ -5159,12 +7669,9 @@ def context_upload_degraded(user_id: str) -> bool:
         return False
     now = time.monotonic()
     with _CONTEXT_FILE_CACHE_LOCK:
+        _cleanup_context_upload_state_locked(now)
         until = _CONTEXT_UPLOAD_DEGRADED_UNTIL.get(user_id)
         if until is None:
-            return False
-        if now >= until:
-            _CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(user_id, None)
-            _CONTEXT_UPLOAD_FAILURES.pop(user_id, None)
             return False
         return True
 
@@ -5173,8 +7680,10 @@ def record_context_upload_failure(user_id: str) -> None:
     if not user_id:
         return
     with _CONTEXT_FILE_CACHE_LOCK:
+        _cleanup_context_upload_state_locked()
         failures = _CONTEXT_UPLOAD_FAILURES.get(user_id, 0) + 1
         if failures >= CONTEXT_UPLOAD_DEGRADE_THRESHOLD:
+            _CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(user_id, None)
             _CONTEXT_UPLOAD_DEGRADED_UNTIL[user_id] = time.monotonic() + CONTEXT_UPLOAD_DEGRADE_WINDOW_SEC
             _CONTEXT_UPLOAD_FAILURES.pop(user_id, None)
             log_event(
@@ -5185,14 +7694,17 @@ def record_context_upload_failure(user_id: str) -> None:
                 fallback="mode_a",
             )
         else:
+            _CONTEXT_UPLOAD_FAILURES.pop(user_id, None)
             _CONTEXT_UPLOAD_FAILURES[user_id] = failures
             log_event("context_upload_failure_count", user_id_fp=sha16(user_id), consecutive_failures=failures)
+        _cleanup_context_upload_state_locked()
 
 
 def record_context_upload_success(user_id: str) -> None:
     if not user_id:
         return
     with _CONTEXT_FILE_CACHE_LOCK:
+        _cleanup_context_upload_state_locked()
         _CONTEXT_UPLOAD_FAILURES.pop(user_id, None)
 
 
@@ -5367,6 +7879,13 @@ def build_tool_instruction(tools: list[dict[str, Any]], policy: ToolChoice) -> s
             "missing content. Do not repeatedly issue the same read for the absent body. Request a full-content "
             "read if the tool supports it, or inform the user that the file contents must be supplied again."
         )
+    instructions += (
+        "\n\nCompletion guard: decide for yourself whether a function is necessary. If more work is needed and a "
+        "function would advance it, invoke that function in this response instead of merely promising or "
+        "describing a future invocation. Give a tool-free response only when it directly and completely answers "
+        "the current user request; a progress update or a plan for later work is not a completed answer. When the "
+        "task is actually complete, finish normally without calling a function merely to satisfy this guard."
+    )
     if policy.mode == "required":
         instructions += "\n7) For this response, you MUST issue at least one call to a tool from the permitted list."
     elif policy.mode == "forced":
@@ -5639,12 +8158,78 @@ def build_tools_transcript(tools: list[dict[str, Any]], policy: ToolChoice | Non
     return TOOLS_TRANSCRIPT_INTRO + "\n\n" + "\n\n".join(schemas) + "\n"
 
 
+def generated_context_file_part_limit(model: str) -> int:
+    """Return the model-specific readable size for generated text files."""
+    return GLM53_CONTEXT_FILE_PART_BYTES if normalize_model(model) == DEFAULT_MODEL else MAX_CONTEXT_FILE_BYTES
+
+
+def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
+    """Split generated context below a model's per-file readable boundary.
+
+    History prefers role boundaries and tools prefer schema boundaries. A
+    single oversized block still splits at a valid UTF-8 character boundary.
+    Multipart headers carry the semantic order because uploaded filenames are
+    intentionally random.
+    """
+    text = str(text or "")
+    if not text:
+        return []
+    limit = generated_context_file_part_limit(model)
+    if len(text.encode("utf-8")) <= limit:
+        return [text]
+    payload_limit = limit - CONTEXT_FILE_PART_HEADER_RESERVE_BYTES
+    if payload_limit <= 0:
+        raise ValueError("generated context part limit is too small")
+    delimiters = (
+        ("\n\n[system]\n", "\n\n[user]\n", "\n\n[assistant]\n", "\n\n[tool]\n")
+        if kind == "history"
+        else ("\n\nname:",)
+    )
+    payloads: list[str] = []
+    remaining = text
+    while remaining:
+        raw = remaining.encode("utf-8")
+        if len(raw) <= payload_limit:
+            payloads.append(remaining)
+            break
+        prefix = raw[:payload_limit].decode("utf-8", errors="ignore")
+        cut = len(prefix)
+        preferred = max((prefix.rfind(delimiter) for delimiter in delimiters), default=-1)
+        if preferred >= len(prefix) // 2:
+            # Consume the separating newlines while leaving the next semantic
+            # block's opening token at the start of the following part.
+            cut = preferred + 2
+        if cut <= 0:
+            raise ValueError("unable to split generated context at a UTF-8 boundary")
+        payloads.append(remaining[:cut])
+        remaining = remaining[cut:]
+
+    total = len(payloads)
+    label = "conversation history" if kind == "history" else "function definitions"
+    parts: list[str] = []
+    for index, payload in enumerate(payloads, start=1):
+        header = (
+            f"[glm2api {label} segment {index}/{total}]\n"
+            f"This is segment {index} of {total}. Read every {label} segment in numeric header order; "
+            "the random filename does not define order.\n\n"
+        )
+        part = header + payload
+        if len(part.encode("utf-8")) > limit:
+            raise ValueError("generated context segment exceeds its model-specific byte limit")
+        parts.append(part)
+    return parts
+
+
 def current_input_file_prompt(has_tools_file: bool) -> str:
     prompt = "The attached file holds the earlier conversation. Read it and respond to the most recent user request directly."
+    prompt += (
+        " The conversation may be split across multiple attachments; when segment headers are present, read every "
+        "segment in numeric header order before answering."
+    )
     if has_tools_file:
         prompt += (
-            " The other attached file enumerates the available function definitions and parameter contracts; "
-            "use only those tools and adhere to the function-call contract described below."
+            " The other attached file or files enumerate the available function definitions and parameter contracts; "
+            "read every numbered segment, use only those tools, and adhere to the function-call contract described below."
         )
     return prompt
 
@@ -5819,24 +8404,59 @@ def normalize_anthropic_messages_request(body: dict[str, Any], include_thinking_
     )
 
 
-def strip_markdown_fenced_blocks(text: str) -> str:
-    """Exclude Markdown examples from tool detection without rewriting prose."""
+def _protect_markdown_fenced_blocks(text: str) -> tuple[str, list[str]]:
+    """Replace complete or truncated fenced blocks with stable sentinels.
+
+    A line-oriented scanner handles both backtick and tilde fences, embedded
+    backticks inside a fence, and an unclosed final fence. Regex-only matching
+    used to expose tags after an embedded backtick or inside ``~~~`` examples.
+    """
+    text = str(text or "")
     if "```" not in text and "~~~" not in text:
-        return text
-    kept: list[str] = []
-    active_marker = ""
+        return text, []
+    out: list[str] = []
+    stashed: list[str] = []
+    fenced: list[str] | None = None
+    marker_char = ""
+    marker_length = 0
     for line in text.splitlines(keepends=True):
         trimmed = line.lstrip()
-        if not active_marker:
-            marker = "```" if trimmed.startswith("```") else "~~~" if trimmed.startswith("~~~") else ""
-            if marker:
-                active_marker = marker[0]
+        if fenced is None:
+            opening = re.match(r"(`{3,}|~{3,})", trimmed)
+            if opening is None:
+                out.append(line)
                 continue
-            kept.append(line)
+            marker = opening.group(1)
+            marker_char = marker[0]
+            marker_length = len(marker)
+            fenced = [line]
             continue
-        if trimmed.startswith(active_marker * 3):
-            active_marker = ""
-    return "".join(kept)
+        fenced.append(line)
+        closing = rf"{re.escape(marker_char)}{{{marker_length},}}\s*$"
+        if re.match(closing, trimmed.rstrip("\r\n")):
+            stashed.append("".join(fenced))
+            out.append(f"\x00GLM2API_FENCE_{len(stashed) - 1}\x00")
+            fenced = None
+            marker_char = ""
+            marker_length = 0
+    if fenced is not None:
+        stashed.append("".join(fenced))
+        out.append(f"\x00GLM2API_FENCE_{len(stashed) - 1}\x00")
+    return "".join(out), stashed
+
+
+def _restore_markdown_fenced_blocks(text: str, stashed: list[str]) -> str:
+    for index, fence in enumerate(stashed):
+        text = text.replace(f"\x00GLM2API_FENCE_{index}\x00", fence)
+    return text
+
+
+def strip_markdown_fenced_blocks(text: str) -> str:
+    """Exclude Markdown examples from tool detection without rewriting prose."""
+    protected, stashed = _protect_markdown_fenced_blocks(text)
+    for index in range(len(stashed)):
+        protected = protected.replace(f"\x00GLM2API_FENCE_{index}\x00", "")
+    return protected
 
 
 def canonicalize_dsml_tool_markup(markup: str) -> str:
@@ -5847,6 +8467,10 @@ def canonicalize_dsml_tool_markup(markup: str) -> str:
             {
                 "＜": "<",
                 "＞": ">",
+                "〈": "<",
+                "〉": ">",
+                "﹤": "<",
+                "﹥": ">",
                 "｜": "|",
                 "／": "/",
                 "＝": "=",
@@ -5858,16 +8482,17 @@ def canonicalize_dsml_tool_markup(markup: str) -> str:
             }
         )
     )
-    # 实测上游偶尔把关闭标签写成 `<||DSML|invoke>`（双竖杠无斜杠）， 这里统一
-    # 容忍每侧 0-3 个竖杠并把 DSML 前缀剥掉，ElementTree/兜底正则才能继续解析。
+    # 实测上游会漂移 DSML 分隔符、下划线和大小写，甚至把前缀与本地名黏连。
+    # 仅在标签壳内接受这些变体，避免改写参数正文中的普通标点。
     pattern = re.compile(
-        r"<\s*(/?)\s*(?:\|{0,3}DSML\|{0,3}\s*)?(tool_calls|invoke|parameter)([^>]*?)\|{0,3}>",
+        r"<\s*(/?)\s*(?:[|!！、\x02]{0,3}\s*DSML\s*[|!！、\x02]{0,3}\s*)?"
+        r"(tool_?calls|invoke|parameter)([^>]*?)[|!！、\x02]{0,3}>",
         re.IGNORECASE,
     )
 
     def replace(match: re.Match[str]) -> str:
         slash = match.group(1)
-        tag = match.group(2).lower()
+        tag = match.group(2).lower().replace("toolcalls", "tool_calls")
         tail = match.group(3)
         if "DSML" in match.group(0).upper() and not slash and tag in {"invoke", "parameter"} and "=" not in tail:
             # 上游偶尔把关闭标签写成无斜杠的 `<||DSML|invoke>`；DSML 风格的
@@ -5917,24 +8542,74 @@ def _xml_tool_value(node: ElementTree.Element) -> Any:
     return _repair_tool_path_controls(parsed) if valid else parsed
 
 
+def _normalize_emitted_tool_arguments(
+    raw_arguments: Any,
+    tool: dict[str, Any],
+    *,
+    strict: bool,
+) -> dict[str, Any]:
+    if not strict:
+        return coerce_tool_arguments_to_schema(as_json_object(raw_arguments), tool)
+    schema = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    if isinstance(raw_arguments, dict):
+        arguments = _repair_tool_path_controls(dict(raw_arguments))
+    elif raw_arguments is None:
+        arguments = {}
+    else:
+        parsed = raw_arguments
+        valid = False
+        if isinstance(raw_arguments, str):
+            parsed, valid = _parse_tool_json_value(raw_arguments)
+        if valid and isinstance(parsed, dict):
+            arguments = _repair_tool_path_controls(parsed)
+        elif "input" in properties or not properties:
+            arguments = {"input": _repair_tool_path_controls(parsed if valid else raw_arguments)}
+        else:
+            raise ToolCallFormatError("工具 arguments 不是可转换的 JSON 对象")
+    arguments = coerce_tool_arguments_to_schema(arguments, tool)
+    required = [str(name) for name in (schema.get("required") or []) if str(name)]
+    missing = [
+        name
+        for name in required
+        if name not in arguments or (isinstance(arguments.get(name), str) and not arguments[name].strip())
+    ]
+    if missing:
+        raise ToolCallFormatError(f"工具 arguments 缺少必填字段: {', '.join(missing[:8])}")
+    arguments_bytes = json_size_bytes(arguments)
+    if arguments_bytes > MAX_TOOL_ARGUMENTS_BYTES:
+        raise ToolCallFormatError(f"工具 arguments 超过 {MAX_TOOL_ARGUMENTS_BYTES} 字节限制")
+    return arguments
+
+
 def normalize_tool_call_candidates(
     raw_calls: Any,
     tools: list[dict[str, Any]],
     policy: ToolChoice,
     id_prefix: str = "call_",
+    *,
+    strict: bool = False,
 ) -> list[ToolCall]:
     if not isinstance(raw_calls, list) or policy.mode == "none":
         return []
+    if strict and len(raw_calls) > MAX_TOOL_CALLS_PER_TURN:
+        raise ToolCallFormatError(f"单轮工具调用超过 {MAX_TOOL_CALLS_PER_TURN} 个限制")
     tools_by_name = {str(tool["name"]): tool for tool in tools_allowed_by_policy(tools, policy)}
     allowed = set(tools_by_name)
     out: list[ToolCall] = []
     for raw in raw_calls:
         if not isinstance(raw, dict):
+            if strict:
+                raise ToolCallFormatError("工具调用条目不是 JSON 对象")
             continue
         name = str(raw.get("name") or "").strip()
         if name not in allowed:
+            if strict:
+                raise ToolCallFormatError(f"工具调用引用了未声明或被策略禁止的工具: {name or '<empty>'}")
             continue
         if policy.mode == "forced" and name != policy.forced_name:
+            if strict:
+                raise ToolCallFormatError(f"工具调用未使用强制工具: {policy.forced_name}")
             continue
         arguments = raw.get("arguments") if "arguments" in raw else raw.get("input")
         out.append(
@@ -5943,11 +8618,14 @@ def normalize_tool_call_candidates(
                 # 24-char id body keep strict SDK validation happy.
                 id=id_prefix + uuid.uuid4().hex[:24],
                 name=name,
-                arguments=coerce_tool_arguments_to_schema(as_json_object(arguments), tools_by_name[name]),
+                arguments=_normalize_emitted_tool_arguments(arguments, tools_by_name[name], strict=strict),
             )
         )
+    if strict and policy.disable_parallel and len(out) > 1:
+        raise ToolCallFormatError("客户端已禁用并行工具调用，但上游返回了多个调用")
     # A forced choice means exactly one invocation of that function, even if
-    # the model repeats the block or the client otherwise permits parallelism.
+    # the model repeats the block. The non-strict helper retains its historical
+    # first-call behavior for transcript normalization and direct callers.
     if (policy.disable_parallel or policy.mode == "forced") and out:
         return out[:1]
     return out
@@ -5987,12 +8665,12 @@ def parse_xml_tool_calls(
                 arguments[param_name] = _repair_tool_path_controls(parsed) if valid else parsed
             raw_calls.append({"name": name, "arguments": arguments})
         if raw_calls:
-            return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix)
+            return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix, strict=True)
         return []
     raw_calls: list[dict[str, Any]] = []
     for invoke in root.findall(".//invoke"):
         name = str(invoke.attrib.get("name") or "").strip()
-        arguments: dict[str, Any] = {}
+        arguments: Any = {}
         for parameter in invoke.findall("./parameter"):
             param_name = str(parameter.attrib.get("name") or "").strip()
             if not param_name:
@@ -6001,9 +8679,159 @@ def parse_xml_tool_calls(
         if not arguments:
             arguments_node = invoke.find("./arguments")
             if arguments_node is not None:
-                arguments = as_json_object("".join(arguments_node.itertext()).strip())
+                arguments = "".join(arguments_node.itertext()).strip()
         raw_calls.append({"name": name, "arguments": arguments})
-    return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix)
+    return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix, strict=True)
+
+
+def _tool_value_contains_placeholder(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().upper() in {"...", "FUNCTION_NAME", "ARG_NAME", "VALUE"}
+    if isinstance(value, dict):
+        return any(_tool_value_contains_placeholder(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_tool_value_contains_placeholder(item) for item in value)
+    return False
+
+
+def _decode_claude_tool_argument(raw: str) -> Any:
+    text = html.unescape(str(raw or "").strip())
+    parsed, valid = _parse_tool_json_value(text)
+    return _repair_tool_path_controls(parsed) if valid else text
+
+
+def _legacy_claude_tool_call(body: str) -> dict[str, Any] | None:
+    """Parse Claude Code's observed ``<tool_call>`` arg_key/arg_value form.
+
+    Real GLM output has also omitted the opening ``<arg_key>`` on later
+    arguments while retaining ``</arg_key>``. Pairing each arg_value with the
+    nearest preceding key accepts that narrow drift without guessing fields.
+    """
+    name_match = re.match(r"\s*([A-Za-z0-9_.:-]{1,128})", str(body or ""))
+    if name_match is None:
+        return None
+    name = name_match.group(1)
+    tail = str(body or "")[name_match.end() :]
+    arguments: dict[str, Any] = {}
+    value_matches = list(re.finditer(r"<arg_value>\s*(.*?)\s*</arg_value\s*>", tail, re.IGNORECASE | re.DOTALL))
+    previous_end = 0
+    for value_match in value_matches:
+        prefix = tail[previous_end : value_match.start()]
+        key_match = re.search(
+            r"(?:<arg_key>\s*)?([A-Za-z_][A-Za-z0-9_.:-]*)\s*</arg_key\s*>\s*$",
+            prefix,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if key_match is None:
+            return None
+        arguments[key_match.group(1)] = _decode_claude_tool_argument(value_match.group(1))
+        previous_end = value_match.end()
+    if not value_matches:
+        remainder = tail.strip()
+        if remainder:
+            parsed, valid = _parse_tool_json_value(remainder)
+            if not valid or not isinstance(parsed, dict):
+                return None
+            arguments = _repair_tool_path_controls(parsed)
+    elif re.sub(r"\s+", "", tail[previous_end:]):
+        return None
+    return {"name": name, "arguments": arguments}
+
+
+def _balanced_json_object(text: str, start: int) -> tuple[str, int] | None:
+    position = start
+    while position < len(text) and text[position].isspace():
+        position += 1
+    if position >= len(text) or text[position] != "{":
+        return None
+    depth = 0
+    quote = ""
+    escaped = False
+    for index in range(position, len(text)):
+        char = text[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {'"', "'"}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[position : index + 1], index + 1
+    return None
+
+
+def _claude_style_tool_call_candidates(text: str) -> list[tuple[int, int, str, dict[str, Any]]]:
+    """Return executable-looking Claude-style calls with their source spans."""
+    text = str(text or "")
+    candidates: list[tuple[int, int, str, dict[str, Any]]] = []
+    for match in CLAUDE_TOOL_CALL_BLOCK_RE.finditer(text):
+        raw_call = _legacy_claude_tool_call(match.group(1))
+        if raw_call is not None:
+            candidates.append((match.start(), match.end(), match.group(0), raw_call))
+    for match in CLAUDE_TOOL_INPUT_CALL_RE.finditer(text):
+        parsed, valid = _parse_tool_json_value(match.group(2))
+        if valid and isinstance(parsed, dict):
+            candidates.append(
+                (
+                    match.start(),
+                    match.end(),
+                    match.group(0),
+                    {"name": match.group(1), "arguments": _repair_tool_path_controls(parsed)},
+                )
+            )
+    for match in CLAUDE_FUNCTION_CALL_BLOCK_RE.finditer(text):
+        parsed, valid = _parse_tool_json_value(match.group(1))
+        if not valid or not isinstance(parsed, dict):
+            continue
+        name = str(parsed.get("name") or "").strip()
+        arguments = parsed.get("arguments") if "arguments" in parsed else parsed.get("input")
+        if name and isinstance(arguments, dict):
+            candidates.append(
+                (
+                    match.start(),
+                    match.end(),
+                    match.group(0),
+                    {"name": name, "arguments": _repair_tool_path_controls(arguments)},
+                )
+            )
+    for match in CLAUDE_CALLING_HEADER_RE.finditer(text):
+        located = _balanced_json_object(text, match.end())
+        if located is None:
+            continue
+        raw_json, end = located
+        parsed, valid = _parse_tool_json_value(raw_json)
+        if valid and isinstance(parsed, dict):
+            candidates.append(
+                (
+                    match.start(),
+                    end,
+                    text[match.start() : end],
+                    {"name": match.group(1), "arguments": _repair_tool_path_controls(parsed)},
+                )
+            )
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates
+
+
+def parse_claude_style_tool_calls(
+    text: str,
+    tools: list[dict[str, Any]],
+    policy: ToolChoice,
+    id_prefix: str = "call_",
+) -> list[ToolCall]:
+    candidates = _claude_style_tool_call_candidates(text)
+    if any(_tool_value_contains_placeholder(raw_call) for _start, _end, _block, raw_call in candidates):
+        raise ToolCallFormatError("工具调用仍包含模板占位符")
+    raw_calls = [raw_call for _start, _end, _block, raw_call in candidates]
+    return normalize_tool_call_candidates(raw_calls, tools, policy, id_prefix=id_prefix, strict=True)
 
 
 def parse_tool_calls_from_output(
@@ -6019,13 +8847,30 @@ def parse_tool_calls_from_output(
         return []
     matches = list(TOOL_JSON_WRAPPER_RE.finditer(visible_for_parse))
     if matches:
-        parsed = json_or_none(matches[-1].group(1))
-        if isinstance(parsed, dict):
+        combined_calls: list[Any] = []
+        for match in matches:
+            parsed = json_or_none(match.group(1))
+            if not isinstance(parsed, dict):
+                raise ToolCallFormatError("工具调用 JSON wrapper 无法解析")
             calls = parsed.get("tool_calls") if "tool_calls" in parsed else parsed.get("calls")
-            result = normalize_tool_call_candidates(calls, tools, policy, id_prefix=id_prefix)
-            if result:
-                return result
+            if calls is None and parsed.get("name"):
+                calls = [parsed]
+            if not isinstance(calls, list):
+                raise ToolCallFormatError("工具调用 JSON wrapper 缺少 tool_calls 数组")
+            combined_calls.extend(calls)
+        result = normalize_tool_call_candidates(
+            combined_calls,
+            tools,
+            policy,
+            id_prefix=id_prefix,
+            strict=True,
+        )
+        if result:
+            return result
     result = parse_xml_tool_calls(visible_for_parse, tools, policy, id_prefix=id_prefix)
+    if result:
+        return result
+    result = parse_claude_style_tool_calls(visible_for_parse, tools, policy, id_prefix=id_prefix)
     if result:
         return result
     if visible_for_parse.startswith("{") and visible_for_parse.endswith("}"):
@@ -6034,7 +8879,7 @@ def parse_tool_calls_from_output(
             calls = parsed.get("tool_calls") if "tool_calls" in parsed else parsed.get("calls")
             if calls is None and parsed.get("name"):
                 calls = [parsed]
-            return normalize_tool_call_candidates(calls, tools, policy, id_prefix=id_prefix)
+            return normalize_tool_call_candidates(calls, tools, policy, id_prefix=id_prefix, strict=True)
     return []
 
 
@@ -6043,6 +8888,9 @@ def tool_markup_attempted(text: str) -> bool:
     return bool(
         re.search(r"<\s*/?\s*(?:glm2api_)?tool_calls\b", visible, re.IGNORECASE)
         or re.search(r"<\s*/?\s*(?:invoke|parameter)\b", visible, re.IGNORECASE)
+        or re.search(r"<\s*/?\s*(?:tool_call|tool_input|function_call|arg_key|arg_value)\b", visible, re.IGNORECASE)
+        or re.search(r"(?:^|\n)\s*Tool:\s*[A-Za-z0-9_.:-]+\s*<tool_input>", visible, re.IGNORECASE)
+        or CLAUDE_CALLING_HEADER_RE.search(visible)
     )
 
 
@@ -6054,17 +8902,19 @@ def protocol_request_with_tool_retry_hint(request: ProtocolRequest, error: str) 
     allowed_names = [tool["name"] for tool in tools_allowed_by_policy(request.tools, request.tool_choice)]
     hint = (
         "Tool-call correction: the previous attempt could not be converted by the client "
-        f"({error[:180]}). Emit one complete DSML tool_calls block using only these names: "
-        f"{', '.join(allowed_names)}. Follow the declared parameter schema exactly; do not explain the correction."
+        f"({error[:180]}). Decide again for yourself whether a tool is needed. If it is, put one complete raw "
+        f"DSML tool_calls block in the visible final answer using only these names: {', '.join(allowed_names)}. "
+        "Do not leave the executable block only in reasoning/thinking, and do not end with a status update or a "
+        "plan for future tool use. Follow the declared parameter schema exactly. If no tool is needed, return the "
+        "complete answer rather than discussing this correction. A completed task should end with its normal final "
+        "answer and does not need a ceremonial tool call."
     )
     return replace(
         request,
         context_text=request.context_text.rstrip() + "\n\n" + hint + "\n",
         execution_prompt=request.execution_prompt.rstrip() + "\n\n" + hint,
+        tool_retry_active=True,
     )
-
-
-CODE_FENCE_RE = re.compile(r"```[^`]*```", re.DOTALL)
 
 
 def strip_parsed_tool_markup(text: str) -> str:
@@ -6075,16 +8925,18 @@ def strip_parsed_tool_markup(text: str) -> str:
     latter while keeping the former prevents both leakage and corrupted
     examples in the answer.
     """
-    stashed: list[str] = []
-
-    def stash(match: re.Match[str]) -> str:
-        stashed.append(match.group(0))
-        return f"\x00GLM2API_FENCE_{len(stashed) - 1}\x00"
-
-    protected = CODE_FENCE_RE.sub(stash, str(text))
+    protected, stashed = _protect_markdown_fenced_blocks(str(text))
     protected = canonicalize_dsml_tool_markup(protected)
     protected = TOOL_JSON_WRAPPER_RE.sub("", protected)
     protected = TOOL_XML_BLOCK_RE.sub("", protected)
+    protected = CLAUDE_TOOL_CALL_BLOCK_RE.sub("", protected)
+    protected = CLAUDE_TOOL_INPUT_CALL_RE.sub("", protected)
+    protected = CLAUDE_FUNCTION_CALL_BLOCK_RE.sub("", protected)
+    # ``**Calling:** name`` has no closing tag; remove only spans whose
+    # following object is structurally complete, leaving ordinary prose alone.
+    for start, end, _block, _raw_call in reversed(_claude_style_tool_call_candidates(protected)):
+        if protected[start:end].lstrip().lower().startswith("**calling:**"):
+            protected = protected[:start] + protected[end:]
     # A complete invoke with a missing outer close is now parseable; remove
     # that entire semantic block instead of leaking its argument values beside
     # the native tool call returned to the client.
@@ -6111,9 +8963,7 @@ def strip_parsed_tool_markup(text: str) -> str:
         protected,
         flags=re.IGNORECASE,
     )
-    for index, fence in enumerate(stashed):
-        protected = protected.replace(f"\x00GLM2API_FENCE_{index}\x00", fence)
-    return protected.strip()
+    return _restore_markdown_fenced_blocks(protected, stashed).strip()
 
 
 def estimate_protocol_tokens(text: str) -> int:
@@ -6137,19 +8987,17 @@ def tool_call_id_prefix(surface: str) -> str:
 def finalize_protocol_turn(request: ProtocolRequest, text: str, thinking: str) -> ProtocolTurn:
     id_prefix = tool_call_id_prefix(request.surface)
     tool_calls = parse_tool_calls_from_output(text, request.tools, request.tool_choice, id_prefix=id_prefix)
-    # Thinking fallback: when the answer carries no call, look in the thinking
-    # stream. Auto mode only does this when there is no text at all (the model
-    # likely put the call there), while required/forced modes also try it with
-    # prose present so a misplaced call does not fail the whole turn.
-    fallback_to_thinking = bool(thinking.strip()) and (
-        not text.strip() or request.tool_choice.mode in {"required", "forced"}
-    )
+    # In auto mode the visible final channel is authoritative: no emitted call
+    # means a normal tool-free completion. Only an explicitly required/forced
+    # policy may recover a misplaced call from thinking.
+    fallback_to_thinking = bool(thinking.strip()) and request.tool_choice.mode in {"required", "forced"}
     calls_source = "output"
     if not tool_calls and fallback_to_thinking:
         tool_calls = parse_tool_calls_from_output(thinking, request.tools, request.tool_choice, id_prefix=id_prefix)
         calls_source = "thinking"
     if not tool_calls and request.tools and (
-        tool_markup_attempted(text) or (fallback_to_thinking and tool_markup_attempted(thinking))
+        tool_markup_attempted(text)
+        or (fallback_to_thinking and tool_markup_attempted(thinking))
     ):
         raise ToolCallFormatError("上游输出了工具调用标记，但其名称或参数格式无法转换")
     if request.tool_choice.mode in {"required", "forced"} and not tool_calls:
@@ -6172,6 +9020,7 @@ def finalize_protocol_turn(request: ProtocolRequest, text: str, thinking: str) -
         tool_calls=tool_calls,
         input_tokens=estimate_protocol_tokens(request.context_text),
         output_tokens=estimate_protocol_tokens(text) + estimate_protocol_tokens(thinking),
+        tool_calls_source=calls_source if tool_calls else "",
     )
 
 
@@ -6184,6 +9033,16 @@ def make_random_short_filename() -> str:
     return f"{seed}.txt"
 
 
+def _cleanup_context_file_cache_locked(now: float | None = None) -> None:
+    now = time.monotonic() if now is None else float(now)
+    for key, (_ref, uploaded_at) in list(_CONTEXT_FILE_CACHE.items()):
+        if now - uploaded_at > CONTEXT_FILE_CACHE_TTL_SECONDS:
+            _CONTEXT_FILE_CACHE.pop(key, None)
+    max_items = max(1, int(CONTEXT_FILE_CACHE_MAX_ITEMS))
+    while len(_CONTEXT_FILE_CACHE) > max_items:
+        _CONTEXT_FILE_CACHE.pop(next(iter(_CONTEXT_FILE_CACHE)), None)
+
+
 def _context_file_cache_lookup(state: HarState, text: str) -> dict[str, Any] | None:
     """Reuse a previously uploaded file id for the same account + content (TTL)."""
     if not state.user_id:
@@ -6191,13 +9050,15 @@ def _context_file_cache_lookup(state: HarState, text: str) -> dict[str, Any] | N
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     now = time.monotonic()
     with _CONTEXT_FILE_CACHE_LOCK:
-        item = _CONTEXT_FILE_CACHE.get((state.user_id, digest))
+        _cleanup_context_file_cache_locked(now)
+        key = (state.user_id, digest)
+        item = _CONTEXT_FILE_CACHE.pop(key, None)
         if item is None:
             return None
         ref, uploaded_at = item
-        if now - uploaded_at > CONTEXT_FILE_CACHE_TTL_SECONDS:
-            _CONTEXT_FILE_CACHE.pop((state.user_id, digest), None)
-            return None
+        # Reinsert without refreshing uploaded_at: LRU order changes, remote
+        # file age does not.
+        _CONTEXT_FILE_CACHE[key] = (ref, uploaded_at)
         return copy.deepcopy(ref)
 
 
@@ -6206,10 +9067,38 @@ def _context_file_cache_store(state: HarState, text: str, ref: dict[str, Any]) -
         return
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     with _CONTEXT_FILE_CACHE_LOCK:
-        _CONTEXT_FILE_CACHE[(state.user_id, digest)] = (copy.deepcopy(ref), time.monotonic())
-        if len(_CONTEXT_FILE_CACHE) > 512:
-            for key in list(_CONTEXT_FILE_CACHE)[:128]:
-                _CONTEXT_FILE_CACHE.pop(key, None)
+        now = time.monotonic()
+        _cleanup_context_file_cache_locked(now)
+        key = (state.user_id, digest)
+        _CONTEXT_FILE_CACHE.pop(key, None)
+        _CONTEXT_FILE_CACHE[key] = (copy.deepcopy(ref), now)
+        _cleanup_context_file_cache_locked(now)
+
+
+def context_cache_status() -> dict[str, int]:
+    """Return content-free attachment-cache and degradation-state health."""
+    with _CONTEXT_FILE_CACHE_LOCK:
+        now = time.monotonic()
+        _cleanup_context_file_cache_locked(now)
+        _cleanup_context_upload_state_locked(now)
+        cached_bytes = 0
+        for ref, _uploaded_at in _CONTEXT_FILE_CACHE.values():
+            file_obj = ref.get("file") if isinstance(ref.get("file"), dict) else ref
+            meta = file_obj.get("meta") if isinstance(file_obj.get("meta"), dict) else {}
+            try:
+                cached_bytes += max(0, int(meta.get("size") or file_obj.get("size") or 0))
+            except (TypeError, ValueError):
+                continue
+        return {
+            "items": len(_CONTEXT_FILE_CACHE),
+            "bytes": cached_bytes,
+            "max_items": max(1, int(CONTEXT_FILE_CACHE_MAX_ITEMS)),
+            "ttl_seconds": max(0, int(CONTEXT_FILE_CACHE_TTL_SECONDS)),
+            "failure_states": len(_CONTEXT_UPLOAD_FAILURES),
+            "degraded_states": len(_CONTEXT_UPLOAD_DEGRADED_UNTIL),
+            "max_state_items": max(1, int(CONTEXT_UPLOAD_STATE_MAX_ITEMS)),
+            "degrade_window_seconds": max(0, int(CONTEXT_UPLOAD_DEGRADE_WINDOW_SEC)),
+        }
 
 
 def upload_context_package_to_zai(state: HarState, context_text: str, filename: str | None = None, label: str = "") -> dict[str, Any]:
@@ -6284,7 +9173,13 @@ def apply_output_integrity_guard(
     return OUTPUT_INTEGRITY_GUARD_PROMPT + "\n\n" + prompt
 
 
-def _context_file_trace_item(kind: str, ref: dict[str, Any], content: str) -> dict[str, Any]:
+def _context_file_trace_item(
+    kind: str,
+    ref: dict[str, Any],
+    content: str,
+    part: int = 1,
+    parts: int = 1,
+) -> dict[str, Any]:
     metadata = history_files_snapshot([ref])
     file_meta = metadata[0] if metadata else {}
     return {
@@ -6293,6 +9188,8 @@ def _context_file_trace_item(kind: str, ref: dict[str, Any], content: str) -> di
         "size": int(file_meta.get("size") or len(content.encode("utf-8"))),
         "content_type": str(file_meta.get("content_type") or "text/plain; charset=utf-8"),
         "content": content,
+        "part": max(1, int(part)),
+        "parts": max(1, int(parts)),
     }
 
 
@@ -6323,32 +9220,56 @@ def prepare_protocol_upstream_request(
         effective_tools = tools_allowed_by_policy(request.tools, request.tool_choice)
         tools_text = build_tools_transcript(request.tools, request.tool_choice)
         history_text = build_history_transcript(request.messages)
+        tools_parts = split_generated_context_text(tools_text, "tools", request.options.model)
+        history_parts = split_generated_context_text(history_text, "history", request.options.model)
+        if len(history_parts) > 1 or len(tools_parts) > 1:
+            log_event(
+                "context_files_split",
+                model=request.options.model,
+                part_limit_bytes=generated_context_file_part_limit(request.options.model),
+                history_parts=len(history_parts),
+                tools_parts=len(tools_parts),
+            )
         generated_files: list[dict[str, Any]] = []
         generated_trace: list[dict[str, Any]] = []
         try:
-            if tools_text.strip():
-                tools_file = upload_context_package_to_zai(state, tools_text, label="tools")
+            tools_files: list[dict[str, Any]] = []
+            tools_trace: list[dict[str, Any]] = []
+            for index, part_text in enumerate(tools_parts, start=1):
+                label = "tools" if len(tools_parts) == 1 else f"tools_{index}_of_{len(tools_parts)}"
+                tools_file = upload_context_package_to_zai(state, part_text, label=label)
                 generated_files.append(tools_file)
-                generated_trace.append(_context_file_trace_item("tools", tools_file, tools_text))
-            history_file = upload_context_package_to_zai(state, history_text, label="history")
-            generated_files.insert(0, history_file)
-            generated_trace.insert(0, _context_file_trace_item("history", history_file, history_text))
+                tools_files.append(tools_file)
+                tools_trace.append(
+                    _context_file_trace_item("tools", tools_file, part_text, index, len(tools_parts))
+                )
+            history_files: list[dict[str, Any]] = []
+            history_trace: list[dict[str, Any]] = []
+            for index, part_text in enumerate(history_parts, start=1):
+                label = "history" if len(history_parts) == 1 else f"history_{index}_of_{len(history_parts)}"
+                history_file = upload_context_package_to_zai(state, part_text, label=label)
+                generated_files.append(history_file)
+                history_files.append(history_file)
+                history_trace.append(
+                    _context_file_trace_item("history", history_file, part_text, index, len(history_parts))
+                )
+            generated_files = history_files + tools_files
+            generated_trace = history_trace + tools_trace
         except Exception as exc:
             # 上传失败不阻断请求：记入降级计数并回退模式 A。
             log_event("context_file_upload_failed", error=str(exc)[:300], fallback="mode_a")
+            orphan_ids: list[str] = []
             for generated in generated_files:
                 file_obj = generated.get("file") if isinstance(generated.get("file"), dict) else generated
                 file_id = str(file_obj.get("id") or generated.get("id") or "").strip()
-                if not file_id:
-                    continue
-                try:
-                    delete_zai_file(state, file_id)
-                except Exception as cleanup_exc:
-                    log_event(
-                        "context_file_cleanup_error",
-                        file_id_fp=sha16(file_id),
-                        error=str(cleanup_exc)[:200],
-                    )
+                if file_id:
+                    orphan_ids.append(file_id)
+            _best_effort_delete_upstream_files(
+                state,
+                orphan_ids,
+                reason="context_upload_failed",
+                event_prefix="context_file_cleanup",
+            )
             record_context_upload_failure(state.user_id)
             if trace_out is not None:
                 trace_out["fallback_reason"] = "upload_failed"
@@ -6569,19 +9490,57 @@ def _guard_dispatch(handler_method: Callable[[Any], None]) -> Callable[[Any], No
         self._request_started_at = time.time()
         self._request_started_mono = time.monotonic()
         self._response_code = 0
+        self._request_body_timed_out = False
+        self._request_body_timeout_logged = False
+        self._request_body_too_large = False
+        self._request_body_too_large_logged = False
         path = urlsplit(self.path).path
+        access_target = safe_access_log_target(self.path)
         quiet_access = path in _QUIET_ACCESS_PATHS
         if not self.quiet and not quiet_access:
-            LOG.info("[%s] REQ %s %s", rid, self.command, self.path[:300])
+            LOG.info("[%s] REQ %s %s", rid, self.command, access_target)
         try:
+            origin = str(self.headers.get("Origin") or "").strip()
+            if origin and not self._cors_origin():
+                log_event("origin_rejected", level=logging.WARNING, origin_fp=sha16(origin), path=access_target)
+                self._json_response(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "origin_not_allowed",
+                            "message": "browser Origin is not allowed",
+                        },
+                    },
+                )
+                return
             handler_method(self)
+        except QueryValidationError as exc:
+            self._response_code = 400
+            if self.command not in {"GET", "HEAD", "OPTIONS"} and (
+                self.headers.get("Content-Length") or self.headers.get("Transfer-Encoding")
+            ):
+                # The handler rejected the target before consuming a possible
+                # body; close keep-alive so those bytes cannot become a second request.
+                self.close_connection = True
+            self._json_response(
+                400,
+                {
+                    "ok": False,
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "code": "invalid_query",
+                    },
+                },
+            )
         except (BrokenPipeError, ConnectionResetError):
             if not getattr(self, "_response_code", 0):
                 self._response_code = 499
-            log_event("client_disconnected", path=path)
+            log_event("client_disconnected", path=access_target)
         except Exception:
             self._response_code = 500
-            LOG.exception("[%s] unhandled dispatcher error %s %s", rid, self.command, self.path[:300])
+            LOG.exception("[%s] unhandled dispatcher error %s %s", rid, self.command, access_target)
             try:
                 self._json_response(
                     500,
@@ -6596,7 +9555,15 @@ def _guard_dispatch(handler_method: Callable[[Any], None]) -> Callable[[Any], No
                 RUNTIME_METRICS.record_http(self.command, path, code, duration_ms)
             if not (code < 400 and (self.quiet or path in _QUIET_ACCESS_PATHS)):
                 level = logging.ERROR if code >= 500 else logging.WARNING if code >= 400 else logging.INFO
-                LOG.log(level, "[%s] RES %s %s -> %s (%d ms)", rid, self.command, path, code or "-", duration_ms)
+                LOG.log(
+                    level,
+                    "[%s] RES %s %s -> %s (%d ms)",
+                    rid,
+                    self.command,
+                    access_target,
+                    code or "-",
+                    duration_ms,
+                )
             set_current_request_id("")
 
     wrapper.__name__ = handler_method.__name__
@@ -6604,7 +9571,9 @@ def _guard_dispatch(handler_method: Callable[[Any], None]) -> Callable[[Any], No
 
 
 class ProxyHandler(BaseHTTPRequestHandler):
-    timeout = 120  # 防止慢速/停滞客户端长期占用连接线程；不影响服务端主动推送 SSE
+    # Local browser/SDK uploads should never sit idle for minutes. A short idle
+    # timeout also bounds shutdown when a client declares a body then disappears.
+    timeout = REQUEST_SOCKET_IDLE_TIMEOUT_SECONDS
     _head_only: bool = False  # do_HEAD 置位：响应只带头部不写体（见 _send_bytes）
     state: HarState | None = None
     profiles: dict[str, AccountProfile] = {}
@@ -6624,6 +9593,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     upstream_timeout_locked: bool = False  # CLI --upstream-timeout-sec 显式配置时面板不可覆盖
     browser_login_timeout_ms: int = 300_000
     browser_login_progress: dict[str, Any] = {"running": False, "mode": "", "stage": "空闲", "updated_at": "", "error": ""}
+    browser_flow_lock = threading.Lock()
+    browser_progress_lock = threading.RLock()
     include_thinking: bool = False
     # API 协议面（OpenAI / Responses / Anthropic）默认回传思维链，不受面板"显示
     # Thinking"开关影响；请求体 include_thinking:false 仍可显式关闭。
@@ -6632,11 +9603,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
     settings_path: Path = SETTINGS_STORE_PATH
     settings_saved_at: str = ""
     settings_error: str = ""
+    settings_state_lock = threading.RLock()
     api_key: str = ""
     api_key_store_path: Path = API_KEY_STORE_PATH
     api_key_saved_at: str = ""
     api_key_store_error: str = ""
     api_key_source: str = "store"
+    api_key_state_lock = threading.RLock()
     cors_origins: tuple[str, ...] = ()
     web_index_cache: str = ""
     web_index_cache_mtime_ns: int = 0
@@ -6646,19 +9619,104 @@ class ProxyHandler(BaseHTTPRequestHandler):
     chat_inflight_lock = threading.RLock()
     _chat_slot_local = threading.local()
 
-    def _try_acquire_chat_slot(self) -> str | None:
-        """Up to MAX_CONCURRENT_GENERATIONS_PER_PROFILE in-flight generations per account profile.
+    def setup(self) -> None:
+        super().setup()
+        # SSE data and timer heartbeats may be written by different threads;
+        # one per-connection lock keeps every frame atomic on the wire.
+        self._sse_output_lock = threading.Lock()
+        self._sse_last_write_mono = time.monotonic()
+        self._sse_heartbeat_stop: threading.Event | None = None
+        self._sse_heartbeat_thread: threading.Thread | None = None
+        self._sse_heartbeat_error: BaseException | None = None
 
-        Returns the profile id that owns the slot, or None when that profile is
-        already at the concurrency cap. The owner id is returned so the slot
-        can later be released even if the active profile is switched mid-request.
+    def _requested_profile_id(self) -> str:
+        """Return a client-pinned profile hint, if present.
+
+        The web console sends this header for a continued chat or an attachment
+        upload so that an upstream chat/file never jumps to another account.
+        New conversations intentionally omit it and use automatic failover.
         """
-        with self.chat_inflight_lock:
-            profile_id = self.active_profile_id
-            if self.chat_inflight.get(profile_id, 0) >= MAX_CONCURRENT_GENERATIONS_PER_PROFILE:
-                return None
-            self.chat_inflight[profile_id] = self.chat_inflight.get(profile_id, 0) + 1
-            return profile_id
+        return str(self.headers.get(PROFILE_ROUTING_HEADER) or "").strip()
+
+    def _profile_exists(self, profile_id: str) -> bool:
+        profile_id = str(profile_id or "").strip()
+        if not profile_id:
+            return False
+        with self.state_lock:
+            return profile_id in self.profiles
+
+    def _routing_candidates(self, preferred_profile_id: str = "", strict: bool = False) -> list[str]:
+        """Build deterministic profile order: preferred/current, then saved profiles.
+
+        ``strict`` is used for resources already tied to a profile (continued
+        chats and uploaded files).  A strict request must not silently move that
+        resource to another account when its owner is full.
+        """
+        active_id = str(self.active_profile_id or "")
+        preferred = str(preferred_profile_id or "").strip()
+        profile_ids = list(self.profiles.keys())
+        if strict and preferred:
+            return [preferred] if preferred in self.profiles else []
+
+        first = preferred if preferred in self.profiles else active_id
+        candidates: list[str] = []
+        if first or not profile_ids:
+            candidates.append(first)
+        for profile_id in profile_ids:
+            if profile_id not in candidates:
+                candidates.append(profile_id)
+        if not candidates and self.state is not None:
+            candidates.append("")
+        return candidates
+
+    def _bind_chat_profile(self, profile_id: str, state: "HarState | None" = None) -> None:
+        self._chat_slot_local.profile_id = profile_id
+        if state is not None:
+            self._chat_slot_local.state = state
+
+    def _chat_profile_get(self) -> str | None:
+        value = getattr(self._chat_slot_local, "profile_id", None)
+        return None if value is None else str(value)
+
+    def _chat_state_get(self) -> "HarState | None":
+        value = getattr(self._chat_slot_local, "state", None)
+        return value if isinstance(value, HarState) else None
+
+    def _chat_profile_clear(self) -> None:
+        for name in ("profile_id", "state", "slot_requested_profile", "slot_busy_renderer"):
+            try:
+                delattr(self._chat_slot_local, name)
+            except AttributeError:
+                pass
+
+    def _try_acquire_chat_slot(
+        self,
+        preferred_profile_id: str = "",
+        *,
+        strict: bool = False,
+        bind: bool = False,
+    ) -> str | None:
+        """Acquire one generation slot from the account pool.
+
+        The active profile is tried first.  Once it reaches three in-flight
+        generations, the next saved profile is tried, then the next one, and so
+        on.  Selection and increment happen under the same lock so concurrent
+        requests cannot oversubscribe a profile.
+        """
+        with self.state_lock:
+            candidates = self._routing_candidates(preferred_profile_id, strict=strict)
+            with self.chat_inflight_lock:
+                for profile_id in candidates:
+                    current = max(0, int(self.chat_inflight.get(profile_id, 0)))
+                    if current >= MAX_CONCURRENT_GENERATIONS_PER_PROFILE:
+                        continue
+                    self.chat_inflight[profile_id] = current + 1
+                    profile = self.profiles.get(profile_id) if profile_id else None
+                    selected_state = profile.state if profile is not None else self.state
+                    if bind:
+                        self._bind_chat_profile(profile_id, selected_state)
+                    return profile_id
+        return None
 
     def _release_chat_slot(self, profile_id: str) -> None:
         with self.chat_inflight_lock:
@@ -6696,18 +9754,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._release_chat_slot(owner)
             self._chat_slot_owner_clear()
 
+    def _acquire_deferred_chat_slot(self) -> bool:
+        """Acquire a generation slot only after request parsing/validation."""
+        if self._chat_slot_owner_get() is not None:
+            return True
+        requested_profile = str(getattr(self._chat_slot_local, "slot_requested_profile", "") or "")
+        render_busy_name = str(getattr(self._chat_slot_local, "slot_busy_renderer", "") or "")
+        acquired = self._try_acquire_chat_slot(
+            requested_profile,
+            strict=bool(requested_profile),
+            bind=True,
+        )
+        if acquired is None:
+            if render_busy_name:
+                getattr(self, render_busy_name)(pinned=bool(requested_profile))
+            return False
+        self._chat_slot_owner_set(acquired)
+        return True
+
     @staticmethod
-    def _chat_slot_guard(render_busy_name: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator: reject requests beyond the per-account concurrency cap."""
+    def _chat_slot_guard(
+        render_busy_name: str,
+        render_missing_name: str,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Validate routing and release a lazily acquired generation slot."""
 
         def decorate(method: Callable[..., Any]) -> Callable[..., Any]:
             @functools.wraps(method)
             def wrapper(self_: "ProxyHandler", *args: Any, **kwargs: Any) -> Any:
-                acquired = self_._try_acquire_chat_slot()
-                if acquired is None:
-                    getattr(self_, render_busy_name)()
+                requested_profile = self_._requested_profile_id()
+                if requested_profile and not self_._profile_exists(requested_profile):
+                    log_event(
+                        "profile_route_missing",
+                        level=logging.WARNING,
+                        profile_id_fp=sha16(requested_profile),
+                        path=urlsplit(self_.path).path,
+                    )
+                    getattr(self_, render_missing_name)()
                     return None
-                self_._chat_slot_owner_set(acquired)
+                # The wrapped method parses and validates its body before it
+                # explicitly acquires a generation slot. Slow/malformed clients
+                # consume only a bounded HTTP handler, never an account slot.
+                self_._chat_slot_local.slot_requested_profile = requested_profile
+                self_._chat_slot_local.slot_busy_renderer = render_busy_name
                 try:
                     return method(self_, *args, **kwargs)
                 finally:
@@ -6715,58 +9804,216 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     if owner is not None:
                         self_._chat_slot_owner_clear()
                         self_._release_chat_slot(owner)
+                    self_._chat_profile_clear()
 
             return wrapper
 
         return decorate
 
-    def _web_busy(self) -> None:
+    @staticmethod
+    def _busy_message(pinned: bool) -> str:
+        if pinned:
+            return "当前会话绑定的账号已占满 3 个生成槽位；为避免跨账号串话，请等待该账号释放后重试"
+        return "所有已登录账号的并发生成槽位都已占用（每个账号最多 3 个），请等待完成后再试"
+
+    def _web_busy(self, *, pinned: bool = False) -> None:
         self._json_response(
             429,
             {
                 "ok": False,
                 "error": {
-                    "message": "当前账号同时进行中的生成请求已达上限（3 个），请等待完成后再试",
+                    "message": self._busy_message(pinned),
                     "type": "chat_slot_busy",
+                    "scope": "profile" if pinned else "pool",
                 },
             },
             extra_headers={"Retry-After": "3"},
         )
 
-    def _openai_busy(self) -> None:
+    def _openai_busy(self, *, pinned: bool = False) -> None:
         self._json_response(
             429,
             {
                 "error": {
-                    "message": "当前账号同时进行中的生成请求已达上限（3 个），请稍后重试",
+                    "message": self._busy_message(pinned),
                     "type": "rate_limit_error",
                     "code": "chat_slot_busy",
+                    "scope": "profile" if pinned else "pool",
                 }
             },
             extra_headers={"Retry-After": "3"},
         )
 
-    def _anthropic_busy(self) -> None:
+    def _anthropic_busy(self, *, pinned: bool = False) -> None:
         self._json_response(
             429,
             {
                 "type": "error",
                 "error": {
                     "type": "rate_limit_error",
-                    "message": "当前账号已有进行中的生成请求，请稍后重试",
+                    "message": self._busy_message(pinned),
+                    "scope": "profile" if pinned else "pool",
                 },
             },
             extra_headers={"Retry-After": "3"},
         )
 
+    @staticmethod
+    def _profile_missing_message() -> str:
+        return "请求指定的本地账号不存在或已被删除，请刷新账号列表后重新发送"
+
+    def _web_profile_missing(self) -> None:
+        self._json_response(
+            404,
+            {
+                "ok": False,
+                "error": {
+                    "message": self._profile_missing_message(),
+                    "type": "profile_not_found",
+                    "code": "profile_not_found",
+                },
+            },
+        )
+
+    def _openai_profile_missing(self) -> None:
+        self._openai_error(400, self._profile_missing_message(), code="profile_not_found")
+
+    def _anthropic_profile_missing(self) -> None:
+        self._json_response(
+            400,
+            {
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": self._profile_missing_message(),
+                    "code": "profile_not_found",
+                },
+            },
+        )
+
     def _active_state(self) -> HarState:
+        bound_state = self._chat_state_get()
+        if bound_state is not None:
+            return bound_state
+        bound_profile = self._chat_profile_get()
         with self.state_lock:
+            if bound_profile is not None:
+                profile = self.profiles.get(bound_profile)
+                if profile:
+                    return profile.state
+                if not bound_profile and self.state:
+                    return self.state
+                raise RuntimeError("请求绑定的登录态已被移除，请重新发送。")
             profile = self.profiles.get(self.active_profile_id)
             if profile:
                 return profile.state
             if self.state:
                 return self.state
             raise RuntimeError("当前没有登录态。请先在网页右侧使用“浏览器登录并切换”或上传 HAR。")
+
+    def _profile_state_for_id(self, profile_id: str = "", *, strict: bool = False) -> tuple[str, HarState] | None:
+        """Resolve a profile hint for auxiliary chat/file operations.
+
+        A request may finish after the UI has switched the active profile, so
+        this helper never relies on the mutable active selection when an
+        explicit profile id is supplied.
+        """
+        profile_id = str(profile_id or self._requested_profile_id() or "").strip()
+        with self.state_lock:
+            if profile_id:
+                profile = self.profiles.get(profile_id)
+                if profile is not None:
+                    return profile_id, profile.state
+                if strict:
+                    return None
+            profile = self.profiles.get(self.active_profile_id)
+            if profile is not None:
+                return self.active_profile_id, profile.state
+            if self.state is not None:
+                return "", self.state
+        return None
+
+    def _select_profile_for_auxiliary(
+        self,
+        preferred_profile_id: str = "",
+        *,
+        strict: bool = False,
+    ) -> tuple[str, HarState] | None:
+        """Pick an account for file/control requests without consuming a slot.
+
+        File uploads happen before ``/api/chat`` acquires its generation slot.
+        Selecting from the same ordered pool keeps uploaded files on the
+        account that will later own the chat. The generation guard still makes
+        the final decision atomically, so this is only a routing hint.
+        """
+        with self.state_lock:
+            candidates = self._routing_candidates(preferred_profile_id, strict=strict)
+            with self.chat_inflight_lock:
+                chosen: str | None = None
+                for profile_id in candidates:
+                    current = max(0, int(self.chat_inflight.get(profile_id, 0)))
+                    if current < MAX_CONCURRENT_GENERATIONS_PER_PROFILE:
+                        chosen = profile_id
+                        break
+                if chosen is None:
+                    return None
+            profile = self.profiles.get(chosen) if chosen else None
+            selected_state = profile.state if profile is not None else self.state
+            if selected_state is None:
+                return None
+            return chosen, selected_state
+
+    def _concurrency_payload(self) -> dict[str, Any]:
+        """Return sanitized account-pool capacity and per-profile occupancy."""
+        with self.state_lock:
+            active_id = str(self.active_profile_id or "")
+            ordered_ids = self._routing_candidates()
+            profile_items = [
+                (profile_id, self.profiles[profile_id])
+                for profile_id in ordered_ids
+                if profile_id in self.profiles
+            ]
+            has_fallback_state = self.state is not None
+            with self.chat_inflight_lock:
+                busy_by_profile = {
+                    profile_id: max(0, int(self.chat_inflight.get(profile_id, 0)))
+                    for profile_id, _profile in profile_items
+                }
+                fallback_busy = max(0, int(self.chat_inflight.get("", 0)))
+        rows: list[dict[str, Any]] = []
+        for routing_order, (profile_id, _profile) in enumerate(profile_items, start=1):
+            busy = busy_by_profile.get(profile_id, 0)
+            rows.append(
+                {
+                    "id": profile_id,
+                    "routing_order": routing_order,
+                    "active": profile_id == active_id,
+                    "inflight": busy,
+                    "capacity": MAX_CONCURRENT_GENERATIONS_PER_PROFILE,
+                    "available": max(0, MAX_CONCURRENT_GENERATIONS_PER_PROFILE - busy),
+                    "state": "busy" if busy >= MAX_CONCURRENT_GENERATIONS_PER_PROFILE else "available",
+                }
+            )
+        profile_count = len(profile_items)
+        capacity = profile_count * MAX_CONCURRENT_GENERATIONS_PER_PROFILE
+        total_inflight = sum(busy_by_profile.values())
+        if not profile_count and has_fallback_state:
+            capacity = MAX_CONCURRENT_GENERATIONS_PER_PROFILE
+            total_inflight = fallback_busy
+        active_inflight = busy_by_profile.get(active_id, fallback_busy if not profile_count else 0)
+        return {
+            "strategy": "active_then_next",
+            "strategy_label": "当前账号优先，满槽后自动接管下一个账号",
+            "auto_failover": True,
+            "per_profile": MAX_CONCURRENT_GENERATIONS_PER_PROFILE,
+            "profile_count": profile_count,
+            "capacity": capacity,
+            "inflight": total_inflight,
+            "available": max(0, capacity - total_inflight),
+            "active_profile_inflight": active_inflight,
+            "active_profile_available": max(0, MAX_CONCURRENT_GENERATIONS_PER_PROFILE - active_inflight),
+            "profiles": rows,
+        }
 
     def _openai_error(self, status: int, message: str, code: str | None = None, extra_headers: dict[str, str] | None = None) -> None:
         self._json_response(
@@ -6797,22 +10044,50 @@ class ProxyHandler(BaseHTTPRequestHandler):
         expired = [response_id for response_id, item in self.response_store.items() if item.expires_at <= now]
         for response_id in expired:
             self.response_store.pop(response_id, None)
-        overflow = len(self.response_store) - MAX_RESPONSE_STORE_ITEMS
-        if overflow > 0:
-            oldest = sorted(self.response_store.items(), key=lambda item: item[1].expires_at)[:overflow]
-            for response_id, _item in oldest:
-                self.response_store.pop(response_id, None)
+        ordered = sorted(self.response_store.items(), key=lambda item: item[1].expires_at)
+        total_bytes = sum(max(0, int(item.size_bytes)) for _response_id, item in ordered)
+        while ordered and (
+            len(self.response_store) > MAX_RESPONSE_STORE_ITEMS
+            or total_bytes > MAX_RESPONSE_STORE_BYTES
+        ):
+            response_id, item = ordered.pop(0)
+            if self.response_store.pop(response_id, None) is not None:
+                total_bytes -= max(0, int(item.size_bytes))
 
-    def _store_response(self, response_id: str, payload: dict[str, Any], messages: list[dict[str, Any]]) -> None:
+    def _response_store_status(self) -> dict[str, int]:
+        with self.response_store_lock:
+            self._cleanup_response_store_locked()
+            return {
+                "items": len(self.response_store),
+                "bytes": sum(max(0, int(item.size_bytes)) for item in self.response_store.values()),
+                "max_items": MAX_RESPONSE_STORE_ITEMS,
+                "max_bytes": MAX_RESPONSE_STORE_BYTES,
+                "max_item_bytes": MAX_STORED_RESPONSE_BYTES,
+                "ttl_seconds": RESPONSE_STORE_TTL_SECONDS,
+            }
+
+    def _store_response(self, response_id: str, payload: dict[str, Any], messages: list[dict[str, Any]]) -> bool:
+        size_bytes = json_size_bytes(payload) + json_size_bytes(messages)
+        if size_bytes > MAX_STORED_RESPONSE_BYTES:
+            log_event(
+                "response_store_item_rejected",
+                level=logging.WARNING,
+                response_id_fp=sha16(response_id),
+                size_bytes=size_bytes,
+                max_item_bytes=MAX_STORED_RESPONSE_BYTES,
+            )
+            return False
         with self.response_store_lock:
             self.response_store[response_id] = StoredResponse(
                 payload=payload,
                 messages=messages,
                 expires_at=time.monotonic() + RESPONSE_STORE_TTL_SECONDS,
+                size_bytes=size_bytes,
             )
             # Cleanup after insertion so the configured cap is never exceeded,
             # even between this write and the next store/read operation.
             self._cleanup_response_store_locked()
+            return response_id in self.response_store
 
     def _get_stored_response(self, response_id: str) -> StoredResponse | None:
         with self.response_store_lock:
@@ -6822,10 +10097,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _clear_deleted_chat_from_active_profile(self, state: HarState, chat_id: str) -> None:
         changed = False
         with self.state_lock:
-            profile = self.profiles.get(self.active_profile_id)
-            if profile and profile.state is state and profile.state.chat_id == chat_id:
-                profile.state.chat_id = ""
-                changed = True
+            # The active profile may have changed while a routed request was
+            # finishing. Match by state identity across the whole pool so an
+            # automatic failover never clears another account's chat id.
+            for profile in self.profiles.values():
+                if profile.state is state and profile.state.chat_id == chat_id:
+                    profile.state.chat_id = ""
+                    changed = True
             if self.state is state and self.state.chat_id == chat_id:
                 self.state.chat_id = ""
                 changed = True
@@ -6863,18 +10141,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
         chat_id = str(context.get("chat_id") or "").strip()
         if not options.delete_chat_after_completion or not chat_id:
             return chat_id, False, ""
+        journal_id = pending_chat_delete_add(state, chat_id, "auto_delete")
         log_event("auto_delete_scheduled", chat_id_fp=sha16(chat_id))
 
         def _work() -> None:
             try:
-                delete_zai_chat(state, chat_id)
+                delete_zai_chat(state, chat_id, cancel_check=_AUTO_DELETE_STOP.is_set)
             except Exception as exc:
+                pending_chat_delete_failed(journal_id, exc)
                 log_event("auto_delete_failed", chat_id_fp=sha16(chat_id), error=str(exc)[:300])
                 return
+            pending_chat_delete_completed(journal_id)
             self._clear_deleted_chat_from_active_profile(state, chat_id)
             log_event("auto_delete_completed", chat_id_fp=sha16(chat_id))
 
-        _submit_auto_delete(_work)
+        if not _submit_auto_delete(_work, inline_on_backpressure=False):
+            log_event(
+                "auto_delete_queue_failed",
+                level=logging.ERROR,
+                chat_id_fp=sha16(chat_id),
+            )
         return chat_id, False, ""
 
     def _cleanup_failed_upstream_chat(
@@ -6882,35 +10168,116 @@ class ProxyHandler(BaseHTTPRequestHandler):
         state: HarState,
         context: dict[str, Any],
         options: ChatOptions,
-    ) -> None:
-        """Best-effort delete of a chat created for a request that failed mid-stream."""
-        if not options.delete_chat_after_completion:
-            return
+        *,
+        force: bool = False,
+        reason: str = "failed",
+    ) -> bool:
+        """Best-effort delete a chat left by a failed/interrupted request.
+
+        Normal failures continue to respect ``delete_chat_after_completion``.
+        A client cancellation or broken stream passes ``force=True`` because
+        the request has explicitly abandoned the upstream conversation; that
+        cleanup must happen even when the normal success auto-delete toggle is
+        disabled.
+        """
+        if context.get("_stream_incomplete"):
+            force = True
+            reason = "stream_interrupted"
+        if not force and not options.delete_chat_after_completion:
+            return False
         chat_id = str(context.get("chat_id") or "").strip()
         if not chat_id:
-            return
+            return False
         if context.get("_failed_cleanup_scheduled"):
-            return
+            return True
         context["_failed_cleanup_scheduled"] = True
-        log_event("failed_chat_cleanup_scheduled", chat_id_fp=sha16(chat_id))
+        interrupted = force or str(reason or "").lower() in {
+            "cancel",
+            "client_cancel",
+            "client_disconnect",
+            "service_shutdown",
+            "stream_interrupted",
+        }
+        event_prefix = "interrupted_chat_cleanup" if interrupted else "failed_chat_cleanup"
+        journal_id = pending_chat_delete_add(state, chat_id, str(reason or "failed"))
+        log_event(
+            f"{event_prefix}_scheduled",
+            chat_id_fp=sha16(chat_id),
+            reason=str(reason or "failed"),
+            forced=bool(force),
+        )
 
         def _work() -> None:
             try:
-                delete_zai_chat(state, chat_id)
+                delete_zai_chat(state, chat_id, cancel_check=_AUTO_DELETE_STOP.is_set)
             except Exception as exc:
+                pending_chat_delete_failed(journal_id, exc)
                 log_event(
-                    "failed_chat_cleanup_error",
+                    f"{event_prefix}_error",
                     chat_id_fp=sha16(chat_id),
                     error=str(exc)[:300],
+                    reason=str(reason or "failed"),
                 )
                 return
+            pending_chat_delete_completed(journal_id)
             self._clear_deleted_chat_from_active_profile(state, chat_id)
-            log_event("failed_chat_cleanup_completed", chat_id_fp=sha16(chat_id))
+            log_event(
+                f"{event_prefix}_completed",
+                chat_id_fp=sha16(chat_id),
+                reason=str(reason or "failed"),
+            )
 
-        _submit_auto_delete(_work)
+        scheduled = _submit_auto_delete(_work, inline_on_backpressure=False)
+        if not scheduled:
+            log_event(
+                f"{event_prefix}_queue_failed",
+                level=logging.ERROR,
+                chat_id_fp=sha16(chat_id),
+                reason=str(reason or "failed"),
+            )
+        # A full/closing executor may defer execution, but the durable journal
+        # has already accepted the cleanup intent. Report it as pending so the
+        # caller clears any reusable pointer to this abandoned chat.
+        return bool(scheduled or journal_id)
+
+    def _schedule_interrupted_upstream_chat_delete(
+        self,
+        state: HarState,
+        chat_id: str,
+        *,
+        reason: str = "client_cancel",
+    ) -> bool:
+        """Schedule deletion for an explicitly interrupted upstream chat.
+
+        This is intentionally independent from the normal auto-delete setting:
+        stopping a stream means the caller no longer wants this turn/chat to
+        remain on the upstream account.  The helper is idempotent per request
+        context and treats an already-gone chat as successful in
+        ``delete_zai_chat``.
+        """
+        chat_id = str(chat_id or "").strip()
+        if not chat_id:
+            return False
+        try:
+            require_uuid(chat_id, "chat_id")
+        except ValueError:
+            log_event(
+                "interrupted_chat_cleanup_invalid",
+                level=logging.WARNING,
+                chat_id_fp=sha16(chat_id),
+                reason=str(reason or "client_cancel"),
+            )
+            return False
+        return self._cleanup_failed_upstream_chat(
+            state,
+            {"chat_id": chat_id},
+            ChatOptions(delete_chat_after_completion=True),
+            force=True,
+            reason=reason,
+        )
 
     def _cleanup_failed_upstream_files(self, state: HarState, files: list[dict[str, Any]] | None) -> None:
-        """Best-effort delete of uploaded files orphaned by a failed chat attempt."""
+        """Journal orphaned uploads and remove them outside the request thread."""
         file_ids: list[str] = []
         for item in files or []:
             if not isinstance(item, dict):
@@ -6919,15 +10286,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             file_id = str(file_obj.get("id") or item.get("id") or "").strip()
             if file_id and file_id not in file_ids:
                 file_ids.append(file_id)
-        for file_id in file_ids:
-            try:
-                delete_zai_file(state, file_id)
-            except Exception as exc:
-                log_event(
-                    "orphan_file_cleanup_error",
-                    file_id_fp=sha16(file_id),
-                    error=str(exc)[:300],
-                )
+        _best_effort_delete_upstream_files(
+            state,
+            file_ids,
+            reason="failed_chat",
+            event_prefix="orphan_file_cleanup",
+        )
 
     def _complete_protocol_turn(
         self,
@@ -6938,6 +10302,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         thinking: str,
     ) -> ProtocolTurn:
         turn = finalize_protocol_turn(request, text, thinking)
+        update_history_protocol_result(str(context.get("_history_record_id") or ""), turn=turn)
+        if request.tool_retry_active:
+            log_event(
+                "tool_call_format_retry_completed",
+                surface=request.surface,
+                model=request.options.model,
+                outcome="tool_calls" if turn.tool_calls else "complete_text",
+                calls=len(turn.tool_calls),
+                source=turn.tool_calls_source,
+            )
         chat_id, deleted, delete_error = self._schedule_upstream_chat_delete(state, context, request.options)
         turn.upstream_chat_id = chat_id
         turn.upstream_chat_deleted = deleted
@@ -6978,7 +10352,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             delete_after=request.options.delete_chat_after_completion,
             user_id_fp=sha16(state.user_id) if state.user_id else "",
         )
-        context: dict[str, Any] = {}
+        context: dict[str, Any] = {"profile_id": self._chat_profile_get() or ""}
         user_input = ""
         for item in reversed(request.messages):
             if str(item.get("role") or "").lower() == "user":
@@ -6991,15 +10365,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         # 与"两个附件 + 一个聊天框"的实发结构一一对应；内联模式记整段上下文。
         mirror_context = request.context_text
         if delivery_trace.get("delivery_mode") == "file":
-            history_file = next(
-                (
-                    item
-                    for item in delivery_trace.get("context_files") or []
-                    if isinstance(item, dict) and item.get("kind") == "history"
-                ),
-                None,
-            )
-            mirror_context = str((history_file or {}).get("content") or "")
+            history_parts = [
+                item
+                for item in delivery_trace.get("context_files") or []
+                if isinstance(item, dict) and item.get("kind") == "history"
+            ]
+            history_parts.sort(key=lambda item: int(item.get("part") or 1))
+            mirror_context = "\n\n".join(str(item.get("content") or "") for item in history_parts)
         history_ctx = {
             "surface": request.surface,
             "stream": request.stream,
@@ -7010,7 +10382,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "context_file_requested": delivery_trace.get("requested_mode") == "file",
             "context_file_fallback": str(delivery_trace.get("fallback_reason") or ""),
             "context_files": delivery_trace.get("context_files") or [],
-            "account": (state.user_id or "")[:8],
+            "account": state.user_id or "",
         }
         if history_record_id:
             history_ctx["_record_id"] = history_record_id
@@ -7032,6 +10404,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             context_out=context,
             files=files,
             history_ctx=history_ctx,
+            cancel_check=self._check_request_cancelled,
         )
         return events, context, state
 
@@ -7045,21 +10418,52 @@ class ProxyHandler(BaseHTTPRequestHandler):
     ) -> tuple[str, str]:
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        stream_budget = UpstreamStreamBudget()
         try:
             for event in events:
                 if progress is not None:
                     progress()
+                stream_budget.observe_event(event)
                 error = extract_error_from_event(event)
                 if error:
                     raise RuntimeError(error)
                 delta, phase = extract_delta_from_event(event)
                 if not delta:
                     continue
+                stream_budget.observe_delta(delta)
+                context["_protocol_content_emitted"] = True
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
                 else:
                     text_parts.append(delta)
-        except Exception:
+        except (BrokenPipeError, ConnectionResetError, GeneratorExit) as exc:
+            reason = interruption_reason(exc)
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = reason
+            close = getattr(events, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+            self._release_chat_slot_early()
+            self._cleanup_failed_upstream_chat(
+                state,
+                context,
+                request.options,
+                force=True,
+                reason=reason,
+            )
+            raise
+        except Exception as exc:
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = "error"
+                context["_stream_close_error"] = client_error_message(exc)
+                context["_protocol_content_emitted"] = bool(text_parts or thinking_parts)
+            try:
+                setattr(exc, "protocol_content_emitted", bool(text_parts or thinking_parts))
+            except Exception:
+                pass
             close = getattr(events, "close", None)
             if callable(close):
                 try:
@@ -7069,10 +10473,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
             raise
-        self._release_chat_slot_early()
         return "".join(text_parts), "".join(thinking_parts)
 
-    def _complete_turn_with_required_retry(
+    def _complete_turn_with_tool_retry(
         self,
         request: ProtocolRequest,
         state: HarState,
@@ -7080,6 +10483,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         text: str,
         thinking: str,
         regenerate: Callable[[ProtocolRequest], tuple[str, str, dict[str, Any], HarState]] | None,
+        release_initial_output: Callable[[], None] | None = None,
     ) -> ProtocolTurn:
         try:
             return self._complete_protocol_turn(request, state, context, text, thinking)
@@ -7087,21 +10491,76 @@ class ProxyHandler(BaseHTTPRequestHandler):
             # One bounded correction pass covers both missing required calls
             # and recognizable-but-malformed call markup.
             if regenerate is None:
+                record_id = str(context.get("_history_record_id") or "")
+                finish_history_record(
+                    record_id,
+                    status="error",
+                    content=text,
+                    reasoning=thinking,
+                    error=str(exc),
+                    chat_id=str(context.get("chat_id") or ""),
+                    status_code=500,
+                )
+                update_history_protocol_result(record_id, error=str(exc))
                 raise
             retry_reason = str(exc)
+        released_chars = len(text) + len(thinking)
+        if release_initial_output is not None:
+            try:
+                release_initial_output()
+            except Exception as exc:
+                log_event(
+                    "tool_retry_output_release_error",
+                    level=logging.WARNING,
+                    surface=request.surface,
+                    error=client_error_message(exc),
+                )
+        # Drop this frame's references before the replacement stream starts.
+        # Streaming callers clear their original part lists through the hook.
+        text = ""
+        thinking = ""
         self._cleanup_failed_upstream_chat(state, context, request.options)
         retry_request = protocol_request_with_tool_retry_hint(request, retry_reason)
-        log_event("tool_call_format_retry", model=request.options.model, reason=retry_reason[:200])
+        log_event(
+            "tool_call_format_retry",
+            surface=request.surface,
+            model=request.options.model,
+            tool_choice=request.tool_choice.mode,
+            reason=retry_reason[:200],
+            released_chars=released_chars,
+        )
         text2, thinking2, context2, state2 = regenerate(retry_request)
         try:
             return self._complete_protocol_turn(retry_request, state2, context2, text2, thinking2)
-        except Exception:
+        except Exception as exc:
             self._cleanup_failed_upstream_chat(state2, context2, retry_request.options)
+            record_id = str(context2.get("_history_record_id") or context.get("_history_record_id") or "")
+            finish_history_record(
+                record_id,
+                status="error",
+                content=text2,
+                reasoning=thinking2,
+                error=str(exc),
+                chat_id=str(context2.get("chat_id") or ""),
+                status_code=500,
+            )
+            update_history_protocol_result(record_id, error=str(exc))
+            log_event(
+                "tool_call_format_retry_failed",
+                surface=request.surface,
+                model=request.options.model,
+                reason=str(exc)[:200],
+            )
             raise
 
     def _collect_protocol_turn(self, request: ProtocolRequest) -> ProtocolTurn:
         events, context, state = self._start_protocol_completion(request)
         text, thinking = self._consume_protocol_events(events, state, request, context)
+
+        def release_initial_output() -> None:
+            nonlocal text, thinking
+            text = ""
+            thinking = ""
 
         def regenerate(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
             events2, context2, state2 = self._start_protocol_completion(
@@ -7110,46 +10569,110 @@ class ProxyHandler(BaseHTTPRequestHandler):
             text2, thinking2 = self._consume_protocol_events(events2, state2, retry_request, context2)
             return text2, thinking2, context2, state2
 
-        return self._complete_turn_with_required_retry(request, state, context, text, thinking, regenerate)
+        try:
+            # Keep the acquired profile slot through a possible semantic/tool
+            # retry. It is released before post-stream housekeeping, so a
+            # retry never runs outside the concurrency cap.
+            return self._complete_turn_with_tool_retry(
+                request,
+                state,
+                context,
+                text,
+                thinking,
+                regenerate,
+                release_initial_output,
+            )
+        finally:
+            self._release_chat_slot_early()
 
     def _profiles_payload(self) -> dict[str, Any]:
         with self.state_lock:
             active_id = self.active_profile_id
             user_counts = profile_user_counts(self.profiles)
+            ordered_ids = [
+                profile_id
+                for profile_id in self._routing_candidates()
+                if profile_id in self.profiles
+            ]
+            with self.chat_inflight_lock:
+                inflight_by_profile = {
+                    profile_id: max(0, int(self.chat_inflight.get(profile_id, 0)))
+                    for profile_id in self.profiles
+                }
             profiles = [
                 profile_summary(
-                    profile,
-                    active=pid == active_id,
-                    same_user_count=user_counts.get(profile.state.user_id, 1),
+                    self.profiles[profile_id],
+                    active=profile_id == active_id,
+                    same_user_count=user_counts.get(self.profiles[profile_id].state.user_id, 1),
+                    inflight=inflight_by_profile.get(profile_id, 0),
+                    routing_order=index,
                 )
-                for pid, profile in self.profiles.items()
+                for index, profile_id in enumerate(ordered_ids, start=1)
             ]
             duplicate_stats = profile_duplicate_stats(self.profiles)
             return {
                 "ok": True,
                 "active_profile_id": active_id,
                 "profiles": profiles,
+                "profile_count": len(profiles),
+                "max_profiles": MAX_ACCOUNT_PROFILES,
+                "profile_slots_available": max(0, MAX_ACCOUNT_PROFILES - len(profiles)),
+                "profile_limit_reached": len(profiles) >= MAX_ACCOUNT_PROFILES,
+                "concurrency": self._concurrency_payload(),
                 "duplicate_stats": duplicate_stats,
                 "profile_store": {
                     "path": self.profile_store_path.name,
                     "exists": self.profile_store_path.exists(),
                     "encryption": "windows-dpapi-current-user",
+                    "max_bytes": MAX_PROFILE_STORE_BYTES,
+                    "max_payload_bytes": MAX_PROFILE_STORE_PAYLOAD_BYTES,
                     "saved_at": self.profile_store_saved_at,
-                    "error": self.profile_store_error,
+                    "persisted": not bool(self.profile_store_error),
+                    "error": client_error_message(self.profile_store_error, fallback="") if self.profile_store_error else "",
                 },
             }
 
-    def _save_profile_store(self) -> None:
+    def _save_profile_store(self) -> tuple[bool, str]:
         with self.state_lock:
             try:
                 save_profile_store(self.profiles, self.active_profile_id, self.profile_store_path)
                 self.__class__.profile_store_saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
                 self.__class__.profile_store_error = ""
+                return True, ""
             except Exception as exc:
                 self.__class__.profile_store_error = str(exc)
+                client_error = client_error_message(exc, fallback="本地加密存储写入失败")
+                log_event(
+                    "profile_store_write_error",
+                    level=logging.ERROR,
+                    error=client_error,
+                    profile_count=len(self.profiles),
+                )
+                return False, client_error
+
+    def _profile_persistence_result(
+        self,
+        persisted: bool,
+        *,
+        persistence_error: str = "",
+        success_message: str,
+        failure_message: str,
+    ) -> dict[str, Any]:
+        """Describe whether an in-memory profile mutation reached encrypted storage."""
+        result: dict[str, Any] = {
+            "persisted": bool(persisted),
+            "message": success_message if persisted else failure_message,
+        }
+        if not persisted:
+            result["profile_store_error"] = client_error_message(
+                persistence_error,
+                fallback="本地加密存储写入失败",
+            )
+        return result
 
     def _api_key_authorized(self) -> bool:
-        configured = str(self.api_key or "")
+        with self.api_key_state_lock:
+            configured = str(self.api_key or "")
         if not configured:
             return True
         provided = str(self.headers.get("X-API-Key") or "").strip()
@@ -7157,7 +10680,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             auth = str(self.headers.get("Authorization") or "").strip()
             if auth.lower().startswith("bearer "):
                 provided = auth[7:].strip()
-        return bool(provided) and hmac.compare_digest(provided.encode("utf-8"), configured.encode("utf-8"))
+        return local_api_keys_match(provided, configured)
 
     def _require_api_key(self) -> bool:
         if self._api_key_authorized():
@@ -7182,30 +10705,38 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return self._api_key_authorized()
 
     def _api_key_config_payload(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "enabled": bool(self.api_key),
-            "source": self.api_key_source,
-            "saved_at": self.api_key_saved_at,
-            "error": self.api_key_store_error,
-            "path": self.api_key_store_path.name,
-        }
+        with self.api_key_state_lock:
+            return {
+                "ok": True,
+                "enabled": bool(self.api_key),
+                "source": self.api_key_source,
+                "saved_at": self.api_key_saved_at,
+                "persisted": not bool(self.api_key_store_error),
+                "error": client_error_message(self.api_key_store_error, fallback="") if self.api_key_store_error else "",
+                "path": self.api_key_store_path.name,
+                "max_chars": MAX_LOCAL_API_KEY_CHARS,
+            }
 
-    def _save_api_key_from_panel(self, new_key: str, current_key: str) -> dict[str, Any]:
-        if self.api_key_source == "cli":
-            raise ValueError("当前 API Key 由 GLM2API_API_KEY/--api-key 配置；请在面板配置前移除该启动参数")
-        if self.api_key and not hmac.compare_digest(
-            current_key.encode("utf-8"),
-            self.api_key.encode("utf-8"),
-        ):
-            raise PermissionError("current API key is incorrect")
-        normalized = str(new_key or "").strip()
-        saved_at = save_api_key_store(normalized, self.api_key_store_path)
-        self.__class__.api_key = normalized
-        self.__class__.api_key_saved_at = saved_at
-        self.__class__.api_key_source = "store"
-        self.__class__.api_key_store_error = ""
-        return self._api_key_config_payload()
+    def _save_api_key_from_panel(self, new_key: Any, current_key: Any) -> dict[str, Any]:
+        normalized = normalize_local_api_key(new_key, label="新 API Key")
+        normalized_current = normalize_local_api_key(current_key, label="当前 API Key")
+        with self.api_key_state_lock:
+            if self.api_key_source == "cli":
+                raise ValueError("当前 API Key 由 GLM2API_API_KEY/--api-key 配置；请在面板配置前移除该启动参数")
+            if self.api_key and not local_api_keys_match(normalized_current, self.api_key):
+                raise PermissionError("current API key is incorrect")
+            try:
+                saved_at = save_api_key_store(normalized, self.api_key_store_path)
+            except Exception as exc:
+                self.__class__.api_key_store_error = str(exc)
+                client_error = client_error_message(exc, fallback="本地加密存储写入失败")
+                log_event("api_key_store_write_error", level=logging.ERROR, error=client_error)
+                raise LocalStoreWriteError(f"API Key 本地加密存储写入失败：{client_error}") from exc
+            self.__class__.api_key = normalized
+            self.__class__.api_key_saved_at = saved_at
+            self.__class__.api_key_source = "store"
+            self.__class__.api_key_store_error = ""
+            return self._api_key_config_payload()
 
     def _handle_api_key_config(self) -> None:
         try:
@@ -7223,8 +10754,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 return
             body = self._read_json_body()
-            new_key = str(body.get("api_key") or "").strip()
-            current_key = str(body.get("current_key") or "").strip()
+            new_key = body.get("api_key")
+            current_key = body.get("current_key")
             try:
                 payload = self._save_api_key_from_panel(new_key, current_key)
             except PermissionError as exc:
@@ -7240,6 +10771,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     },
                 )
                 return
+            except LocalStoreWriteError as exc:
+                self._json_response(
+                    500,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": str(exc),
+                            "type": "local_store_error",
+                            "code": "api_key_store_write_failed",
+                        },
+                    },
+                )
+                return
+            except ValueError as exc:
+                self._json_response(
+                    400,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": str(exc),
+                            "type": "invalid_request_error",
+                            "code": "invalid_api_key_config",
+                        },
+                    },
+                )
+                return
             self._json_response(
                 200,
                 {
@@ -7251,18 +10808,85 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
     def _settings_payload(self) -> dict[str, Any]:
-        return {
-            "ok": True,
-            "settings": dict(self.settings),
-            "saved_at": self.settings_saved_at,
-            "path": self.settings_path.name,
-            "error": self.settings_error,
-        }
+        with self.settings_state_lock:
+            return {
+                "ok": True,
+                "settings": dict(self.settings),
+                "saved_at": self.settings_saved_at,
+                "path": self.settings_path.name,
+                "max_bytes": MAX_SETTINGS_STORE_BYTES,
+                "persisted": not bool(self.settings_error),
+                "error": client_error_message(self.settings_error, fallback="") if self.settings_error else "",
+            }
+
+    def _settings_store_payload(self) -> dict[str, Any]:
+        with self.settings_state_lock:
+            return {
+                "path": self.settings_path.name,
+                "saved_at": self.settings_saved_at,
+                "max_bytes": MAX_SETTINGS_STORE_BYTES,
+                "persisted": not bool(self.settings_error),
+                "error": client_error_message(self.settings_error, fallback="") if self.settings_error else "",
+            }
+
+    def _browser_progress_snapshot(self) -> dict[str, Any]:
+        with self.browser_progress_lock:
+            payload = dict(self.__class__.browser_login_progress)
+        if payload.get("error"):
+            payload["error"] = client_error_message(payload["error"], fallback="")
+        payload["locked"] = self.browser_flow_lock.locked()
+        return payload
+
+    def _browser_progress_update(self, **fields: Any) -> dict[str, Any]:
+        with self.browser_progress_lock:
+            self.__class__.browser_login_progress.update(fields)
+            return dict(self.__class__.browser_login_progress)
+
+    def _auth_flow_busy_response(self) -> None:
+        progress = self._browser_progress_snapshot()
+        self._json_response(
+            409,
+            {
+                "ok": False,
+                "error": {
+                    "message": "已有登录或验证码采集流程正在进行，请先完成。",
+                    "type": "auth_flow_busy",
+                    "code": "auth_flow_busy",
+                },
+                "flow": {
+                    "running": bool(progress.get("running")),
+                    "locked": bool(progress.get("locked")),
+                    "mode": str(progress.get("mode") or ""),
+                    "stage": str(progress.get("stage") or ""),
+                    "updated_at": str(progress.get("updated_at") or ""),
+                },
+            },
+        )
+
+    def _profile_capacity_response(self, exc: ProfileCapacityError) -> None:
+        self._json_response(
+            409,
+            {
+                "ok": False,
+                "error": {
+                    "message": str(exc),
+                    "type": "profile_capacity_reached",
+                    "code": "profile_capacity_reached",
+                    "max_profiles": MAX_ACCOUNT_PROFILES,
+                },
+            },
+        )
 
     def _save_settings(self, settings: dict[str, Any]) -> None:
-        normalized = normalize_local_settings(settings, self.settings)
-        try:
-            saved_at = save_local_settings(normalized, self.settings_path)
+        with self.settings_state_lock:
+            normalized = normalize_local_settings(settings, self.settings)
+            try:
+                saved_at = save_local_settings(normalized, self.settings_path)
+            except Exception as exc:
+                self.__class__.settings_error = str(exc)
+                client_error = client_error_message(exc, fallback="本地设置写入失败")
+                log_event("settings_store_write_error", level=logging.ERROR, error=client_error)
+                raise LocalStoreWriteError(f"默认设置写入失败：{client_error}") from exc
             self.__class__.settings = normalized
             self.__class__.settings_saved_at = saved_at
             self.__class__.settings_error = ""
@@ -7277,28 +10901,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.__class__.upstream_retry_max_attempts = int(
                 normalized.get("upstream_retry_max_attempts", DEFAULT_UPSTREAM_RETRY_ATTEMPTS)
             )
-            _HISTORY_CONF["max_records"] = max(50, min(2000, int(normalized.get("history_max_records") or 300)))
-        except Exception as exc:
-            self.__class__.settings_error = str(exc)
-            raise
+            _HISTORY_CONF["max_records"] = max(
+                50,
+                min(2000, int(normalized.get("history_max_records") or 300)),
+            )
 
     def _cors_origin(self) -> str:
-        origin = str(self.headers.get("Origin") or "")
+        origin = str(self.headers.get("Origin") or "").strip().rstrip("/")
         if not origin:
             return ""
         if "*" in self.cors_origins:
             return "*"
+        try:
+            parsed = urlsplit(origin)
+            host = str(parsed.hostname or "").lower().rstrip(".")
+            is_loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+            origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            server_port = int(self.server.server_address[1])
+            if parsed.scheme == "http" and is_loopback and origin_port == server_port:
+                return origin
+        except (ValueError, TypeError):
+            pass
         return origin if origin in self.cors_origins else ""
 
     def _send_cors_headers(self) -> None:
+        # Generation handlers bind a concrete account before writing headers.
+        # Returning that opaque local profile id lets API clients pin a later
+        # continuation with the same header, matching the web console behavior.
+        profile_id = self._chat_profile_get()
+        if profile_id:
+            self.send_header(PROFILE_ROUTING_HEADER, profile_id)
         origin = self._cors_origin()
         if not origin:
             return
         self.send_header("Access-Control-Allow-Origin", origin)
         self.send_header(
             "Access-Control-Allow-Headers",
-            "content-type, authorization, x-filename, x-api-key, anthropic-version, anthropic-beta",
+            "content-type, authorization, x-filename, x-api-key, x-glm2api-profile-id, anthropic-version, anthropic-beta",
         )
+        self.send_header("Access-Control-Expose-Headers", f"Retry-After, {PROFILE_ROUTING_HEADER}")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Max-Age", "600")
         if origin != "*":
@@ -7329,9 +10970,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
 
     def _json_response(self, status: int, payload: dict[str, Any], extra_headers: dict[str, str] | None = None) -> None:
+        request_body_error: tuple[int, str, str] | None = None
+        if status in {400, 408, 413, 500}:
+            if getattr(self, "_request_body_timed_out", False):
+                request_body_error = (408, "request body timed out", "request_timeout")
+            elif getattr(self, "_request_body_too_large", False):
+                request_body_error = (413, "request body too large", "request_too_large")
+        if request_body_error is not None:
+            status, message, code = request_body_error
+            self.close_connection = True
+            payload = copy.deepcopy(payload)
+            error = payload.get("error")
+            if isinstance(error, dict):
+                error["message"] = message
+                if str(payload.get("type") or "").lower() == "error":
+                    # Anthropic envelope: root type=error, nested type is the code.
+                    error["type"] = code
+                elif payload.get("ok") is False:
+                    error["type"] = code
+                    error["code"] = code
+                else:
+                    # OpenAI envelope: preserve invalid_request_error and use code.
+                    error["code"] = code
+            else:
+                payload = {
+                    "ok": False,
+                    "error": {
+                        "message": message,
+                        "type": code,
+                        "code": code,
+                    },
+                }
+        error_shaped = (
+            status >= 400
+            or payload.get("ok") is False
+            or str(payload.get("type") or "").lower() == "error"
+        )
+        if error_shaped:
+            payload = sanitize_client_error_payload(payload)
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         headers = {"Cache-Control": "no-store"}
         headers.update(extra_headers or {})
+        if request_body_error is not None or self.close_connection:
+            headers.setdefault("Connection", "close")
         self._send_bytes(status, raw, "application/json; charset=utf-8", headers)
 
     def _html_response(self, status: int, html: str) -> None:
@@ -7342,14 +11023,128 @@ class ProxyHandler(BaseHTTPRequestHandler):
             {"Cache-Control": "no-cache"},
         )
 
+    def _ensure_sse_state(self) -> None:
+        if not hasattr(self, "_sse_output_lock"):
+            self._sse_output_lock = threading.Lock()
+            self._sse_last_write_mono = time.monotonic()
+            self._sse_heartbeat_stop = None
+            self._sse_heartbeat_thread = None
+            self._sse_heartbeat_error = None
+
+    def _sse_raw_write(
+        self,
+        raw: bytes,
+        *,
+        heartbeat: bool = False,
+        only_if_due: bool = False,
+        from_pump: bool = False,
+    ) -> bool:
+        """Serialize downstream SSE frames and surface timer-thread failures."""
+        global _SSE_HEARTBEATS_SENT_TOTAL
+        self._ensure_sse_state()
+        with self._sse_output_lock:
+            pump_error = self._sse_heartbeat_error
+            if pump_error is not None and not from_pump:
+                raise ConnectionResetError("downstream SSE heartbeat failed") from pump_error
+            now = time.monotonic()
+            interval = max(0.0, float(SSE_KEEPALIVE_INTERVAL_SECONDS))
+            if only_if_due and interval > 0 and now - self._sse_last_write_mono < interval:
+                return False
+            self.wfile.write(raw)
+            self.wfile.flush()
+            self._sse_last_write_mono = time.monotonic()
+        if heartbeat:
+            with _SSE_HEARTBEAT_STATS_LOCK:
+                _SSE_HEARTBEATS_SENT_TOTAL += 1
+        return True
+
+    def _check_sse_heartbeat(self) -> None:
+        """Raise in the request thread after the timer detected a disconnect."""
+        self._ensure_sse_state()
+        with self._sse_output_lock:
+            pump_error = self._sse_heartbeat_error
+        if pump_error is not None:
+            raise ConnectionResetError("downstream SSE heartbeat failed") from pump_error
+
+    def _check_request_cancelled(self) -> None:
+        """Abort upstream work on downstream failure or service shutdown."""
+        self._check_sse_heartbeat()
+        shutdown_event = getattr(self.server, "shutdown_event", None)
+        if shutdown_event is not None and shutdown_event.is_set():
+            raise ServiceShuttingDown("local service is shutting down")
+
     def _sse_write(self, event: str, payload: dict[str, Any]) -> None:
         raw = f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
-        self.wfile.write(raw)
-        self.wfile.flush()
+        self._sse_raw_write(raw)
 
-    def _sse_keepalive(self) -> None:
-        self.wfile.write(b": keep-alive\n\n")
-        self.wfile.flush()
+    def _sse_keepalive(self, *, from_pump: bool = False) -> bool:
+        return self._sse_raw_write(
+            b": keep-alive\n\n",
+            heartbeat=True,
+            only_if_due=True,
+            from_pump=from_pump,
+        )
+
+    def _start_sse_heartbeat_pump(self) -> None:
+        """Keep the downstream alive across captcha/chat/connect blocking phases."""
+        global _SSE_HEARTBEAT_PUMPS_ACTIVE, _SSE_HEARTBEAT_PUMPS_PEAK, _SSE_HEARTBEAT_PUMPS_STARTED
+        global _SSE_HEARTBEAT_ERRORS_TOTAL
+        self._ensure_sse_state()
+        self._stop_sse_heartbeat_pump()
+        interval = max(0.0, float(SSE_KEEPALIVE_INTERVAL_SECONDS))
+        with self._sse_output_lock:
+            self._sse_last_write_mono = time.monotonic()
+            self._sse_heartbeat_error = None
+        if interval <= 0:
+            return
+        stop = threading.Event()
+        self._sse_heartbeat_stop = stop
+
+        def run() -> None:
+            global _SSE_HEARTBEAT_PUMPS_ACTIVE, _SSE_HEARTBEAT_PUMPS_PEAK, _SSE_HEARTBEAT_PUMPS_STARTED
+            global _SSE_HEARTBEAT_ERRORS_TOTAL
+            with _SSE_HEARTBEAT_STATS_LOCK:
+                _SSE_HEARTBEAT_PUMPS_ACTIVE += 1
+                _SSE_HEARTBEAT_PUMPS_STARTED += 1
+                _SSE_HEARTBEAT_PUMPS_PEAK = max(
+                    _SSE_HEARTBEAT_PUMPS_PEAK,
+                    _SSE_HEARTBEAT_PUMPS_ACTIVE,
+                )
+            try:
+                while not stop.is_set():
+                    with self._sse_output_lock:
+                        remaining = max(
+                            0.05,
+                            interval - (time.monotonic() - self._sse_last_write_mono),
+                        )
+                    if stop.wait(remaining):
+                        return
+                    try:
+                        self._sse_keepalive(from_pump=True)
+                    except BaseException as exc:
+                        with self._sse_output_lock:
+                            self._sse_heartbeat_error = exc
+                        with _SSE_HEARTBEAT_STATS_LOCK:
+                            _SSE_HEARTBEAT_ERRORS_TOTAL += 1
+                        return
+            finally:
+                with _SSE_HEARTBEAT_STATS_LOCK:
+                    _SSE_HEARTBEAT_PUMPS_ACTIVE = max(0, _SSE_HEARTBEAT_PUMPS_ACTIVE - 1)
+
+        thread = threading.Thread(target=run, name="sse-heartbeat", daemon=True)
+        self._sse_heartbeat_thread = thread
+        thread.start()
+
+    def _stop_sse_heartbeat_pump(self) -> None:
+        self._ensure_sse_state()
+        stop = self._sse_heartbeat_stop
+        thread = self._sse_heartbeat_thread
+        if stop is not None:
+            stop.set()
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(timeout=0.5)
+        self._sse_heartbeat_stop = None
+        self._sse_heartbeat_thread = None
 
     @staticmethod
     def _close_upstream_events(events: Iterable[str]) -> None:
@@ -7360,12 +11155,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
+    def _raise_request_body_too_large(self, max_bytes: int, *, framing: str) -> NoReturn:
+        self.close_connection = True
+        self._request_body_too_large = True
+        if not getattr(self, "_request_body_too_large_logged", False):
+            self._request_body_too_large_logged = True
+            log_event(
+                "request_body_too_large",
+                level=logging.WARNING,
+                path=safe_access_log_target(self.path),
+                framing=framing,
+                max_bytes=max(1, int(max_bytes)),
+            )
+        raise RequestBodyTooLarge("request body too large")
+
     def _content_length(self, max_bytes: int, allow_empty: bool = False) -> int:
-        value = self.headers.get("Content-Length")
-        if value is None:
+        values = self.headers.get_all("Content-Length") or []
+        if not values:
             if allow_empty:
                 return 0
             raise ValueError("missing Content-Length")
+        if len(values) != 1:
+            raise ValueError("multiple Content-Length headers are not allowed")
+        value = values[0]
         try:
             length = int(value)
         except ValueError as exc:
@@ -7375,41 +11187,143 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if length == 0 and not allow_empty:
             raise ValueError("missing request body")
         if length > max_bytes:
-            raise ValueError("request body too large")
+            self._raise_request_body_too_large(max_bytes, framing="content-length")
         return length
 
-    def _read_json_body(self, max_bytes: int = MAX_JSON_BODY_BYTES) -> dict[str, Any]:
-        length = self._content_length(max_bytes, allow_empty=True)
+    def _request_body_framing(self, max_bytes: int, allow_empty: bool = False) -> tuple[str, int]:
+        transfer_values = self.headers.get_all("Transfer-Encoding") or []
+        if transfer_values:
+            if self.headers.get_all("Content-Length"):
+                raise ValueError("Content-Length and Transfer-Encoding cannot be combined")
+            raw_parts = ",".join(transfer_values).split(",")
+            codings = [part.strip().lower() for part in raw_parts]
+            if any(not coding for coding in codings) or codings != ["chunked"]:
+                raise ValueError("unsupported Transfer-Encoding; only chunked is accepted")
+            return "chunked", 0
+        return "length", self._content_length(max_bytes, allow_empty=allow_empty)
+
+    def _read_body_chunk(self, size: int) -> bytes:
+        try:
+            return self.rfile.read(size)
+        except TimeoutError as exc:
+            self.close_connection = True
+            self._request_body_timed_out = True
+            if not getattr(self, "_request_body_timeout_logged", False):
+                self._request_body_timeout_logged = True
+                try:
+                    declared_bytes = max(0, int(self.headers.get("Content-Length") or 0))
+                except (TypeError, ValueError):
+                    declared_bytes = 0
+                log_event(
+                    "request_body_timeout",
+                    level=logging.WARNING,
+                    path=safe_access_log_target(self.path),
+                    declared_bytes=declared_bytes,
+                )
+            raise RequestBodyTimeout("request body timed out") from exc
+
+    def _read_body_line(self, max_bytes: int) -> bytes:
+        try:
+            line = self.rfile.readline(max_bytes + 1)
+        except TimeoutError as exc:
+            self.close_connection = True
+            self._request_body_timed_out = True
+            if not getattr(self, "_request_body_timeout_logged", False):
+                self._request_body_timeout_logged = True
+                log_event(
+                    "request_body_timeout",
+                    level=logging.WARNING,
+                    path=safe_access_log_target(self.path),
+                    declared_bytes=0,
+                    framing="chunked",
+                )
+            raise RequestBodyTimeout("request body timed out") from exc
+        if len(line) > max_bytes:
+            raise ValueError("chunked body line is too large")
+        if not line:
+            raise ValueError("incomplete chunked request body")
+        if not line.endswith(b"\r\n"):
+            raise ValueError("malformed chunked request body")
+        return line
+
+    def _iter_chunked_body(self, max_bytes: int) -> Iterable[bytes]:
+        total = 0
+        while True:
+            line = self._read_body_line(MAX_CHUNK_SIZE_LINE_BYTES)
+            token = line[:-2].split(b";", 1)[0].strip()
+            if not re.fullmatch(rb"[0-9A-Fa-f]{1,16}", token):
+                raise ValueError("invalid chunk size")
+            chunk_size = int(token, 16)
+            if chunk_size == 0:
+                trailer_bytes = 0
+                while True:
+                    trailer = self._read_body_line(MAX_CHUNK_TRAILER_BYTES)
+                    if trailer == b"\r\n":
+                        return
+                    trailer_bytes += len(trailer)
+                    if trailer_bytes > MAX_CHUNK_TRAILER_BYTES:
+                        raise ValueError("chunked trailers are too large")
+                    trailer_value = trailer[:-2]
+                    if b":" not in trailer_value or trailer_value[:1] in {b" ", b"\t"}:
+                        raise ValueError("invalid chunked trailer")
+            if total + chunk_size > max_bytes:
+                self._raise_request_body_too_large(max_bytes, framing="chunked")
+            chunk = self._read_body_chunk(chunk_size)
+            if len(chunk) != chunk_size:
+                raise ValueError("incomplete chunked request body")
+            if self._read_body_chunk(2) != b"\r\n":
+                raise ValueError("malformed chunk delimiter")
+            total += chunk_size
+            if chunk:
+                yield chunk
+
+    def _read_framed_body(self, max_bytes: int, allow_empty: bool = False) -> bytes:
+        framing, length = self._request_body_framing(max_bytes, allow_empty=allow_empty)
+        if framing == "chunked":
+            raw = b"".join(self._iter_chunked_body(max_bytes))
+            if not raw and not allow_empty:
+                raise ValueError("missing request body")
+            return raw
         if length <= 0:
-            return {}
-        raw = self.rfile.read(length)
+            return b""
+        raw = self._read_body_chunk(length)
         if len(raw) != length:
             raise ValueError("incomplete request body")
+        return raw
+
+    def _read_json_body(self, max_bytes: int = MAX_JSON_BODY_BYTES) -> dict[str, Any]:
+        raw = self._read_framed_body(max_bytes, allow_empty=True)
+        if not raw:
+            return {}
         body = json.loads(raw.decode("utf-8"))
         if not isinstance(body, dict):
             raise ValueError("JSON body must be an object")
         return body
 
     def _read_raw_body(self, max_bytes: int = MAX_HAR_UPLOAD_BYTES) -> bytes:
-        length = self._content_length(max_bytes)
-        raw = self.rfile.read(length)
-        if len(raw) != length:
-            raise ValueError("incomplete request body")
-        return raw
+        return self._read_framed_body(max_bytes)
 
     def _spool_raw_body(self, max_bytes: int, prefix: str, suffix: str) -> Path:
-        length = self._content_length(max_bytes)
+        framing, length = self._request_body_framing(max_bytes)
         tmp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(prefix=prefix, suffix=suffix, delete=False) as f:
                 tmp_path = Path(f.name)
-                remaining = length
-                while remaining:
-                    chunk = self.rfile.read(min(UPLOAD_STREAM_CHUNK_BYTES, remaining))
-                    if not chunk:
-                        raise ValueError("incomplete request body")
-                    f.write(chunk)
-                    remaining -= len(chunk)
+                if framing == "chunked":
+                    written = 0
+                    for chunk in self._iter_chunked_body(max_bytes):
+                        f.write(chunk)
+                        written += len(chunk)
+                    if not written:
+                        raise ValueError("missing request body")
+                else:
+                    remaining = length
+                    while remaining:
+                        chunk = self._read_body_chunk(min(UPLOAD_STREAM_CHUNK_BYTES, remaining))
+                        if not chunk:
+                            raise ValueError("incomplete request body")
+                        f.write(chunk)
+                        remaining -= len(chunk)
             return tmp_path
         except Exception:
             if tmp_path is not None:
@@ -7463,11 +11377,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path in {"/healthz", "/readyz"}:
             with self.state_lock:
                 auth_ready = bool(self.profiles.get(self.active_profile_id) or self.state)
-            self._json_response(200, {"ok": True, "auth_ready": auth_ready})
+            self._json_response(200, {"ok": True, "service": SERVICE_ID, "auth_ready": auth_ready})
             return
         if path == "/api/hello":
             # 探测端点：有客户端用 HEAD/GET /api/hello 探活（日志 03:58 实测），不应 404。
-            self._json_response(200, {"ok": True})
+            self._json_response(200, {"ok": True, "service": SERVICE_ID})
             return
         if path.startswith(("/api/", "/v1/", "/chat/", "/anthropic/", "/responses/", "/messages")) and path not in {"/api/status", "/api/settings/api-key"}:
             if not self._require_api_key():
@@ -7492,7 +11406,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._json_response(200, self._settings_payload())
             return
         if path == "/api/status":
-            if self.api_key and not self._api_key_authorized():
+            api_key_config = self._api_key_config_payload()
+            with self.settings_state_lock:
+                settings_snapshot = dict(self.settings)
+                upstream_timeout_sec = self.upstream_timeout_sec
+                upstream_retry_wait_sec = self.upstream_retry_wait_sec
+                upstream_retry_max_attempts = self.upstream_retry_max_attempts
+            if api_key_config["enabled"] and not self._api_key_authorized():
                 self._json_response(
                     200,
                     {
@@ -7501,11 +11421,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "api_key_valid": False,
                         "auth_ready": False,
                         "supported_models": list(ADVERTISED_MODELS),
-                        "api_key_source": self.api_key_source,
-                        "api_key_saved_at": self.api_key_saved_at,
-                        "upstream_timeout_sec": self.upstream_timeout_sec,
-                        "upstream_retry_wait_sec": self.upstream_retry_wait_sec,
-                        "upstream_retry_max_attempts": self.upstream_retry_max_attempts,
+                        "api_key_source": api_key_config["source"],
+                        "api_key_saved_at": api_key_config["saved_at"],
+                        "upstream_timeout_sec": upstream_timeout_sec,
+                        "upstream_retry_wait_sec": upstream_retry_wait_sec,
+                        "upstream_retry_max_attempts": upstream_retry_max_attempts,
                     },
                 )
                 return
@@ -7518,29 +11438,39 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "ok": True,
-                    "api_key_required": bool(self.api_key),
+                    "api_key_required": bool(api_key_config["enabled"]),
                     "api_key_valid": True,
-                    "api_key_source": self.api_key_source,
-                    "api_key_saved_at": self.api_key_saved_at,
-                    "api_key_store_error": self.api_key_store_error,
+                    "api_key_source": api_key_config["source"],
+                    "api_key_saved_at": api_key_config["saved_at"],
+                    "api_key_store_error": api_key_config["error"],
                     "auth_ready": state is not None,
                     "model": DEFAULT_MODEL,
                     "supported_models": list(ADVERTISED_MODELS),
-                    "default_options": chat_options_public(chat_options_from_body(self.settings)),
+                    "default_options": chat_options_public(chat_options_from_body(settings_snapshot)),
                     "base_url": BASE_URL,
+                    # captcha_mode 保留旧值，避免已有面板/脚本失配；新代码应读取
+                    # captcha_strategy + captcha_solver 判断真实求解链路。
                     "captcha_mode": "browser_fresh" if self.fresh_captcha_browser else "provided_or_har",
+                    "captcha_strategy": "fresh" if self.fresh_captcha_browser else "provided_or_har",
+                    "captcha_fresh_enabled": bool(self.fresh_captcha_browser),
                     "captcha_solver": _CAPTCHA_MODE,
-                    "upstream_timeout_sec": self.upstream_timeout_sec,
-                    "upstream_retry_wait_sec": self.upstream_retry_wait_sec,
-                    "upstream_retry_max_attempts": self.upstream_retry_max_attempts,
+                    "captcha_happydom_available": happydom_captcha_available(),
+                    "captcha_browser_fallback_enabled": bool(
+                        browser_captcha_refresh_enabled(self.fresh_captcha_browser)
+                    ),
+                    "legacy_browser_captcha_refresh_enabled": browser_captcha_refresh_enabled(
+                        self.fresh_captcha_browser
+                    ),
+                    "playwright_available": playwright_package_available(),
+                    "upstream_timeout_sec": upstream_timeout_sec,
+                    "upstream_retry_wait_sec": upstream_retry_wait_sec,
+                    "upstream_retry_max_attempts": upstream_retry_max_attempts,
                     "include_thinking": self.include_thinking,
                     "active_profile_id": self.active_profile_id,
-                    "profile_label": active_profile.label if active_profile else "",
-                    "user_id": state.user_id if state else "",
-                    "user_name": state.user_name if state else "",
+                    "user_id_fp": sha16(state.user_id) if state and state.user_id else "",
                     "token_fp": sha16(state.token) if state else "",
                     "device_id_fp": sha16(state.device_id) if state and state.device_id else "",
-                    "chrome_path": self.chrome_path or default_chrome_path() or "",
+                    "browser_executable_available": bool(self.chrome_path or default_chrome_path()),
                     "protocol_compatibility": {
                         "openai_chat_completions": True,
                         "openai_responses": True,
@@ -7550,21 +11480,89 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "context_file_default": False,
                         "force_history_suffix": FORCE_HISTORY_MODEL_SUFFIX,
                         "auto_delete_after_completion_default": DEFAULT_DELETE_CHAT_AFTER_COMPLETION,
+                        "chunked_request_body": True,
+                        "bounded_query_params": True,
+                        "upstream_idle_heartbeat": True,
                     },
                     "profile_store": self._profiles_payload()["profile_store"],
+                    "settings_store": self._settings_store_payload(),
                     "chat_busy": active_chat_busy_count > 0,
                     "chat_busy_count": active_chat_busy_count,
+                    "concurrency": self._concurrency_payload(),
+                    "response_store": self._response_store_status(),
+                    "history_store": history_store_status(),
+                    "log_store": log_store_status(),
+                    "auto_delete": auto_delete_executor_status(),
+                    "captcha_worker": captcha_worker_status(),
+                    "http_handlers": self.server.handler_status(exclude_current=True),
+                    "upload_slots": upload_slot_status(),
+                    "upstream_responses": upstream_response_status(),
+                    "upstream_readers": upstream_reader_status(),
+                    "sse_heartbeat": sse_heartbeat_status(),
+                    "context_cache": context_cache_status(),
                     "limits": {
                         "chat_file_upload_bytes": MAX_CHAT_FILE_UPLOAD_BYTES,
                         "har_upload_bytes": MAX_HAR_UPLOAD_BYTES,
+                        "legacy_json_har_bytes": MAX_LEGACY_JSON_HAR_BYTES,
                         "json_body_bytes": MAX_JSON_BODY_BYTES,
+                        "upstream_stream_wire_bytes": MAX_UPSTREAM_STREAM_WIRE_BYTES,
+                        "upstream_stream_output_bytes": MAX_UPSTREAM_STREAM_OUTPUT_BYTES,
+                        "upstream_stream_events": MAX_UPSTREAM_STREAM_EVENTS,
+                        "upstream_json_response_bytes": MAX_UPSTREAM_JSON_RESPONSE_BYTES,
+                        "upstream_error_response_bytes": MAX_UPSTREAM_ERROR_RESPONSE_BYTES,
+                        "upstream_upload_response_bytes": MAX_UPSTREAM_UPLOAD_RESPONSE_BYTES,
+                        "runtime_metric_paths": MAX_RUNTIME_METRIC_PATHS,
+                        "runtime_metric_path_chars": MAX_RUNTIME_METRIC_PATH_CHARS,
+                        "log_record_chars": LOG_RECORD_MAX_CHARS,
+                        "response_store_bytes": MAX_RESPONSE_STORE_BYTES,
+                        "stored_response_bytes": MAX_STORED_RESPONSE_BYTES,
+                        "history_detail_bytes": HISTORY_MAX_DETAIL_BYTES,
+                        "history_index_bytes": MAX_HISTORY_INDEX_BYTES,
+                        "history_detail_file_bytes": MAX_HISTORY_DETAIL_FILE_BYTES,
+                        "history_detail_scan_files": MAX_HISTORY_DETAIL_SCAN_FILES,
+                        "http_handler_threads": MAX_HTTP_HANDLER_THREADS,
+                        "query_fields": MAX_QUERY_FIELDS,
+                        "query_key_chars": MAX_QUERY_KEY_CHARS,
+                        "query_value_chars": MAX_QUERY_VALUE_CHARS,
+                        "history_search_chars": MAX_HISTORY_SEARCH_CHARS,
+                        "history_query_page": MAX_HISTORY_QUERY_PAGE,
+                        "account_profiles": MAX_ACCOUNT_PROFILES,
+                        "profile_store_bytes": MAX_PROFILE_STORE_BYTES,
+                        "profile_store_payload_bytes": MAX_PROFILE_STORE_PAYLOAD_BYTES,
+                        "settings_store_bytes": MAX_SETTINGS_STORE_BYTES,
+                        "pending_delete_store_bytes": MAX_PENDING_DELETE_STORE_BYTES,
+                        "local_api_key_chars": MAX_LOCAL_API_KEY_CHARS,
+                        "api_key_store_bytes": MAX_API_KEY_STORE_BYTES,
+                        "session_token_chars": MAX_SESSION_TOKEN_CHARS,
+                        "profile_state_field_chars": MAX_PROFILE_STATE_FIELD_CHARS,
+                        "tool_definitions": MAX_TOOL_DEFINITIONS,
+                        "tool_definitions_bytes": MAX_TOOL_DEFINITIONS_BYTES,
+                        "tool_calls_per_turn": MAX_TOOL_CALLS_PER_TURN,
+                        "tool_arguments_bytes": MAX_TOOL_ARGUMENTS_BYTES,
+                        "graceful_shutdown_seconds": GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+                        "forced_shutdown_seconds": FORCED_SHUTDOWN_TIMEOUT_SECONDS,
+                        "request_socket_idle_seconds": REQUEST_SOCKET_IDLE_TIMEOUT_SECONDS,
+                        "upstream_file_idle_seconds": UPSTREAM_FILE_IDLE_TIMEOUT_SECONDS,
+                        "captcha_worker_pending": CAPTCHA_WORKER_MAX_PENDING,
+                        "auto_delete_request_seconds": AUTO_DELETE_REQUEST_TIMEOUT_SECONDS,
+                        "auto_delete_shutdown_seconds": AUTO_DELETE_SHUTDOWN_TIMEOUT_SECONDS,
+                        "upstream_stop_seconds": UPSTREAM_STOP_TIMEOUT_SECONDS,
+                        "har_extract_seconds": HAR_EXTRACT_TIMEOUT_SECONDS,
+                        "helper_process_poll_seconds": HELPER_PROCESS_POLL_SECONDS,
+                        "browser_login_launch_seconds": BROWSER_LOGIN_LAUNCH_TIMEOUT_MS / 1000,
+                        "browser_login_navigation_slice_seconds": BROWSER_LOGIN_NAVIGATION_SLICE_MS / 1000,
+                        "browser_login_auth_fetch_seconds": BROWSER_LOGIN_AUTH_FETCH_TIMEOUT_MS / 1000,
+                        "pending_delete_records": PENDING_DELETE_MAX_RECORDS,
+                        "active_chat_file_uploads": MAX_ACTIVE_CHAT_FILE_UPLOADS,
+                        "active_har_uploads": MAX_ACTIVE_HAR_UPLOADS,
+                        "chunk_size_line_bytes": MAX_CHUNK_SIZE_LINE_BYTES,
+                        "chunk_trailer_bytes": MAX_CHUNK_TRAILER_BYTES,
                     },
                 },
             )
             return
         if path == "/api/auth/browser-login/status":
-            with self.state_lock:
-                payload = dict(self.__class__.browser_login_progress)
+            payload = self._browser_progress_snapshot()
             self._json_response(200, {"ok": True, **payload})
             return
         if path in {"/api/auth/state", "/api/auth/profiles"}:
@@ -7667,6 +11665,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         if path == "/api/auth/browser-login":
             self._handle_auth_browser_login()
             return
+        # 保留旧版客户端的手动验证码接口；当前网页不再暴露该入口。启用
+        # fresh-captcha 时优先使用本地 happy-dom，浏览器仅作为可选回退。
         if path == "/api/auth/captcha-refresh":
             self._handle_auth_captcha_refresh()
             return
@@ -7701,37 +11701,41 @@ class ProxyHandler(BaseHTTPRequestHandler):
         return
 
     def _write_openai_chunk(self, payload: dict[str, Any]) -> None:
-        self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8"))
-        self.wfile.flush()
+        self._sse_raw_write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8"))
 
-    @_chat_slot_guard("_openai_busy")
+    @_chat_slot_guard("_openai_busy", "_openai_profile_missing")
     def _handle_openai_chat_completions(self) -> None:
         try:
             body = self._read_json_body()
             request = normalize_openai_chat_request(body, self.api_include_thinking_default)
+            if not self._acquire_deferred_chat_slot():
+                return
             if request.stream:
                 self._stream_openai_chat_completions(request)
                 return
             turn = self._collect_protocol_turn(request)
             self._json_response(200, build_openai_chat_completion(request, turn))
         except Exception as exc:
-            if not isinstance(exc, ValueError):
+            if not isinstance(exc, (ValueError, UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
                 LOG.exception("[%s] openai chat completions failed", current_request_id())
             message = str(exc)
             # 内部重试耗尽后的上游繁忙/验证码失效：503 + Retry-After，让 SDK 走标准退避。
-            if not isinstance(exc, ValueError) and is_retryable_upstream_error(message):
+            if not isinstance(exc, ValueError) and is_retryable_protocol_exception(exc):
                 self._openai_error(503, message, extra_headers={"Retry-After": "3"})
                 return
-            status = 400 if isinstance(exc, ValueError) else 500
+            status = exception_http_status(exc)
             self._openai_error(status, message)
 
     def _stream_openai_chat_completions(self, request: ProtocolRequest) -> None:
-        events, context, state = self._start_protocol_completion(request)
+        events: Iterable[str] = ()
+        context: dict[str, Any] = {}
+        state = self._active_state()
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         created = int(time.time())
         buffer_for_tools = bool(request.tools) and request.tool_choice.mode != "none"
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        stream_budget = UpstreamStreamBudget()
         last_client_write = time.monotonic()
 
         def keepalive_if_due() -> None:
@@ -7750,6 +11754,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.close_connection = True
+            self._start_sse_heartbeat_pump()
             self._write_openai_chunk(
                 {
                     "id": completion_id,
@@ -7759,13 +11764,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}],
                 }
             )
+            events, context, state = self._start_protocol_completion(request)
             for event in events:
+                stream_budget.observe_event(event)
                 error = extract_error_from_event(event)
                 if error:
                     raise RuntimeError(error)
                 delta, phase = extract_delta_from_event(event)
-                if not delta:
+                if is_sse_comment_event(event):
+                    self._sse_keepalive()
+                    last_client_write = time.monotonic()
                     continue
+                if not delta:
+                    keepalive_if_due()
+                    continue
+                stream_budget.observe_delta(delta)
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
                     if request.options.include_thinking and not buffer_for_tools:
@@ -7798,7 +11811,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     last_client_write = time.monotonic()
                 else:
                     keepalive_if_due()
-            self._release_chat_slot_early()
+            def release_initial_output() -> None:
+                text_parts.clear()
+                thinking_parts.clear()
 
             def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
                 events2, context2, state2 = self._start_protocol_completion(
@@ -7809,9 +11824,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 return text2, thinking2, context2, state2
 
-            turn = self._complete_turn_with_required_retry(
-                request, state, context, "".join(text_parts), "".join(thinking_parts), _regenerate_required_turn
+            turn = self._complete_turn_with_tool_retry(
+                request,
+                state,
+                context,
+                "".join(text_parts),
+                "".join(thinking_parts),
+                _regenerate_required_turn,
+                release_initial_output,
             )
+            text_parts.clear()
+            thinking_parts.clear()
+            self._release_chat_slot_early()
             if buffer_for_tools and request.options.include_thinking and turn.thinking:
                 self._write_openai_chunk(
                     {
@@ -7870,26 +11894,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "usage": openai_usage(turn),
                 }
             )
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+            self._sse_raw_write(b"data: [DONE]\n\n")
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            reason = interruption_reason(exc)
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = reason
             self._close_upstream_events(events)
             self._release_chat_slot_early()
-            self._cleanup_failed_upstream_chat(state, context, request.options)
+            self._cleanup_failed_upstream_chat(
+                state,
+                context,
+                request.options,
+                force=True,
+                reason=reason,
+            )
             return
         except Exception as exc:
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = "error"
+                context["_stream_close_error"] = client_error_message(exc)
             self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
-            LOG.exception("[%s] streaming turn failed", current_request_id())
+            if not isinstance(exc, (UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
+                LOG.exception("[%s] streaming turn failed", current_request_id())
             try:
-                self._write_openai_chunk({"object": "error", "error": {"message": str(exc), "type": "server_error"}})
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                self._write_openai_chunk(
+                    {
+                        "object": "error",
+                        "error": {"message": client_error_message(exc), "type": "server_error"},
+                    }
+                )
+                self._sse_raw_write(b"data: [DONE]\n\n")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        finally:
+            self._stop_sse_heartbeat_pump()
 
-    @_chat_slot_guard("_openai_busy")
+    @_chat_slot_guard("_openai_busy", "_openai_profile_missing")
     def _handle_openai_responses(self) -> None:
         try:
             body = self._read_json_body()
@@ -7901,6 +11943,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     raise ValueError("previous_response_id not found or expired")
                 prior_messages = stored.messages
             request = normalize_openai_responses_request(body, self.api_include_thinking_default, prior_messages)
+            if not self._acquire_deferred_chat_slot():
+                return
             response_id = "resp_" + uuid.uuid4().hex
             if request.stream:
                 self._stream_openai_responses(request, response_id)
@@ -7911,20 +11955,23 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._store_response(response_id, payload, protocol_messages_with_turn(request, turn))
             self._json_response(200, payload)
         except Exception as exc:
-            if not isinstance(exc, ValueError):
+            if not isinstance(exc, (ValueError, UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
                 LOG.exception("[%s] openai responses failed", current_request_id())
             message = str(exc)
-            if not isinstance(exc, ValueError) and is_retryable_upstream_error(message):
+            if not isinstance(exc, ValueError) and is_retryable_protocol_exception(exc):
                 self._openai_error(503, message, extra_headers={"Retry-After": "3"})
                 return
-            status = 400 if isinstance(exc, ValueError) else 500
+            status = exception_http_status(exc)
             self._openai_error(status, message)
 
     def _stream_openai_responses(self, request: ProtocolRequest, response_id: str) -> None:
-        events, context, state = self._start_protocol_completion(request)
+        events: Iterable[str] = ()
+        context: dict[str, Any] = {}
+        state = self._active_state()
         buffer_for_tools = bool(request.tools) and request.tool_choice.mode != "none"
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        stream_budget = UpstreamStreamBudget()
         sequence = 0
         message_id = "msg_" + uuid.uuid4().hex
         # Thinking is streamed as a standard `reasoning` output item (index 0),
@@ -7959,6 +12006,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.close_connection = True
+            self._start_sse_heartbeat_pump()
             initial = build_openai_response_object(response_id, request, status="in_progress")
             send("response.created", {"response": initial})
             send("response.in_progress", {"response": initial})
@@ -8007,13 +12055,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "part": {"type": "output_text", "text": "", "annotations": []},
                     },
                 )
+            events, context, state = self._start_protocol_completion(request)
             for event in events:
+                stream_budget.observe_event(event)
                 error = extract_error_from_event(event)
                 if error:
                     raise RuntimeError(error)
                 delta, phase = extract_delta_from_event(event)
-                if not delta:
+                if is_sse_comment_event(event):
+                    self._sse_keepalive()
+                    last_client_write = time.monotonic()
                     continue
+                if not delta:
+                    keepalive_if_due()
+                    continue
+                stream_budget.observe_delta(delta)
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
                     if reasoning_wanted and not buffer_for_tools:
@@ -8042,7 +12098,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                 else:
                     keepalive_if_due()
-            self._release_chat_slot_early()
+            def release_initial_output() -> None:
+                text_parts.clear()
+                thinking_parts.clear()
 
             def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
                 events2, context2, state2 = self._start_protocol_completion(
@@ -8053,9 +12111,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 return text2, thinking2, context2, state2
 
-            turn = self._complete_turn_with_required_retry(
-                request, state, context, "".join(text_parts), "".join(thinking_parts), _regenerate_required_turn
+            turn = self._complete_turn_with_tool_retry(
+                request,
+                state,
+                context,
+                "".join(text_parts),
+                "".join(thinking_parts),
+                _regenerate_required_turn,
+                release_initial_output,
             )
+            text_parts.clear()
+            thinking_parts.clear()
+            self._release_chat_slot_early()
             if reasoning_wanted:
                 if buffer_for_tools and turn.thinking:
                     send(
@@ -8189,47 +12256,65 @@ class ProxyHandler(BaseHTTPRequestHandler):
             if request.store:
                 self._store_response(response_id, completed, protocol_messages_with_turn(request, turn))
             send("response.completed", {"response": completed})
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
+            self._sse_raw_write(b"data: [DONE]\n\n")
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            reason = interruption_reason(exc)
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = reason
             self._close_upstream_events(events)
             self._release_chat_slot_early()
-            self._cleanup_failed_upstream_chat(state, context, request.options)
+            self._cleanup_failed_upstream_chat(
+                state,
+                context,
+                request.options,
+                force=True,
+                reason=reason,
+            )
             return
         except Exception as exc:
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = "error"
+                context["_stream_close_error"] = client_error_message(exc)
             self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
-            LOG.exception("[%s] streaming turn failed", current_request_id())
+            if not isinstance(exc, (UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
+                LOG.exception("[%s] streaming turn failed", current_request_id())
             try:
-                send("error", {"error": {"message": str(exc), "type": "server_error"}})
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                send(
+                    "error",
+                    {"error": {"message": client_error_message(exc), "type": "server_error"}},
+                )
+                self._sse_raw_write(b"data: [DONE]\n\n")
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        finally:
+            self._stop_sse_heartbeat_pump()
 
-    @_chat_slot_guard("_anthropic_busy")
+    @_chat_slot_guard("_anthropic_busy", "_anthropic_profile_missing")
     def _handle_anthropic_messages(self) -> None:
         try:
             body = self._read_json_body()
             if "max_tokens" in body and int(body["max_tokens"]) <= 0:
                 raise ValueError("max_tokens must be positive")
             request = normalize_anthropic_messages_request(body, self.api_include_thinking_default)
+            if not self._acquire_deferred_chat_slot():
+                return
             if request.stream:
                 self._stream_anthropic_messages(request)
                 return
             turn = self._collect_protocol_turn(request)
             self._json_response(200, build_anthropic_message(request, turn))
         except Exception as exc:
-            if not isinstance(exc, ValueError):
+            if not isinstance(exc, (ValueError, UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
                 LOG.exception("[%s] anthropic messages failed", current_request_id())
             message = str(exc)
             # 内部重试耗尽后的上游繁忙/验证码失效：Anthropic 规范的 529 overloaded_error，
             # SDK 会按过载自动退避重试，而不是把 500 当作未知服务端故障。
-            if not isinstance(exc, ValueError) and is_retryable_upstream_error(message):
+            if not isinstance(exc, ValueError) and is_retryable_protocol_exception(exc):
                 self._anthropic_error(529, message, extra_headers={"Retry-After": "3"})
                 return
-            status = 400 if isinstance(exc, ValueError) else 500
+            status = exception_http_status(exc)
             self._anthropic_error(status, message)
 
     def _handle_anthropic_count_tokens(self) -> None:
@@ -8238,10 +12323,12 @@ class ProxyHandler(BaseHTTPRequestHandler):
             request = normalize_anthropic_messages_request(body, self.api_include_thinking_default)
             self._json_response(200, {"input_tokens": estimate_protocol_tokens(request.context_text)})
         except Exception as exc:
-            self._anthropic_error(400 if isinstance(exc, ValueError) else 500, str(exc))
+            self._anthropic_error(exception_http_status(exc), str(exc))
 
     def _stream_anthropic_messages(self, request: ProtocolRequest) -> None:
-        events, context, state = self._start_protocol_completion(request)
+        events: Iterable[str] = ()
+        context: dict[str, Any] = {}
+        state = self._active_state()
         # To avoid leaking adapter markup, tool and thinking responses are
         # rendered once their semantic block is known. Plain text keeps genuine
         # low-latency Anthropic streaming.
@@ -8249,6 +12336,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         buffer_for_semantics = buffer_for_semantics or request.options.include_thinking
         text_parts: list[str] = []
         thinking_parts: list[str] = []
+        stream_budget = UpstreamStreamBudget()
         message_id = "msg_" + uuid.uuid4().hex
         last_client_write = time.monotonic()
 
@@ -8268,6 +12356,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.close_connection = True
+            self._start_sse_heartbeat_pump()
             self._sse_write(
                 "message_start",
                 {
@@ -8289,13 +12378,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "content_block_start",
                     {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
                 )
+            events, context, state = self._start_protocol_completion(request)
             for event in events:
+                stream_budget.observe_event(event)
                 error = extract_error_from_event(event)
                 if error:
                     raise RuntimeError(error)
                 delta, phase = extract_delta_from_event(event)
-                if not delta:
+                if is_sse_comment_event(event):
+                    self._sse_keepalive()
+                    last_client_write = time.monotonic()
                     continue
+                if not delta:
+                    keepalive_if_due()
+                    continue
+                stream_budget.observe_delta(delta)
                 if phase.lower() == "thinking":
                     thinking_parts.append(delta)
                     keepalive_if_due()
@@ -8309,7 +12406,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     last_client_write = time.monotonic()
                 else:
                     keepalive_if_due()
-            self._release_chat_slot_early()
+            def release_initial_output() -> None:
+                text_parts.clear()
+                thinking_parts.clear()
 
             def _regenerate_required_turn(retry_request: ProtocolRequest) -> tuple[str, str, dict[str, Any], HarState]:
                 events2, context2, state2 = self._start_protocol_completion(
@@ -8320,9 +12419,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
                 return text2, thinking2, context2, state2
 
-            turn = self._complete_turn_with_required_retry(
-                request, state, context, "".join(text_parts), "".join(thinking_parts), _regenerate_required_turn
+            turn = self._complete_turn_with_tool_retry(
+                request,
+                state,
+                context,
+                "".join(text_parts),
+                "".join(thinking_parts),
+                _regenerate_required_turn,
+                release_initial_output,
             )
+            text_parts.clear()
+            thinking_parts.clear()
+            self._release_chat_slot_early()
             final_message = build_anthropic_message(request, turn, message_id)
             if buffer_for_semantics:
                 for index, block in enumerate(final_message["content"]):
@@ -8360,28 +12468,46 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             self._sse_write("message_stop", {"type": "message_stop"})
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError) as exc:
+            reason = interruption_reason(exc)
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = reason
             self._close_upstream_events(events)
             self._release_chat_slot_early()
-            self._cleanup_failed_upstream_chat(state, context, request.options)
+            self._cleanup_failed_upstream_chat(
+                state,
+                context,
+                request.options,
+                force=True,
+                reason=reason,
+            )
             return
         except Exception as exc:
+            if isinstance(context, dict):
+                context["_stream_close_reason"] = "error"
+                context["_stream_close_error"] = client_error_message(exc)
             self._close_upstream_events(events)
             self._release_chat_slot_early()
             self._cleanup_failed_upstream_chat(state, context, request.options)
-            LOG.exception("[%s] streaming turn failed", current_request_id())
+            if not isinstance(exc, (UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
+                LOG.exception("[%s] streaming turn failed", current_request_id())
             try:
                 # 重试耗尽后的繁忙/验证码失效按 Anthropic 规范标记为 overloaded_error，
                 # 客户端 SDK（Claude Code 等）据此识别为可重试的过载而非未知故障。
                 error_type = "overloaded_error" if is_retryable_upstream_error(str(exc)) else "api_error"
                 self._sse_write(
                     "error",
-                    {"type": "error", "error": {"type": error_type, "message": str(exc)}},
+                    {
+                        "type": "error",
+                        "error": {"type": error_type, "message": client_error_message(exc)},
+                    },
                 )
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        finally:
+            self._stop_sse_heartbeat_pump()
 
-    @_chat_slot_guard("_web_busy")
+    @_chat_slot_guard("_web_busy", "_web_profile_missing")
     def _handle_web_chat(self) -> None:
         streaming_started = False
         try:
@@ -8392,10 +12518,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
             history = web_history_from_body(body)
             response_model = requested_model_name(body)
             files = chat_files_from_body(body)
+            if not self._acquire_deferred_chat_slot():
+                return
             create_chat = not (options.mode in {"continue", "edit", "reuse"} and options.chat_id)
             state = self._active_state()
             assistant_message_id = str(uuid.uuid4())
-            context: dict[str, Any] = {"assistant_message_id": assistant_message_id}
+            profile_id = self._chat_profile_get() or ""
+            context: dict[str, Any] = {
+                "assistant_message_id": assistant_message_id,
+                "profile_id": profile_id,
+            }
             # 面板请求镜像：出站消息 = 面板多轮历史 + 本条用户输入。
             history_ctx = {
                 "surface": "panel_chat",
@@ -8403,14 +12535,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "user_input": prompt[:HISTORY_PROMPT_CHARS],
                 "messages": [*history, {"role": "user", "content": prompt}],
                 "context_text": "",
-                "account": (state.user_id or "")[:8],
+                "account": state.user_id or "",
             }
 
             if not stream:
                 answer: list[str] = []
                 retried_fallback = False
                 while True:
-                    attempt_context: dict[str, Any] = {"assistant_message_id": assistant_message_id}
+                    attempt_context: dict[str, Any] = {
+                        "assistant_message_id": assistant_message_id,
+                        "profile_id": profile_id,
+                    }
                     attempt_options = options
                     attempt_create_chat = create_chat
                     attempt_chat_id = options.chat_id or None
@@ -8435,9 +12570,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         files=files,
                         history=history,
                         history_ctx=history_ctx,
+                        cancel_check=self._check_request_cancelled,
                     ):
                         error = extract_error_from_event(event)
                         if error:
+                            attempt_context["_stream_close_reason"] = "error"
                             attempt_error = error
                             break
                         delta, phase = extract_delta_from_event(event)
@@ -8469,6 +12606,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                         "model": response_model,
                         "answer": "".join(answer),
                         "chat_id": chat_id,
+                        "profile_id": context.get("profile_id", profile_id),
                         "current_user_message_id": context.get("current_user_message_id", ""),
                         "assistant_message_id": context.get("assistant_message_id", ""),
                         "options": chat_options_public(options),
@@ -8488,6 +12626,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._send_security_headers()
             self.end_headers()
             self.close_connection = True
+            self._start_sse_heartbeat_pump()
             streaming_started = True
             action = "复用当前会话" if not create_chat else "创建新会话"
             self._sse_write(
@@ -8495,6 +12634,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 {
                     "message": f"已连接本地代理，正在{action}/验证码...",
                     "assistant_message_id": assistant_message_id,
+                    "profile_id": profile_id,
                     "model": response_model,
                     "options": chat_options_public(options),
                     "files": len(files),
@@ -8503,7 +12643,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
             context_announced = False
             retried_fallback = False
             while True:
-                attempt_context: dict[str, Any] = {"assistant_message_id": assistant_message_id}
+                attempt_context: dict[str, Any] = {
+                    "assistant_message_id": assistant_message_id,
+                    "profile_id": profile_id,
+                }
                 attempt_options = options
                 attempt_create_chat = create_chat
                 attempt_chat_id = options.chat_id or None
@@ -8528,19 +12671,25 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     files=files,
                     history=history,
                     history_ctx=history_ctx,
+                    cancel_check=self._check_request_cancelled,
                 ):
                     if not context_announced:
                         self._sse_write(
                             "context",
                             {
                                 "chat_id": attempt_context.get("chat_id", ""),
+                                "profile_id": attempt_context.get("profile_id", profile_id),
                                 "current_user_message_id": attempt_context.get("current_user_message_id", ""),
                                 "assistant_message_id": attempt_context.get("assistant_message_id", ""),
                             },
                         )
                         context_announced = True
+                    if is_sse_comment_event(event):
+                        self._sse_keepalive()
+                        continue
                     error = extract_error_from_event(event)
                     if error:
+                        attempt_context["_stream_close_reason"] = "error"
                         attempt_error = error
                         break
                     delta, phase = extract_delta_from_event(event)
@@ -8564,7 +12713,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self._release_chat_slot_early()
                     self._cleanup_failed_upstream_chat(state, context, options)
                     self._cleanup_failed_upstream_files(state, files)
-                    self._sse_write("error", {"message": attempt_error})
+                    self._sse_write("error", {"message": client_error_message(attempt_error)})
                     self.close_connection = True
                     return
                 context.update(attempt_context)
@@ -8576,6 +12725,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 {
                     "model": response_model,
                     "chat_id": chat_id,
+                    "profile_id": context.get("profile_id", profile_id),
                     "current_user_message_id": context.get("current_user_message_id", ""),
                     "assistant_message_id": context.get("assistant_message_id", ""),
                     "options": chat_options_public(options),
@@ -8586,9 +12736,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 },
             )
             self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, GeneratorExit) as exc:
+            reason = interruption_reason(exc)
+            # A browser/SDK abort closes the downstream socket before the
+            # upstream generator reaches its normal tail.  The per-attempt
+            # context is the only reliable place where a newly-created chat
+            # id may have been announced, so merge it before scheduling the
+            # forced cleanup.
+            if "attempt_context" in locals() and isinstance(attempt_context, dict):
+                context.update(attempt_context)
+            if "context" in locals() and "state" in locals():
+                self._release_chat_slot_early()
+                self._cleanup_failed_upstream_chat(
+                    state,
+                    context,
+                    options,
+                    force=True,
+                    reason=reason,
+                )
+            if "files" in locals() and "state" in locals():
+                self._cleanup_failed_upstream_files(state, files)
+            return
         except Exception as exc:
-            if not isinstance(exc, ValueError):
+            if not isinstance(exc, (ValueError, UpstreamResponseTooLarge, UpstreamStreamIncomplete)):
                 LOG.exception("[%s] web chat failed", current_request_id())
+            if "attempt_context" in locals() and isinstance(attempt_context, dict):
+                context.update(attempt_context)
             if "context" in locals() and "options" in locals() and "state" in locals():
                 self._release_chat_slot_early()
                 self._cleanup_failed_upstream_chat(state, context, options)
@@ -8596,13 +12769,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._cleanup_failed_upstream_files(state, files)
             if streaming_started and not self.wfile.closed:
                 try:
-                    self._sse_write("error", {"message": str(exc)})
+                    self._sse_write("error", {"message": client_error_message(exc)})
                     self.close_connection = True
                 except Exception:
                     pass
             elif not self.wfile.closed:
-                status = 400 if isinstance(exc, ValueError) else 500
+                status = exception_http_status(exc)
                 self._json_response(status, {"ok": False, "error": {"message": str(exc)}})
+        finally:
+            self._stop_sse_heartbeat_pump()
 
     def _handle_chat_cancel(self) -> None:
         try:
@@ -8611,15 +12786,80 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 body.get("assistant_message_id") or body.get("task_id") or body.get("id"),
                 "assistant_message_id",
             )
-            result = stop_zai_task(self._active_state(), assistant_message_id)
+            raw_chat_id = body.get("chat_id") or body.get("conversation_id") or ""
+            chat_id = require_uuid(raw_chat_id, "chat_id") if str(raw_chat_id).strip() else ""
+            profile_hint = str(body.get("profile_id") or self._requested_profile_id() or "").strip()
+            resolved = self._profile_state_for_id(profile_hint, strict=bool(profile_hint))
+            if resolved is None:
+                raise RuntimeError("请求所属的登录态不存在，请刷新账号页后重试。")
+            profile_id, state = resolved
+            result: dict[str, Any] = {}
+            stop_error: BaseException | None = None
+            try:
+                result = stop_zai_task(state, assistant_message_id)
+            except Exception as exc:
+                stop_error = exc
+            # Stopping the task alone leaves the partially-created upstream
+            # chat in the account history.  A cancelled stream is explicitly
+            # abandoned, so remove that chat regardless of the normal
+            # success auto-delete toggle.  The deletion is queued after the
+            # stop request to avoid holding the cancel response on upstream
+            # cleanup latency.
+            chat_delete_pending = False
+            if chat_id:
+                chat_delete_pending = self._schedule_interrupted_upstream_chat_delete(
+                    state,
+                    chat_id,
+                    reason="client_cancel",
+                )
+            if stop_error is not None:
+                if chat_id and chat_delete_pending:
+                    log_event(
+                        "upstream_task_stop_cleanup_fallback",
+                        level=logging.WARNING,
+                        assistant_message_id_fp=sha16(assistant_message_id),
+                        chat_id_fp=sha16(chat_id),
+                        error=str(stop_error)[:200],
+                    )
+                    self._json_response(
+                        202,
+                        {
+                            "ok": True,
+                            "assistant_message_id": assistant_message_id,
+                            "profile_id": profile_id,
+                            "chat_id": chat_id,
+                            "upstream_stopped": False,
+                            "stop_error": client_error_message(stop_error),
+                            "chat_deleted": False,
+                            "chat_delete_pending": True,
+                            "upstream": {},
+                        },
+                    )
+                    return
+                raise stop_error
+            log_event(
+                "upstream_task_stopped",
+                assistant_message_id_fp=sha16(assistant_message_id),
+                empty_ack=coerce_bool(result.get("empty_ack"), False),
+                already_stopped=coerce_bool(result.get("already_stopped"), False),
+            )
             self._json_response(
                 200,
                 {
                     "ok": True,
                     "assistant_message_id": assistant_message_id,
+                    "profile_id": profile_id,
+                    "chat_id": chat_id,
+                    "upstream_stopped": True,
+                    "chat_deleted": False,
+                    "chat_delete_pending": chat_delete_pending,
                     "upstream": result,
                 },
             )
+        except (UpstreamRequestError, URLError, TimeoutError, http.client.HTTPException) as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
+        except ValueError as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
@@ -8627,34 +12867,34 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             chat_id = require_uuid(body.get("chat_id") or body.get("conversation_id"), "chat_id")
-            state = self._active_state()
+            profile_hint = str(body.get("profile_id") or self._requested_profile_id() or "").strip()
+            resolved = self._profile_state_for_id(profile_hint, strict=bool(profile_hint))
+            if resolved is None:
+                raise RuntimeError("请求所属的登录态不存在，请刷新账号页后重试。")
+            profile_id, state = resolved
             delete_zai_chat(state, chat_id)
-            with self.state_lock:
-                profile = self.profiles.get(self.active_profile_id)
-                if profile and profile.state is state and profile.state.chat_id == chat_id:
-                    profile.state.chat_id = ""
-                    self._save_profile_store()
-                elif self.state is state and self.state.chat_id == chat_id:
-                    self.state.chat_id = ""
-            self._json_response(200, {"ok": True, "chat_id": chat_id, "deleted": True})
+            self._clear_deleted_chat_from_active_profile(state, chat_id)
+            self._json_response(200, {"ok": True, "chat_id": chat_id, "profile_id": profile_id, "deleted": True})
+        except (UpstreamRequestError, URLError, TimeoutError, http.client.HTTPException) as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
     def _handle_history_chats(self) -> None:
         """上游账号历史对话列表 + 本地镜像条目合并（本地未在上游出现的补在第 1 页）。"""
         try:
-            params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+            params = parse_request_query(self.path)
             try:
-                page = max(1, int(params.get("page", "1")))
+                page = max(1, min(MAX_HISTORY_QUERY_PAGE, int(params.get("page", "1"))))
             except ValueError:
                 page = 1
-            upstream_error = ""
+            upstream_error: BaseException | None = None
             chats: list[dict[str, Any]] = []
             try:
                 state = self._active_state()
                 chats = list_zai_chats(state, page=page)
             except Exception as exc:
-                upstream_error = str(exc)
+                upstream_error = exc
             items = [
                 {
                     "id": str(item.get("id") or ""),
@@ -8688,24 +12928,26 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     )
                 items.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
             if not items and upstream_error:
-                raise RuntimeError(upstream_error)
+                raise upstream_error
             self._json_response(200, {"ok": True, "page": page, "count": len(items), "chats": items})
+        except (UpstreamRequestError, URLError, TimeoutError, http.client.HTTPException) as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
     def _handle_history_chat_detail(self) -> None:
         """单条历史对话详情：优先本地镜像（含助手完整回复），无镜像再读上游。"""
         try:
-            params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+            params = parse_request_query(self.path)
             chat_id = require_uuid(params.get("id", ""), "chat_id")
             local_records = [r for r in local_history_records() if str(r.get("chat_id") or "") == chat_id]
-            upstream_error = ""
+            upstream_error: BaseException | None = None
             detail: dict[str, Any] | None = None
             try:
                 state = self._active_state()
                 detail = get_zai_chat_detail(state, chat_id)
             except Exception as exc:
-                upstream_error = str(exc)
+                upstream_error = exc
             if local_records:
                 messages: list[dict[str, Any]] = []
                 for record in local_records:
@@ -8751,7 +12993,9 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 self._json_response(200, {"ok": True, "source": "local", "chat": meta, "messages": messages})
                 return
             if detail is None:
-                raise RuntimeError(upstream_error or "对话不存在")
+                if upstream_error is not None:
+                    raise upstream_error
+                raise RuntimeError("对话不存在")
             chat = detail.get("chat") or {}
             models = chat.get("models") if isinstance(chat.get("models"), list) else []
             self._json_response(
@@ -8771,6 +13015,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "messages": extract_chat_history_messages(detail),
                 },
             )
+        except (UpstreamRequestError, URLError, TimeoutError, http.client.HTTPException) as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
@@ -8779,29 +13025,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             chat_id = require_uuid(body.get("chat_id"), "chat_id")
-            state = self._active_state()
+            profile_hint = str(body.get("profile_id") or self._requested_profile_id() or "").strip()
+            resolved = self._profile_state_for_id(profile_hint, strict=bool(profile_hint))
+            if resolved is None:
+                raise RuntimeError("请求所属的登录态不存在，请刷新账号页后重试。")
+            profile_id, state = resolved
             delete_zai_chat(state, chat_id)
-            local_removed = purge_local_history(chat_id)
-            with self.state_lock:
-                profile = self.profiles.get(self.active_profile_id)
-                if profile and profile.state is state and profile.state.chat_id == chat_id:
-                    profile.state.chat_id = ""
-                    self._save_profile_store()
-                elif self.state is state and self.state.chat_id == chat_id:
-                    self.state.chat_id = ""
-            self._json_response(200, {"ok": True, "chat_id": chat_id, "deleted": True, "local_removed": local_removed})
+            local_result: dict[str, Any] = {}
+            local_removed = purge_local_history(chat_id, result_out=local_result)
+            self._clear_deleted_chat_from_active_profile(state, chat_id)
+            local_persisted = bool(local_result.get("persisted", True))
+            self._json_response(
+                200,
+                {
+                    "ok": True,
+                    "chat_id": chat_id,
+                    "profile_id": profile_id,
+                    "deleted": True,
+                    "local_removed": local_removed,
+                    "local_persisted": local_persisted,
+                    "local_store_error": str(local_result.get("error") or "") if not local_persisted else "",
+                    "message": (
+                        "上游会话和本地镜像已删除"
+                        if local_persisted
+                        else "上游会话已删除；本地镜像已从当前进程移除，但持久化失败，重启后可能重新出现。"
+                    ),
+                },
+            )
+        except (UpstreamRequestError, URLError, TimeoutError, http.client.HTTPException) as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
     def _handle_history_records(self) -> None:
         """请求镜像列表（ds2api 同款：每条请求一条记录，分页、新→旧，支持 text/status 筛选）。"""
         try:
-            params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+            params = parse_request_query(self.path)
             try:
-                page = max(1, int(params.get("page", "1")))
+                page = max(1, min(MAX_HISTORY_QUERY_PAGE, int(params.get("page", "1"))))
             except ValueError:
                 page = 1
-            text = str(params.get("text") or "")
+            text = str(params.get("text") or "")[:MAX_HISTORY_SEARCH_CHARS]
             status = str(params.get("status") or "").strip().lower()
             if status and status not in {"streaming", "success", "stopped", "error"}:
                 status = ""
@@ -8830,16 +13094,30 @@ class ProxyHandler(BaseHTTPRequestHandler):
     def _handle_history_record_detail(self) -> None:
         """单条请求镜像完整记录：出站消息、文件清单、上下文、最终 prompt、回复。"""
         try:
-            params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+            params = parse_request_query(self.path)
             record_id = str(params.get("id") or "").strip()
             if not re.fullmatch(r"req_[0-9a-f]{8,32}", record_id):
                 raise ValueError("record id is invalid")
             record = get_local_history_record(record_id)
             if record is None:
-                raise RuntimeError("记录不存在（可能已被清理或超出保留上限）")
+                self._json_response(
+                    404,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": "记录不存在（可能已被清理或超出保留上限）",
+                            "type": "history_record_not_found",
+                            "code": "history_record_not_found",
+                        },
+                    },
+                )
+                return
             self._json_response(200, {"ok": True, "record": record})
-        except Exception as exc:
+        except ValueError as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
+        except Exception:
+            LOG.exception("[%s] history record read failed", current_request_id())
+            self._json_response(500, {"ok": False, "error": {"message": "读取历史记录失败，请查看服务日志。"}})
 
     def _handle_history_record_delete(self) -> None:
         try:
@@ -8847,22 +13125,68 @@ class ProxyHandler(BaseHTTPRequestHandler):
             record_id = str(body.get("id") or "").strip()
             if not re.fullmatch(r"req_[0-9a-f]{8,32}", record_id):
                 raise ValueError("record id is invalid")
-            removed = purge_history_record(record_id)
+            result: dict[str, Any] = {}
+            removed = purge_history_record(record_id, result_out=result)
             if not removed:
-                raise RuntimeError("记录不存在")
-            self._json_response(200, {"ok": True, "id": record_id, "removed": removed})
-        except Exception as exc:
+                self._json_response(
+                    404,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": "记录不存在",
+                            "type": "history_record_not_found",
+                            "code": "history_record_not_found",
+                        },
+                    },
+                )
+                return
+            persisted = bool(result.get("persisted", False))
+            self._json_response(
+                200,
+                {
+                    "ok": True,
+                    "id": record_id,
+                    "removed": removed,
+                    "persisted": persisted,
+                    "history_store_error": str(result.get("error") or "") if not persisted else "",
+                    "message": (
+                        "历史记录已删除"
+                        if persisted
+                        else "历史记录已从当前页面和进程移除，但本地持久化失败，重启后可能重新出现。"
+                    ),
+                },
+            )
+        except ValueError as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
+        except Exception:
+            LOG.exception("[%s] history record delete failed", current_request_id())
+            self._json_response(500, {"ok": False, "error": {"message": "删除历史记录失败，请查看服务日志。"}})
 
     def _handle_history_clear(self) -> None:
         try:
-            removed = clear_local_history()
-            self._json_response(200, {"ok": True, "removed": removed})
-        except Exception as exc:
-            self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
+            result: dict[str, Any] = {}
+            removed = clear_local_history(result_out=result)
+            persisted = bool(result.get("persisted", False))
+            self._json_response(
+                200,
+                {
+                    "ok": True,
+                    "removed": removed,
+                    "persisted": persisted,
+                    "history_store_error": str(result.get("error") or "") if not persisted else "",
+                    "message": (
+                        f"已清空 {removed} 条本地历史记录"
+                        if persisted
+                        else f"已从当前进程清空 {removed} 条历史记录，但本地持久化失败，重启后可能重新出现。"
+                    ),
+                },
+            )
+        except Exception:
+            LOG.exception("[%s] history clear failed", current_request_id())
+            self._json_response(500, {"ok": False, "error": {"message": "清空历史记录失败，请查看服务日志。"}})
 
     def _handle_file_cleanup(self) -> None:
-        """Delete uploaded files that never reached a chat (abort/failure paths)."""
+        """Journal orphaned uploads and schedule bounded background deletion."""
         try:
             body = self._read_json_body()
             raw = body.get("files")
@@ -8870,30 +13194,115 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 raise ValueError("files must be a list")
             if len(raw) > 64:
                 raise ValueError("too many files in one cleanup request")
-            state = self._active_state()
-            removed: list[str] = []
-            skipped: list[str] = []
+            profile_hint = str(body.get("profile_id") or self._requested_profile_id() or "").strip()
+            resolved = self._profile_state_for_id(profile_hint, strict=bool(profile_hint))
+            if resolved is None:
+                self._web_profile_missing()
+                return
+            profile_id, state = resolved
+            file_ids: list[str] = []
+            seen: set[str] = set()
+            invalid_count = 0
             for item in raw:
                 if isinstance(item, dict):
                     item = item.get("id") or item.get("file_id")
-                if not isinstance(item, str) or not item.strip():
+                if not isinstance(item, str):
+                    invalid_count += 1
                     continue
                 try:
-                    if delete_zai_file(state, item):
-                        removed.append(item)
-                    else:
-                        skipped.append(item)
-                except Exception:
-                    skipped.append(item)
-            self._json_response(200, {"ok": True, "removed": removed, "skipped": skipped, "count": len(removed)})
-        except Exception as exc:
+                    file_id = require_upstream_file_id(item)
+                except ValueError:
+                    invalid_count += 1
+                    continue
+                if file_id in seen:
+                    continue
+                seen.add(file_id)
+                file_ids.append(file_id)
+            schedule_details: dict[str, Any] = {}
+            scheduled = _best_effort_delete_upstream_files(
+                state,
+                file_ids,
+                reason="client_cleanup",
+                event_prefix="client_file_cleanup",
+                schedule_out=schedule_details,
+            )
+            journal_status = pending_chat_delete_status()
+            accepted_ids = list(schedule_details.get("journaled_ids") or [])
+            dropped_count = max(0, len(file_ids) - len(accepted_ids))
+            self._json_response(
+                202 if accepted_ids else 200,
+                {
+                    "ok": True,
+                    "profile_id": profile_id,
+                    "requested_count": len(raw),
+                    "accepted": accepted_ids,
+                    "accepted_count": len(accepted_ids),
+                    "invalid_count": invalid_count,
+                    "journal_capacity_dropped": dropped_count,
+                    "scheduled": bool(scheduled),
+                    "cleanup_pending": bool(accepted_ids),
+                    "journal_persisted": not bool(journal_status.get("journal_store_error")),
+                    "journal_store_error": bool(journal_status.get("journal_store_error")),
+                    # Compatibility fields: deletion is asynchronous, so no
+                    # file can truthfully be reported as removed at enqueue time.
+                    "removed": [],
+                    "skipped": [],
+                    "count": len(accepted_ids),
+                },
+            )
+        except ValueError as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
+        except Exception:
+            LOG.exception("[%s] file cleanup enqueue failed", current_request_id())
+            self._json_response(
+                500,
+                {
+                    "ok": False,
+                    "error": {
+                        "message": "文件清理任务登记失败，请查看服务日志。",
+                        "type": "server_error",
+                        "code": "file_cleanup_enqueue_failed",
+                    },
+                },
+            )
 
     def _handle_file_upload(self) -> None:
         tmp_path: Path | None = None
+        upload_slot_acquired = False
         try:
-            state = self._active_state()
-            query = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+            profile_hint = self._requested_profile_id()
+            with self.state_lock:
+                auth_ready = bool(self.profiles or self.state)
+            if not auth_ready:
+                # Preserve the established, actionable no-login error instead
+                # of misreporting an empty account pool as a concurrency 429.
+                self._active_state()
+            if profile_hint and not self._profile_exists(profile_hint):
+                log_event(
+                    "profile_route_missing",
+                    level=logging.WARNING,
+                    profile_id_fp=sha16(profile_hint),
+                    path=urlsplit(self.path).path,
+                )
+                self._web_profile_missing()
+                return
+            resolved = self._select_profile_for_auxiliary(profile_hint, strict=bool(profile_hint))
+            if resolved is None:
+                self._json_response(
+                    429,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": self._busy_message(bool(profile_hint)),
+                            "type": "chat_slot_busy",
+                            "scope": "profile" if profile_hint else "pool",
+                        },
+                    },
+                    extra_headers={"Retry-After": "3"},
+                )
+                return
+            profile_id, state = resolved
+            query = parse_request_query(self.path)
             filename = safe_filename(
                 str(
                     query.get("filename")
@@ -8903,17 +13312,44 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 )
             )
             content_type = guess_content_type(filename, str(self.headers.get("Content-Type") or ""))
+            if not _CHAT_FILE_UPLOAD_LIMITER.try_acquire():
+                # The request body has not been consumed. Close this keep-alive
+                # connection so its unread bytes cannot become a second request.
+                self.close_connection = True
+                log_event("upload_backpressure", level=logging.WARNING, upload_type="file")
+                self._json_response(
+                    429,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": "附件上传任务已满，请稍后重试。",
+                            "type": "upload_capacity_busy",
+                            "scope": "file",
+                        },
+                    },
+                    extra_headers={"Retry-After": "2", "Connection": "close"},
+                )
+                return
+            upload_slot_acquired = True
             tmp_path = self._spool_raw_body(
                 max_bytes=MAX_CHAT_FILE_UPLOAD_BYTES,
                 prefix="glm2api-file-",
                 suffix=".upload",
             )
-            uploaded = upload_file_path_to_zai(state, tmp_path, filename, content_type)
+            self._check_request_cancelled()
+            uploaded = upload_file_path_to_zai(
+                state,
+                tmp_path,
+                filename,
+                content_type,
+                cancel_check=self._check_request_cancelled,
+            )
             meta = uploaded.get("meta") if isinstance(uploaded.get("meta"), dict) else {}
             self._json_response(
                 200,
                 {
                     "ok": True,
+                    "profile_id": profile_id,
                     "file": uploaded,
                     "summary": {
                         "id": uploaded.get("id"),
@@ -8923,11 +13359,47 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     },
                 },
             )
-        except Exception as exc:
+        except ServiceShuttingDown:
+            return
+        except UpstreamRequestError as exc:
+            self._json_response(
+                502,
+                {
+                    "ok": False,
+                    "error": {
+                        "message": client_error_message(exc),
+                        "type": "upstream_upload_error",
+                        "code": "upstream_upload_error",
+                    },
+                },
+            )
+        except QueryValidationError as exc:
+            self.close_connection = True
+            self._json_response(
+                400,
+                {
+                    "ok": False,
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "code": "invalid_query",
+                    },
+                },
+            )
+        except ValueError as exc:
+            self._json_response(exception_http_status(exc), {"ok": False, "error": {"message": str(exc)}})
+        except RuntimeError as exc:
+            # Missing/removed local login state is an actionable request-state
+            # problem. UpstreamRequestError is handled above as a 502.
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
+        except Exception:
+            LOG.exception("[%s] file upload failed", current_request_id())
+            self._json_response(500, {"ok": False, "error": {"message": "附件上传内部错误，请查看服务日志。"}})
         finally:
             if tmp_path is not None:
                 tmp_path.unlink(missing_ok=True)
+            if upload_slot_acquired:
+                _CHAT_FILE_UPLOAD_LIMITER.release()
 
     def _handle_settings_save(self) -> None:
         try:
@@ -8941,22 +13413,55 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "message": "默认设置已保存，下次启动自动生效",
                 },
             )
+        except LocalStoreWriteError as exc:
+            self._json_response(
+                500,
+                {
+                    "ok": False,
+                    "error": {
+                        "message": str(exc),
+                        "type": "local_store_error",
+                        "code": "settings_store_write_failed",
+                    },
+                },
+            )
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
     def _handle_auth_har_upload(self) -> None:
         tmp_path: Path | None = None
+        upload_slot_acquired = False
         try:
+            if not _HAR_UPLOAD_LIMITER.try_acquire():
+                self.close_connection = True
+                log_event("upload_backpressure", level=logging.WARNING, upload_type="har")
+                self._json_response(
+                    429,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": "HAR 导入任务正在运行，请稍后重试。",
+                            "type": "upload_capacity_busy",
+                            "scope": "har",
+                        },
+                    },
+                    extra_headers={"Retry-After": "2", "Connection": "close"},
+                )
+                return
+            upload_slot_acquired = True
             content_type = str(self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
             har_fp = ""
             if content_type == "application/json":
-                body = self._read_json_body(max_bytes=MAX_HAR_UPLOAD_BYTES)
+                body = self._read_json_body(max_bytes=MAX_LEGACY_JSON_HAR_BYTES)
                 label = safe_profile_label(str(body.get("label") or body.get("name") or "uploaded HAR"))
                 source = safe_profile_label(str(body.get("source") or "web upload"))
                 har_text = str(body.get("har_text") or body.get("har") or "")
                 if har_text.strip():
                     raw = har_text.encode("utf-8")
-                    state, har_fp = extract_state_from_uploaded_bytes(raw)
+                    state, har_fp = extract_state_from_uploaded_bytes(
+                        raw,
+                        cancel_check=self._check_request_cancelled,
+                    )
                     raw = b""
                     har_text = ""
                     body = {}
@@ -8972,7 +13477,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 else:
                     raise ValueError("missing har_text")
             else:
-                query = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+                query = parse_request_query(self.path)
                 label = safe_profile_label(str(query.get("label") or "uploaded HAR"))
                 source = safe_profile_label(str(query.get("source") or "web upload"))
                 tmp_path = self._spool_raw_body(
@@ -8980,20 +13485,45 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     prefix="glm2api-upload-",
                     suffix=".har",
                 )
-                state, har_fp = extract_state_via_worker(tmp_path)
+                state, har_fp = extract_state_via_worker(
+                    tmp_path,
+                    cancel_check=self._check_request_cancelled,
+                )
 
             with self.state_lock:
                 profile = make_profile(state, label=label, source=source, har_fp=har_fp)
                 merge_profile(self.profiles, profile)
                 self.__class__.active_profile_id = profile.id
                 self.__class__.state = state
-                self._save_profile_store()
+                persisted, persistence_error = self._save_profile_store()
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": "HAR 登录态已加载、保存并切换为当前账号",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message="HAR 登录态已加载、保存并切换为当前账号",
+                        failure_message="HAR 登录态已加载并切换，但仅在当前进程生效；本地加密存储写入失败，重启后可能丢失。",
+                    ),
                     "profile": profile_summary(profile, active=True),
+                },
+            )
+        except ProfileCapacityError as exc:
+            self._profile_capacity_response(exc)
+        except ServiceShuttingDown:
+            return
+        except QueryValidationError as exc:
+            self.close_connection = True
+            self._json_response(
+                400,
+                {
+                    "ok": False,
+                    "error": {
+                        "message": str(exc),
+                        "type": "invalid_request_error",
+                        "code": "invalid_query",
+                    },
                 },
             )
         except Exception as exc:
@@ -9001,6 +13531,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         finally:
             if tmp_path is not None:
                 tmp_path.unlink(missing_ok=True)
+            if upload_slot_acquired:
+                _HAR_UPLOAD_LIMITER.release()
 
     def _handle_auth_token(self) -> None:
         try:
@@ -9014,15 +13546,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 merge_profile(self.profiles, profile)
                 self.__class__.active_profile_id = profile.id
                 self.__class__.state = state
-                self._save_profile_store()
+                persisted, persistence_error = self._save_profile_store()
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": "token 登录态已加载、保存并切换为当前账号",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message="token 登录态已加载、保存并切换为当前账号",
+                        failure_message="token 登录态已加载并切换，但仅在当前进程生效；本地加密存储写入失败，重启后可能丢失。",
+                    ),
                     "profile": profile_summary(profile, active=True),
                 },
             )
+        except ProfileCapacityError as exc:
+            self._profile_capacity_response(exc)
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
@@ -9036,12 +13575,17 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     raise ValueError("unknown profile_id")
                 self.__class__.active_profile_id = profile_id
                 self.__class__.state = profile.state
-                self._save_profile_store()
+                persisted, persistence_error = self._save_profile_store()
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": "已切换当前账号并保存默认选择",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message="已切换当前账号并保存默认选择",
+                        failure_message="当前账号已切换，但默认选择保存失败；重启后可能恢复为之前的账号。",
+                    ),
                     "profile": profile_summary(profile, active=True),
                 },
             )
@@ -9052,20 +13596,72 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             body = self._read_json_body()
             profile_id = str(body.get("profile_id") or "")
+            profile: AccountProfile | None = None
+            busy_count = 0
+            persisted = False
+            persistence_error = ""
             with self.state_lock:
-                profile = self.profiles.pop(profile_id, None)
-                if profile is None:
-                    raise ValueError("unknown profile_id")
-                if self.active_profile_id == profile_id:
-                    self.__class__.active_profile_id = next(iter(self.profiles.keys()), "")
-                    next_profile = self.profiles.get(self.active_profile_id)
-                    self.__class__.state = next_profile.state if next_profile else None
-                self._save_profile_store()
+                profile = self.profiles.get(profile_id)
+                if profile is not None:
+                    with self.chat_inflight_lock:
+                        busy_count = max(0, int(self.chat_inflight.get(profile_id, 0)))
+                    if not busy_count:
+                        self.profiles.pop(profile_id, None)
+                        with self.chat_inflight_lock:
+                            self.chat_inflight.pop(profile_id, None)
+                        if self.active_profile_id == profile_id:
+                            self.__class__.active_profile_id = next(iter(self.profiles.keys()), "")
+                            next_profile = self.profiles.get(self.active_profile_id)
+                            self.__class__.state = next_profile.state if next_profile else None
+                        persisted, persistence_error = self._save_profile_store()
+            if profile is None:
+                self._json_response(
+                    404,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": "登录态不存在，请刷新账号列表后重试",
+                            "type": "profile_not_found",
+                            "code": "profile_not_found",
+                        },
+                    },
+                )
+                return
+            if busy_count:
+                log_event(
+                    "profile_remove_blocked",
+                    level=logging.WARNING,
+                    profile_id_fp=sha16(profile_id),
+                    inflight=busy_count,
+                )
+                self._json_response(
+                    409,
+                    {
+                        "ok": False,
+                        "error": {
+                            "message": "该账号仍有正在进行的生成，请等待完成或停止请求后再删除",
+                            "type": "profile_busy",
+                            "code": "profile_busy",
+                            "inflight": busy_count,
+                        },
+                    },
+                )
+                return
+            log_event(
+                "profile_removed",
+                profile_id_fp=sha16(profile_id),
+                remaining_profiles=len(self.profiles),
+            )
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": "登录态已从本机加密保存区删除",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message="登录态已从本机加密保存区删除",
+                        failure_message="登录态已从当前进程移除，但本地加密存储写入失败；重启后该账号可能重新出现。",
+                    ),
                     "removed_profile_id": profile_id,
                 },
             )
@@ -9077,12 +13673,29 @@ class ProxyHandler(BaseHTTPRequestHandler):
             _body = self._read_json_body()
             with self.state_lock:
                 before = len(self.profiles)
-                active_profile_id, removed = compact_duplicate_profiles(self.profiles, self.active_profile_id)
+                with self.chat_inflight_lock:
+                    busy_counts = {
+                        profile_id: max(0, int(self.chat_inflight.get(profile_id, 0)))
+                        for profile_id in self.profiles
+                    }
+                busy_profile_ids = {profile_id for profile_id, count in busy_counts.items() if count > 0}
+                preview = dict(self.profiles)
+                _preview_active, would_remove = compact_duplicate_profiles(preview, self.active_profile_id)
+                skipped_busy_ids = {
+                    profile.id for profile in would_remove if profile.id in busy_profile_ids
+                }
+                active_profile_id, removed = compact_duplicate_profiles(
+                    self.profiles,
+                    self.active_profile_id,
+                    protected_profile_ids=busy_profile_ids,
+                )
                 self.__class__.active_profile_id = active_profile_id
                 active_profile = self.profiles.get(active_profile_id)
                 self.__class__.state = active_profile.state if active_profile else None
+                persisted = True
+                persistence_error = ""
                 if removed:
-                    self._save_profile_store()
+                    persisted, persistence_error = self._save_profile_store()
                 removed_summaries = [
                     {
                         "id": profile.id,
@@ -9094,49 +13707,91 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     }
                     for profile in removed
                 ]
+                skipped_busy_profiles = [
+                    {
+                        "id": profile_id,
+                        "label": self.profiles[profile_id].label,
+                        "inflight": busy_counts.get(profile_id, 0),
+                    }
+                    for profile_id in skipped_busy_ids
+                    if profile_id in self.profiles
+                ]
+            skipped_count = len(skipped_busy_profiles)
+            message = f"已清理 {len(removed)} 个同账号重复登录态"
+            if skipped_count:
+                message += f"；跳过 {skipped_count} 个正在生成的账号"
+            failure_message = message + "；清理结果仅在当前进程生效，本地加密存储写入失败，重启后重复项可能恢复。"
+            log_event(
+                "profiles_compacted",
+                removed=len(removed),
+                skipped_busy=skipped_count,
+                remaining=before - len(removed),
+            )
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": f"已清理 {len(removed)} 个同账号重复登录态",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message=message,
+                        failure_message=failure_message,
+                    ),
                     "before_count": before,
                     "after_count": before - len(removed),
                     "removed_profiles": removed_summaries,
+                    "skipped_busy_count": skipped_count,
+                    "skipped_busy_profiles": skipped_busy_profiles,
                 },
             )
         except Exception as exc:
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
 
     def _handle_auth_browser_login(self) -> None:
-        progress = self.__class__.browser_login_progress
+        flow_acquired = False
         try:
-            with self.state_lock:
-                if progress.get("running"):
-                    self._json_response(
-                        409,
-                        {"ok": False, "error": {"message": "已有登录或验证码采集流程正在进行，请先完成。"}},
-                    )
-                    return
+            if not playwright_package_available():
+                self._json_response(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "browser_automation_unavailable",
+                            "message": "浏览器登录组件未安装，请使用 Token/HAR，或先安装 requirements.txt。",
+                        },
+                    },
+                )
+                return
             body = self._read_json_body()
             label = safe_profile_label(str(body.get("label") or "browser login"))
             timeout_sec = int(body.get("timeout_sec") or self.browser_login_timeout_ms // 1000)
             timeout_ms = max(30, min(timeout_sec, 900)) * 1000
+            if not self.browser_flow_lock.acquire(blocking=False):
+                self._auth_flow_busy_response()
+                return
+            flow_acquired = True
             now = datetime.now().astimezone().isoformat(timespec="seconds")
 
-            def report(stage: str) -> None:
-                progress["stage"] = stage
-                progress["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            self._browser_progress_update(
+                running=True,
+                mode="login",
+                stage="正在启动授权浏览器…",
+                updated_at=now,
+                error="",
+            )
 
-            progress.update({"running": True, "mode": "login", "stage": "正在启动授权浏览器…", "updated_at": now, "error": ""})
-            try:
-                state = get_browser_login_state(
-                    chrome_path=self.chrome_path,
-                    timeout_ms=timeout_ms,
-                    progress_cb=report,
+            def report(stage: str) -> None:
+                self._browser_progress_update(
+                    stage=stage,
+                    updated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                 )
-            except Exception as exc:
-                progress.update({"stage": "登录失败", "error": str(exc)})
-                raise
+
+            state = get_browser_login_state(
+                chrome_path=self.chrome_path,
+                timeout_ms=timeout_ms,
+                progress_cb=report,
+                cancel_check=self._check_request_cancelled,
+            )
             if label == "browser login":
                 label = safe_profile_label(f"browser: {state.user_name}")
             profile = make_profile(
@@ -9149,34 +13804,88 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 merge_profile(self.profiles, profile)
                 self.__class__.active_profile_id = profile.id
                 self.__class__.state = state
-                self._save_profile_store()
-            progress.update({"stage": "已保存并切换账号", "error": ""})
+                persisted, persistence_error = self._save_profile_store()
+            self._browser_progress_update(
+                stage="已保存并切换账号" if persisted else "已切换账号（本地保存失败）",
+                error="" if persisted else persistence_error,
+            )
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": "浏览器登录态已采集、保存并切换为当前账号；验证码将在发送消息时自动获取，如失败可点击“手动采集验证码”在浏览器中完成。",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message="浏览器登录态已采集、保存并切换为当前账号；验证码将在发送消息时由本地求解器自动获取。",
+                        failure_message="浏览器登录态已采集并切换，但仅在当前进程生效；本地加密存储写入失败，重启后可能丢失。",
+                    ),
                     "profile": profile_summary(profile, active=True),
                     "captcha_ok": False,
                 },
             )
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+        except ProfileCapacityError as exc:
+            if flow_acquired:
+                self._browser_progress_update(stage="账号池已满", error=str(exc))
+            self._profile_capacity_response(exc)
         except Exception as exc:
+            if flow_acquired:
+                self._browser_progress_update(stage="登录失败", error=str(exc))
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
         finally:
-            progress["running"] = False
-            progress["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            if flow_acquired:
+                self._browser_progress_update(
+                    running=False,
+                    updated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
+                self.browser_flow_lock.release()
 
     def _handle_auth_captcha_refresh(self) -> None:
-        progress = self.__class__.browser_login_progress
+        flow_acquired = False
         try:
-            with self.state_lock:
-                if progress.get("running"):
-                    self._json_response(
-                        409,
-                        {"ok": False, "error": {"message": "已有登录或验证码采集流程正在进行，请先完成。"}},
-                    )
-                    return
             body = self._read_json_body()
+            if not browser_captcha_refresh_enabled(self.fresh_captcha_browser):
+                self._json_response(
+                    409,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "legacy_browser_captcha_disabled",
+                            "type": "feature_disabled",
+                            "message": (
+                                "当前验证码链路使用无浏览器自动求解器，旧版手动浏览器采集接口未启用。"
+                            ),
+                        },
+                    },
+                )
+                return
+            if not playwright_package_available():
+                self._json_response(
+                    503,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "browser_automation_unavailable",
+                            "message": "旧版浏览器验证码组件未安装；请改用 fresh-captcha 本地求解器。",
+                        },
+                    },
+                )
+                return
+            timeout_sec = int(body.get("timeout_sec") or 120)
+            timeout_ms = max(30, min(timeout_sec, 300)) * 1000
+            if not self.browser_flow_lock.acquire(blocking=False):
+                self._auth_flow_busy_response()
+                return
+            flow_acquired = True
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            self._browser_progress_update(
+                running=True,
+                mode="captcha",
+                stage="正在打开验证码采集窗口…",
+                updated_at=now,
+                error="",
+            )
             profile_id = str(body.get("profile_id") or self.active_profile_id)
             with self.state_lock:
                 profile = self.profiles.get(profile_id)
@@ -9184,43 +13893,50 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     self._json_response(404, {"ok": False, "error": {"message": "登录态不存在，请先登录或上传 HAR。"}})
                     return
                 state = profile.state
-            timeout_sec = int(body.get("timeout_sec") or 120)
-            timeout_ms = max(30, min(timeout_sec, 300)) * 1000
-            now = datetime.now().astimezone().isoformat(timespec="seconds")
-            progress.update({"running": True, "mode": "captcha", "stage": "正在打开验证码采集窗口…", "updated_at": now, "error": ""})
-            try:
-                captcha = get_browser_captcha(
-                    state,
-                    chrome_path=self.chrome_path,
-                    headless=False,
-                    timeout_ms=timeout_ms,
-                )
-            except Exception as exc:
-                progress.update({"stage": "验证码采集失败", "error": str(exc)})
-                raise
+            captcha = get_browser_captcha(
+                state,
+                chrome_path=self.chrome_path,
+                headless=False,
+                timeout_ms=timeout_ms,
+            )
             if not captcha:
-                progress.update({"stage": "验证码采集失败", "error": "验证码采集为空"})
                 raise RuntimeError("验证码采集为空，请重试。")
             with self.state_lock:
                 profile.state.captcha_verify_param = captcha
                 if profile_id == self.active_profile_id:
                     self.__class__.state = profile.state
-                self._save_profile_store()
-            progress.update({"stage": "验证码已保存", "error": ""})
+                persisted, persistence_error = self._save_profile_store()
+            self._browser_progress_update(
+                stage="验证码已保存" if persisted else "验证码已更新（本地保存失败）",
+                error="" if persisted else persistence_error,
+            )
             self._json_response(
                 200,
                 {
                     **self._profiles_payload(),
-                    "message": "验证码已采集并保存到当前账号",
+                    **self._profile_persistence_result(
+                        persisted,
+                        persistence_error=persistence_error,
+                        success_message="验证码已采集并保存到当前账号",
+                        failure_message="验证码已更新到当前进程，但本地加密存储写入失败，重启后可能丢失。",
+                    ),
                     "profile": profile_summary(profile, active=profile_id == self.active_profile_id),
                     "captcha_ok": True,
                 },
             )
+        except (BrokenPipeError, ConnectionResetError):
+            raise
         except Exception as exc:
+            if flow_acquired:
+                self._browser_progress_update(stage="验证码采集失败", error=str(exc))
             self._json_response(400, {"ok": False, "error": {"message": str(exc)}})
         finally:
-            progress["running"] = False
-            progress["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+            if flow_acquired:
+                self._browser_progress_update(
+                    running=False,
+                    updated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                )
+                self.browser_flow_lock.release()
 
     quiet: bool = False  # --quiet 时抑制逐请求访问日志
 
@@ -9232,11 +13948,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self._response_code = 500
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        LOG.info("[proxy] " + fmt % args)
+        LOG.info("[proxy] %s", redact_log_text(fmt % args))
 
     def _handle_api_logs(self) -> None:
         """Query the structured in-memory ring while keeping legacy line output."""
-        params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+        params = parse_request_query(self.path)
         try:
             limit = max(1, min(int(params.get("lines", "300")), 2000))
         except ValueError:
@@ -9264,10 +13980,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
             rid=rid,
             after_seq=after_seq,
         )
-        try:
-            file_bytes = LOG_FILE_PATH.stat().st_size
-        except OSError:
-            file_bytes = 0
+        store = log_store_status()
         payload = {
             "ok": True,
             "entries": [
@@ -9280,7 +13993,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "cursor": cursor,
             "stats": ring.stats(matched),
             "file": log_file_label(),
-            "file_bytes": file_bytes,
+            "file_bytes": store["active_bytes"],
+            "store": store,
             "ring_count": len(ring),
             "ring_capacity": ring.capacity,
             "level": logging.getLevelName(LOG.getEffectiveLevel()),
@@ -9291,7 +14005,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def _handle_api_metrics(self) -> None:
         """Return aggregate operational and retained-history telemetry."""
-        params = dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
+        params = parse_request_query(self.path)
         try:
             hours = max(1, min(int(params.get("hours", "24")), 24 * 30))
         except ValueError:
@@ -9300,6 +14014,16 @@ class ProxyHandler(BaseHTTPRequestHandler):
         with self.chat_inflight_lock:
             runtime["inflight"] = sum(max(0, int(value)) for value in self.chat_inflight.values())
             runtime["active_profile_inflight"] = max(0, int(self.chat_inflight.get(self.active_profile_id, 0)))
+        runtime["auto_delete"] = auto_delete_executor_status()
+        runtime["captcha_worker"] = captcha_worker_status()
+        runtime["http_handlers"] = self.server.handler_status(exclude_current=True)
+        runtime["upload_slots"] = upload_slot_status()
+        runtime["upstream_responses"] = upstream_response_status()
+        runtime["upstream_readers"] = upstream_reader_status()
+        runtime["sse_heartbeat"] = sse_heartbeat_status()
+        runtime["context_cache"] = context_cache_status()
+        logs = log_ring().stats()
+        logs["store"] = log_store_status()
         self._json_response(
             200,
             {
@@ -9307,16 +14031,206 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 "generated_at": int(time.time() * 1000),
                 "window_hours": hours,
                 "runtime": runtime,
+                "concurrency": self._concurrency_payload(),
                 "history": local_history_metrics(hours),
-                "logs": log_ring().stats(),
+                "logs": logs,
             },
         )
 
 
 class LocalProxyServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows SO_REUSEADDR permits multiple live processes to bind the same
+    # endpoint and distribute connections unpredictably. That can leave an old
+    # glm2api process serving stale code beside a newly started one. POSIX keeps
+    # fast restart semantics; Windows uses an exclusive bind instead.
+    allow_reuse_address = os.name != "nt"
+    allow_reuse_port = False
+    request_queue_size = 64
     thread_name_prefix = "proxy"
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._handler_limit = max(1, int(MAX_HTTP_HANDLER_THREADS))
+        self._handler_slots = threading.BoundedSemaphore(self._handler_limit)
+        self._handler_metrics_lock = threading.Lock()
+        self._handler_drained = threading.Condition(self._handler_metrics_lock)
+        self._handler_active = 0
+        self._handler_peak = 0
+        self._handler_waiting = 0
+        self._handler_wait_total = 0
+        self._handler_rejected_total = 0
+        self._handler_sequence = 0
+        self._active_requests: set[Any] = set()
+        self.shutdown_event = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if self.shutdown_event.is_set():
+            self.shutdown_request(request)
+            return
+        acquired = self._handler_slots.acquire(blocking=False)
+        if not acquired:
+            with self._handler_metrics_lock:
+                # wait_total is retained as a legacy cumulative saturation
+                # counter; new consumers should read rejected_total.
+                self._handler_wait_total += 1
+                self._handler_rejected_total += 1
+            self._reject_overloaded_request(request)
+            return
+        if self.shutdown_event.is_set():
+            if acquired:
+                self._handler_slots.release()
+            self.shutdown_request(request)
+            return
+        with self._handler_metrics_lock:
+            self._handler_active += 1
+            self._handler_peak = max(self._handler_peak, self._handler_active)
+            self._active_requests.add(request)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            with self._handler_metrics_lock:
+                self._handler_active = max(0, self._handler_active - 1)
+                self._active_requests.discard(request)
+                self._handler_drained.notify_all()
+            if acquired:
+                self._handler_slots.release()
+            raise
+
+    def _reject_overloaded_request(self, request: Any) -> None:
+        """Return a bounded generic response without consuming a handler slot."""
+        payload = json.dumps(
+            {
+                "error": {
+                    "message": "本地服务 HTTP 处理容量已满，请稍后重试。",
+                    "type": "server_overloaded",
+                    "code": "handler_capacity_exhausted",
+                }
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        response = (
+            "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(payload)}\r\n"
+            f"Retry-After: {HTTP_HANDLER_OVERLOAD_RETRY_SECONDS}\r\n"
+            "Cache-Control: no-store\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        ).encode("ascii") + payload
+        try:
+            request.sendall(response)
+        except OSError:
+            pass
+        finally:
+            self.shutdown_request(request)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        with self._handler_metrics_lock:
+            self._handler_sequence += 1
+            sequence = self._handler_sequence
+        threading.current_thread().name = f"{self.thread_name_prefix}-{sequence}"
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._handler_metrics_lock:
+                self._handler_active = max(0, self._handler_active - 1)
+                self._active_requests.discard(request)
+                self._handler_drained.notify_all()
+            self._handler_slots.release()
+
+    def begin_shutdown(self) -> None:
+        """Stop new request dispatch and notify active handlers to unwind."""
+        self.shutdown_event.set()
+
+    def wait_for_handlers(self, timeout: float) -> bool:
+        """Wait for active/waiting request handlers without an unbounded join."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._handler_drained:
+            while self._handler_active or self._handler_waiting:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._handler_drained.wait(timeout=remaining)
+            return True
+
+    def force_close_active_requests(self) -> int:
+        """Interrupt downstream sockets after the graceful drain deadline."""
+        with self._handler_metrics_lock:
+            requests = list(self._active_requests)
+        for request in requests:
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except (AttributeError, OSError):
+                pass
+        return len(requests)
+
+    def handler_status(self, *, exclude_current: bool = False) -> dict[str, int | float | bool]:
+        with self._handler_metrics_lock:
+            active = max(0, self._handler_active - (1 if exclude_current else 0))
+            return {
+                "active": active,
+                "max_active": self._handler_limit,
+                "peak": max(0, self._handler_peak),
+                "waiting": max(0, self._handler_waiting),
+                "wait_total": max(0, self._handler_wait_total),
+                "rejected_total": max(0, self._handler_rejected_total),
+                "saturated": self._handler_active >= self._handler_limit,
+                "shutting_down": self.shutdown_event.is_set(),
+                "request_queue_size": max(1, int(self.request_queue_size)),
+                "overload_retry_seconds": HTTP_HANDLER_OVERLOAD_RETRY_SECONDS,
+                "socket_timeout_seconds": max(0.0, float(getattr(self.RequestHandlerClass, "timeout", 0) or 0)),
+            }
+
+    def server_bind(self) -> None:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
+def graceful_shutdown_server(
+    server: LocalProxyServer,
+    *,
+    graceful_timeout: float = GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    forced_timeout: float = FORCED_SHUTDOWN_TIMEOUT_SECONDS,
+) -> dict[str, int | bool]:
+    """Close the listener, drain handlers, then interrupt remaining clients."""
+    started = time.monotonic()
+    before = server.handler_status()
+    server.begin_shutdown()
+    server.server_close()
+    log_event(
+        "server_shutdown_started",
+        active=before["active"],
+        waiting=before["waiting"],
+        graceful_timeout_sec=max(0.0, float(graceful_timeout)),
+    )
+    drained = server.wait_for_handlers(graceful_timeout)
+    forced_sockets = 0
+    if not drained:
+        forced_sockets = server.force_close_active_requests()
+        log_event(
+            "server_shutdown_force_close",
+            level=logging.WARNING,
+            active=server.handler_status()["active"],
+            sockets=forced_sockets,
+            forced_timeout_sec=max(0.0, float(forced_timeout)),
+        )
+        drained = server.wait_for_handlers(forced_timeout)
+    after = server.handler_status()
+    result: dict[str, int | bool] = {
+        "drained": bool(drained),
+        "forced_sockets": max(0, int(forced_sockets)),
+        "remaining_handlers": max(0, int(after["active"])),
+        "elapsed_ms": max(0, int((time.monotonic() - started) * 1000)),
+    }
+    log_event(
+        "server_shutdown_completed",
+        level=logging.INFO if drained else logging.WARNING,
+        **result,
+    )
+    return result
 
 
 def validate_signature_from_har(har: dict[str, Any]) -> bool:
@@ -9419,7 +14333,7 @@ def write_evidence(har: dict[str, Any], out_dir: Path) -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--har", default="chat.z.ai.har", help="HAR path, default: chat.z.ai.har")
     parser.add_argument("--extract-state-json", action="store_true", help=argparse.SUPPRESS)
@@ -9464,12 +14378,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reuse-har-chat", action="store_true", help="Reuse chat_id from HAR instead of creating a fresh chat")
     parser.add_argument("--captcha", help="Use a fresh captcha_verify_param value instead of the HAR/env value")
     parser.add_argument(
-        "--fresh-captcha-browser",
+        "--fresh-captcha",
+        dest="fresh_captcha",
         action="store_true",
-        help="Use Chrome + official AliyunCaptcha SDK to obtain a fresh didk33e0 captcha before each completion",
+        help="Obtain a fresh captcha before each completion; select the solver with --captcha-mode",
     )
-    parser.add_argument("--chrome", help="Chrome/Edge executable path for --fresh-captcha-browser")
-    parser.add_argument("--headed", action="store_true", help="Show browser window for --fresh-captcha-browser")
+    parser.add_argument(
+        "--fresh-captcha-browser",
+        dest="fresh_captcha",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--chrome", help="Chrome/Edge executable path for browser login or captcha fallback")
+    parser.add_argument("--headed", action="store_true", help="Show the optional captcha fallback browser window")
     parser.add_argument("--captcha-timeout-ms", type=int, default=75_000)
     parser.add_argument(
         "--captcha-mode",
@@ -9497,11 +14418,13 @@ def parse_args() -> argparse.Namespace:
         "--evidence-dir",
         default="exports/ctf-website/2026-08-13-chat-z-ai-model-proxy",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
+    global _CAPTCHA_MODE
     args = parse_args()
+    _CAPTCHA_MODE = str(getattr(args, "captcha_mode", "") or "auto").strip().lower() or "auto"
     setup_logging(args.log_level)
     LOG.info("glm2api starting: serve=%s port=%s log_level=%s", args.serve, args.port, args.log_level)
     har_path = Path(args.har)
@@ -9597,12 +14520,13 @@ def main() -> int:
     )
     api_key = stored_api_key
     api_key_source = "store"
-    env_api_key = str(os.environ.get(API_KEY_ENV_NAME) or "").strip()
-    if env_api_key:
-        api_key = env_api_key
+    cli_api_key = str(args.api_key or "")
+    env_api_key = str(os.environ.get(API_KEY_ENV_NAME) or "")
+    if cli_api_key.strip():
+        api_key = normalize_local_api_key(cli_api_key, label="--api-key")
         api_key_source = "cli"
-    if str(args.api_key or "").strip():
-        api_key = str(args.api_key).strip()
+    elif env_api_key.strip():
+        api_key = normalize_local_api_key(env_api_key, label=API_KEY_ENV_NAME)
         api_key_source = "cli"
     if args.serve:
         validate_server_bind(args.host, args.allow_remote, api_key)
@@ -9614,7 +14538,8 @@ def main() -> int:
         token_fp=sha16(active_state.token) if active_state else "",
         device_id_fp=sha16(active_state.device_id) if active_state and active_state.device_id else "",
         captcha_fp=sha16(active_state.captcha_verify_param) if active_state and active_state.captcha_verify_param else "",
-        captcha_mode="browser_fresh" if args.fresh_captcha_browser else "provided_or_har",
+        captcha_mode="fresh" if args.fresh_captcha else "provided_or_har",
+        captcha_solver=_CAPTCHA_MODE,
         saved_profile_count=len(stored_profiles),
         profile_store_error=store_error,
         default_model=DEFAULT_MODEL,
@@ -9633,7 +14558,7 @@ def main() -> int:
             args.prompt,
             create_chat=not args.reuse_har_chat,
             captcha_verify_param=args.captcha,
-            fresh_captcha_browser=args.fresh_captcha_browser,
+            fresh_captcha_browser=args.fresh_captcha,
             chrome_path=args.chrome,
             captcha_headless=not args.headed,
             captcha_timeout_ms=args.captcha_timeout_ms,
@@ -9680,12 +14605,10 @@ def main() -> int:
         ProxyHandler.profile_store_saved_at = stored_saved_at
         ProxyHandler.profile_store_error = store_error
         ProxyHandler.captcha_verify_param = args.captcha
-        ProxyHandler.fresh_captcha_browser = args.fresh_captcha_browser
+        ProxyHandler.fresh_captcha_browser = args.fresh_captcha
         ProxyHandler.chrome_path = args.chrome
         ProxyHandler.captcha_headless = not args.headed
         ProxyHandler.captcha_timeout_ms = args.captcha_timeout_ms
-        global _CAPTCHA_MODE
-        _CAPTCHA_MODE = str(getattr(args, "captcha_mode", "") or "auto").strip().lower() or "auto"
         ProxyHandler.upstream_timeout_sec = int(
             args.upstream_timeout_sec
             or local_settings.get("upstream_timeout_sec")
@@ -9722,7 +14645,27 @@ def main() -> int:
         har = None
         har_state = None
         gc.collect()
-        server = LocalProxyServer((args.host, args.port), ProxyHandler)
+        try:
+            server = LocalProxyServer((args.host, args.port), ProxyHandler)
+        except OSError as exc:
+            error_code = int(getattr(exc, "winerror", 0) or getattr(exc, "errno", 0) or 0)
+            log_event(
+                "server_bind_failed",
+                level=logging.ERROR,
+                host=args.host,
+                port=args.port,
+                error_code=error_code,
+            )
+            print(
+                f"[glm2api] 启动失败：无法监听 {args.host}:{args.port}。"
+                "端口可能已被旧进程占用，请关闭旧服务或使用 --port 选择其它端口。",
+                file=sys.stderr,
+            )
+            return 2
+        global _DELETE_EXECUTOR_CLOSED
+        _DELETE_EXECUTOR_CLOSED = False
+        _AUTO_DELETE_STOP.clear()
+        _CAPTCHA_PREFETCH_STOP.clear()
         web_url = f"http://{args.host}:{args.port}/"
         LOG.info("Web UI listening on %s", web_url)
         LOG.info("OpenAI-compatible proxy listening on http://%s:%s", args.host, args.port)
@@ -9731,7 +14674,7 @@ def main() -> int:
             LOG.info("API key protection enabled; requests must include X-API-Key or Authorization: Bearer <key>")
         if ProxyHandler.cors_origins:
             LOG.info("Allowed CORS origins: %s", ", ".join(ProxyHandler.cors_origins))
-        if args.fresh_captcha_browser:
+        if args.fresh_captcha and _CAPTCHA_MODE in {"auto", "browser"}:
             global _CAPTCHA_WORKER
             _CAPTCHA_WORKER = CaptchaWorker(
                 chrome_path=args.chrome,
@@ -9739,35 +14682,61 @@ def main() -> int:
                 default_timeout_ms=args.captcha_timeout_ms,
                 idle_timeout_sec=args.captcha_worker_idle_sec,
             )
-            LOG.info(
-                "Captcha mode: browser_fresh (reused headless Chrome + official AliyunCaptcha SDK; "
-                "idle shutdown after %gs)",
-                args.captcha_worker_idle_sec,
-            )
+        if args.fresh_captcha:
+            solver_summary = {
+                "happydom": "happy-dom only (no browser worker)",
+                "browser": "reused headless browser",
+                "auto": "happy-dom preferred with browser fallback",
+            }.get(_CAPTCHA_MODE, _CAPTCHA_MODE)
+            LOG.info("Captcha mode: fresh (%s)", solver_summary)
+            if _CAPTCHA_MODE in {"auto", "happydom"} and not happydom_captcha_available():
+                fallback_note = "browser fallback remains enabled" if _CAPTCHA_MODE == "auto" else "requests may fail"
+                LOG.warning("happy-dom captcha solver is unavailable; %s", fallback_note)
         log_event(
             "server_started",
             port=args.port,
             web_url=web_url,
             captcha_mode=_CAPTCHA_MODE,
-            captcha_browser_fresh=bool(args.fresh_captcha_browser),
+            captcha_fresh_enabled=bool(args.fresh_captcha),
+            captcha_happydom_available=happydom_captcha_available(),
             auth_ready=active_state is not None,
             profile_count=len(ProxyHandler.profiles),
             api_key_protected=bool(api_key),
+            http_handler_limit=MAX_HTTP_HANDLER_THREADS,
             log_file=log_file_label(),
             log_level=logging.getLevelName(LOG.getEffectiveLevel()),
         )
+        replay_pending_deletes(ProxyHandler.profiles)
         if args.open_web:
             webbrowser.open(web_url)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
             log_event("server_stopped", reason="keyboard_interrupt")
-            print("\n[glm2api] local service stopped.")
+            print("\n[glm2api] stopping local service; draining active requests...")
         finally:
-            server.server_close()
-            if _CAPTCHA_WORKER is not None:
-                _CAPTCHA_WORKER.close()
-                _CAPTCHA_WORKER = None
+            try:
+                prefetch_stopped = _shutdown_captcha_prefetch()
+                if not prefetch_stopped:
+                    log_event("captcha_prefetch_shutdown_timeout", level=logging.WARNING)
+                graceful_shutdown_server(server)
+            finally:
+                delete_shutdown = _shutdown_auto_delete_executor(
+                    AUTO_DELETE_SHUTDOWN_TIMEOUT_SECONDS,
+                    cancel_pending=True,
+                )
+                log_event(
+                    "auto_delete_shutdown_completed",
+                    drained=delete_shutdown["drained"],
+                    remaining=delete_shutdown["remaining"],
+                    replay_stopped=delete_shutdown["replay_stopped"],
+                    elapsed_ms=delete_shutdown["elapsed_ms"],
+                    journal_pending=pending_chat_delete_status()["journal_pending"],
+                )
+                if _CAPTCHA_WORKER is not None:
+                    _CAPTCHA_WORKER.close()
+                    _CAPTCHA_WORKER = None
+            print("[glm2api] local service stopped.")
     return 0
 
 
