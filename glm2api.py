@@ -902,6 +902,10 @@ MAX_CONTEXT_FILE_BYTES = 4 * 1024 * 1024
 # context segments below that hard edge, including the multipart header.
 GLM53_CONTEXT_FILE_PART_BYTES = 40 * 1024
 CONTEXT_FILE_PART_HEADER_RESERVE_BYTES = 512
+# The official composer accepts at most ten attachments on one completion
+# message. Larger GLM-5.3 context packages are loaded through one or more
+# intentionally interrupted thinking turns, then completed on the same chat.
+ZAI_MAX_COMPLETION_FILES = 10
 # Per-account concurrency cap for in-flight upstream generations (Z.ai 429s beyond this).
 MAX_CONCURRENT_GENERATIONS_PER_PROFILE = 3
 # Optional request header used by the web console to keep a continued chat on
@@ -3764,7 +3768,10 @@ HISTORY_PROMPT_CHARS = 8_000
 HISTORY_MSG_CHARS = 6_000
 HISTORY_MESSAGES_MAX = 30
 HISTORY_CONTEXT_CHARS = 16_000
-HISTORY_CONTEXT_FILES_MAX = 32
+# A 2 MiB protocol request can produce slightly above fifty 40 KiB GLM-5.3
+# segments after transcript headers/tool guidance are added. Keep the complete
+# delivery manifest while remaining well below the 16 MiB detail-file budget.
+HISTORY_CONTEXT_FILES_MAX = 64
 HISTORY_CONTEXT_FILE_CHARS = 80_000
 HISTORY_FINAL_CHARS = 40_000
 HISTORY_ANSWER_CHARS = 30_000
@@ -4299,6 +4306,8 @@ def _history_summary_locked(record: dict[str, Any]) -> dict[str, Any]:
         "context_file_requested": bool(record.get("context_file_requested")),
         "context_file_fallback": str(record.get("context_file_fallback") or ""),
         "context_files": len(record.get("context_files") or []),
+        "context_preload_waves": max(0, int(record.get("context_preload_waves") or 0)),
+        "context_preload_files": max(0, int(record.get("context_preload_files") or 0)),
         "finish_reason": str(record.get("finish_reason") or ""),
         "tool_calls_count": max(0, int(record.get("tool_calls_count") or 0)),
         "tool_calls_source": str(record.get("tool_calls_source") or ""),
@@ -4412,6 +4421,8 @@ def start_history_record(
     context_file_requested: bool = False,
     context_file_fallback: str = "",
     context_files: Any = None,
+    context_preload_waves: int = 0,
+    context_preload_files: int = 0,
     chat_id: str = "",
     account: str = "",
 ) -> str:
@@ -4443,6 +4454,8 @@ def start_history_record(
         "context_file_requested": bool(context_file_requested),
         "context_file_fallback": str(context_file_fallback or "")[:120],
         "context_files": history_context_files_snapshot(context_files),
+        "context_preload_waves": max(0, int(context_preload_waves or 0)),
+        "context_preload_files": max(0, int(context_preload_files or 0)),
         "history_text": str(context_text or "")[:HISTORY_CONTEXT_CHARS],
         "final_prompt": str(final_prompt or "")[:HISTORY_FINAL_CHARS],
         "reasoning": "",
@@ -4520,6 +4533,34 @@ def restart_history_record(record_id: str, final_prompt: str) -> None:
             _history_persist_locked()
     except Exception as exc:
         log_event("history_store_write_error", stage="restart", error=str(exc)[:200])
+
+
+def refresh_history_record_delivery(
+    record_id: str,
+    *,
+    final_prompt: str,
+    files: Any,
+    context_files: Any,
+    chat_id: str,
+) -> None:
+    """Refresh a prestarted staged record without counting a tool retry."""
+    if not record_id:
+        return
+    try:
+        with _HISTORY_LOCK:
+            record = _history_find_locked(record_id)
+            if record is None:
+                return
+            record["status"] = "streaming"
+            record["final_prompt"] = str(final_prompt or "")[:HISTORY_FINAL_CHARS]
+            record["files"] = history_files_snapshot(files)
+            record["context_files"] = history_context_files_snapshot(context_files)
+            record["chat_id"] = str(chat_id or "")
+            record["updated_at"] = int(time.time() * 1000)
+            _HISTORY_DIRTY.add(record_id)
+            _history_persist_locked()
+    except Exception as exc:
+        log_event("history_store_write_error", stage="staged_delivery", error=str(exc)[:200])
 
 
 def finish_history_record(
@@ -4677,6 +4718,8 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
                 "tool_calls_count": max(0, int(record.get("tool_calls_count") or 0)),
                 "tool_calls_source": str(record.get("tool_calls_source") or ""),
                 "tool_retry_count": max(0, int(record.get("tool_retry_count") or 0)),
+                "context_preload_waves": max(0, int(record.get("context_preload_waves") or 0)),
+                "context_preload_files": max(0, int(record.get("context_preload_files") or 0)),
             }
             for record in records
         ]
@@ -4688,6 +4731,9 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
     durations: list[int] = []
     token_totals = {"prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0, "total_tokens": 0}
     file_delivery_requests = 0
+    staged_context_requests = 0
+    context_preload_waves = 0
+    context_preload_files = 0
     fallback_requests = 0
     tool_turns = 0
     tool_calls_total = 0
@@ -4720,6 +4766,11 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
             bucket["elapsed_samples"] += 1
         if row["delivery_mode"] == "file":
             file_delivery_requests += 1
+        row_preload_waves = int(row["context_preload_waves"])
+        if row_preload_waves > 0:
+            staged_context_requests += 1
+            context_preload_waves += row_preload_waves
+            context_preload_files += int(row["context_preload_files"])
         if row["fallback"]:
             fallback_requests += 1
         tool_calls_count = int(row["tool_calls_count"])
@@ -4775,6 +4826,9 @@ def local_history_metrics(hours: int = 24, now_ms: int | None = None) -> dict[st
         "tokens": token_totals,
         "file_delivery_requests": file_delivery_requests,
         "file_delivery_rate": round(file_delivery_requests / window_rows, 4) if window_rows else 0.0,
+        "staged_context_requests": staged_context_requests,
+        "context_preload_waves": context_preload_waves,
+        "context_preload_files": context_preload_files,
         "fallback_requests": fallback_requests,
         "tools": {
             "turns": tool_turns,
@@ -4822,6 +4876,8 @@ def local_history_summary(text: str = "", status: str = "") -> list[dict[str, An
             "context_file_requested": bool(record.get("context_file_requested")),
             "context_file_fallback": str(record.get("context_file_fallback") or ""),
             "context_files": len(record.get("context_files") or []),
+            "context_preload_waves": max(0, int(record.get("context_preload_waves") or 0)),
+            "context_preload_files": max(0, int(record.get("context_preload_files") or 0)),
             "finish_reason": str(record.get("finish_reason") or ""),
             "tool_calls_count": max(0, int(record.get("tool_calls_count") or 0)),
             "tool_calls_source": str(record.get("tool_calls_source") or ""),
@@ -5276,6 +5332,8 @@ def chat_files_from_body(body: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     if not isinstance(value, list):
         raise ValueError("files must be a list")
+    if len(value) > ZAI_MAX_COMPLETION_FILES:
+        raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} user files per completion")
     files: list[dict[str, Any]] = []
     for item in value:
         if isinstance(item, dict):
@@ -5375,8 +5433,11 @@ def completion_payload(
     options: ChatOptions | None = None,
     files: list[dict[str, Any]] | None = None,
     history: list[dict[str, Any]] | None = None,
+    parent_message_id: str | None = None,
 ) -> dict[str, Any]:
     options = options or ChatOptions()
+    if files and len(files) > ZAI_MAX_COMPLETION_FILES:
+        raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} files per completion")
     features = {
         "image_generation": False,
         "web_search": False,
@@ -5418,7 +5479,7 @@ def completion_payload(
         "chat_id": chat_id,
         "id": assistant_msg_id or str(uuid.uuid4()),
         "current_user_message_id": user_msg_id,
-        "current_user_message_parent_id": None,
+        "current_user_message_parent_id": parent_message_id,
         "background_tasks": {"title_generation": True, "tags_generation": True},
     }
     captcha = captcha_verify_param or state.captcha_verify_param
@@ -5561,15 +5622,21 @@ def stream_zai_completion(
     retry_wait_sec: float = DEFAULT_UPSTREAM_RETRY_WAIT_SEC,
     retry_attempts: int = DEFAULT_UPSTREAM_RETRY_ATTEMPTS,
     cancel_check: Callable[[], None] | None = None,
+    parent_message_id: str | None = None,
+    retry_reused_chat: bool = False,
+    retry_files_factory: Callable[[], list[dict[str, Any]]] | None = None,
+    preserve_chat_on_generator_close: bool = False,
 ) -> Any:
     global _UPSTREAM_STREAM_INCOMPLETE_TOTAL
     options = options or ChatOptions()
     assistant_msg_id = require_uuid(assistant_msg_id, "assistant_message_id") if assistant_msg_id else str(uuid.uuid4())
     retry_attempts = max(1, int(retry_attempts))
     retry_wait_sec = max(0.0, float(retry_wait_sec))
-    # 仅当本次调用自建会话时才内部重试：复用会话（continue/reuse）的 chat_id 由调用方持有，
-    # 换会话会破坏“保持当前会话”语义，此类错误仍原样透传。
+    parent_message_id = require_uuid(parent_message_id, "parent_message_id") if parent_message_id else None
+    # 普通复用会话仍不重试；GLM-5.3 多批上下文的后续波次显式允许在同一
+    # parent 上换 message id 重传，严格对齐官网抓包，不会偷偷换 chat。
     own_chat = bool(create_chat or not chat_id)
+    can_retry = own_chat or bool(retry_reused_chat)
     content_emitted = False
     attempt = 0
     force_fresh_captcha = False  # 上游刚拒绝过验证码时，下一 attempt 绕开池码现场重解
@@ -5599,15 +5666,20 @@ def stream_zai_completion(
                 context_file_requested=coerce_bool(history_ctx.get("context_file_requested"), False),
                 context_file_fallback=str(history_ctx.get("context_file_fallback") or ""),
                 context_files=history_ctx.get("context_files") or [],
+                context_preload_waves=max(0, int(history_ctx.get("context_preload_waves") or 0)),
+                context_preload_files=max(0, int(history_ctx.get("context_preload_files") or 0)),
                 account=str(history_ctx.get("account") or ""),
             )
             if hist_id:
                 history_ctx["_record_id"] = hist_id
-        else:
+        elif not coerce_bool(history_ctx.get("_record_prestarted"), False):
             restart_history_record(hist_id, prompt)
     if hist_id and context_out is not None:
         context_out["_history_record_id"] = hist_id
     hist_started = time.monotonic()
+    hist_elapsed_offset_ms = (
+        max(0, int(history_ctx.get("history_elapsed_offset_ms") or 0)) if history_ctx else 0
+    )
     hist_status = "success"
     hist_error = ""
     # 流式过程中按历史详情页的读取频率节流落盘，让生成中内容保持实时，
@@ -5627,7 +5699,7 @@ def stream_zai_completion(
             content="".join(answer_parts),
             reasoning="".join(thinking_parts),
             status_code=200,
-            elapsed_ms=int((now - hist_started) * 1000),
+            elapsed_ms=hist_elapsed_offset_ms + int((now - hist_started) * 1000),
         )
 
     try:
@@ -5636,6 +5708,9 @@ def stream_zai_completion(
             last_attempt = attempt >= retry_attempts
             if cancel_check is not None:
                 cancel_check()
+            attempt_files = files
+            if attempt > 1 and retry_files_factory is not None:
+                attempt_files = retry_files_factory()
             if own_chat:
                 try:
                     chat_id, user_msg_id = new_chat(state, prompt, options=options)
@@ -5705,9 +5780,10 @@ def stream_zai_completion(
                 chat_id,
                 user_msg_id,
                 assistant_msg_id=assistant_msg_id,
+                parent_message_id=parent_message_id,
                 captcha_verify_param=captcha,
                 options=options,
-                files=files,
+                files=attempt_files,
                 history=history if create_chat else None,
             )
             url = f"{BASE_URL}/api/v2/chat/completions?{query}"
@@ -5728,9 +5804,12 @@ def stream_zai_completion(
                     status=exc.code,
                     summary=summary,
                 )
-                if not last_attempt and own_chat and is_retryable_upstream_error(summary):
+                if not last_attempt and can_retry and is_retryable_upstream_error(summary):
                     wait_sec = 0.0 if is_captcha_upstream_error(summary) else retry_wait_sec
-                    _best_effort_delete_upstream_chat(state, chat_id)
+                    if own_chat:
+                        _best_effort_delete_upstream_chat(state, chat_id)
+                    user_msg_id = None
+                    assistant_msg_id = str(uuid.uuid4())
                     log_event(
                         "upstream_transient_retry",
                         attempt=attempt,
@@ -5798,7 +5877,7 @@ def stream_zai_completion(
                                 error
                                 and not content_emitted
                                 and not last_attempt
-                                and own_chat
+                                and can_retry
                                 and is_retryable_upstream_error(error)
                             ):
                                 # 流首瞬时繁忙/验证码失效：不透传给客户端，整体换会话重试。
@@ -5840,7 +5919,7 @@ def stream_zai_completion(
                             error
                             and not content_emitted
                             and not last_attempt
-                            and own_chat
+                            and can_retry
                             and is_retryable_upstream_error(error)
                         ):
                             retry_transient = error
@@ -5880,7 +5959,7 @@ def stream_zai_completion(
                             events=event_count,
                             content_emitted=content_emitted,
                         )
-                        if not content_emitted and not last_attempt and own_chat:
+                        if not content_emitted and not last_attempt and can_retry:
                             retry_transient = message
                             retry_incomplete = True
                         else:
@@ -5899,11 +5978,12 @@ def stream_zai_completion(
                         elapsed_ms=int((time.time() - stream_started) * 1000),
                     )
                 if retry_transient:
-                    _best_effort_delete_upstream_chat(
-                        state,
-                        chat_id,
-                        reason="stream_incomplete" if retry_incomplete else "retry",
-                    )
+                    if own_chat:
+                        _best_effort_delete_upstream_chat(
+                            state,
+                            chat_id,
+                            reason="stream_incomplete" if retry_incomplete else "retry",
+                        )
                     captcha_rejected = is_captcha_upstream_error(retry_transient)
                     if captcha_rejected:
                         # 验证码被拒（超龄/一次性已耗）：无需等待，强制下一轮现场重解。
@@ -5913,12 +5993,14 @@ def stream_zai_completion(
                     answer_chars = 0
                     thinking_chars = 0
                     stream_budget.reset()
+                    user_msg_id = None
+                    assistant_msg_id = str(uuid.uuid4())
                     if hist_id:
                         # 重试换会话：立即清掉盘上残留的上一轮内容，不受节流限制。
                         update_history_progress(
                             hist_id,
                             status_code=200,
-                            elapsed_ms=int((time.monotonic() - hist_started) * 1000),
+                            elapsed_ms=hist_elapsed_offset_ms + int((time.monotonic() - hist_started) * 1000),
                         )
                     wait_sec = 0.0 if captcha_rejected else retry_wait_sec
                     log_event(
@@ -5951,7 +6033,7 @@ def stream_zai_completion(
         else:
             hist_status = "stopped"
             interrupted_chat_id = str((context_out or {}).get("chat_id") or chat_id or "").strip()
-            if interrupted_chat_id:
+            if interrupted_chat_id and not preserve_chat_on_generator_close:
                 if isinstance(context_out, dict):
                     context_out["_failed_cleanup_scheduled"] = True
                 _best_effort_delete_upstream_chat(
@@ -5975,7 +6057,7 @@ def stream_zai_completion(
                 content="".join(answer_parts),
                 reasoning="".join(thinking_parts),
                 error=hist_error,
-                elapsed_ms=int((time.monotonic() - hist_started) * 1000),
+                elapsed_ms=hist_elapsed_offset_ms + int((time.monotonic() - hist_started) * 1000),
                 chat_id=str(chat_id or ""),
             )
 
@@ -6439,6 +6521,7 @@ def _best_effort_delete_upstream_files(
             continue
         seen.add(file_id)
         file_id_list.append(file_id)
+    invalidate_context_file_cache_refs(file_id_list)
     added = pending_resource_deletes_add(
         state,
         (("file", file_id) for file_id in file_id_list),
@@ -9075,6 +9158,22 @@ def _context_file_cache_store(state: HarState, text: str, ref: dict[str, Any]) -
         _cleanup_context_file_cache_locked(now)
 
 
+def invalidate_context_file_cache_refs(file_ids: Iterable[str]) -> int:
+    """Evict cached refs before their upstream files enter the delete journal."""
+    targets = {str(file_id or "").strip() for file_id in file_ids if str(file_id or "").strip()}
+    if not targets:
+        return 0
+    removed = 0
+    with _CONTEXT_FILE_CACHE_LOCK:
+        for key, (ref, _uploaded_at) in list(_CONTEXT_FILE_CACHE.items()):
+            file_obj = ref.get("file") if isinstance(ref.get("file"), dict) else ref
+            file_id = str(file_obj.get("id") or ref.get("id") or "").strip()
+            if file_id in targets:
+                _CONTEXT_FILE_CACHE.pop(key, None)
+                removed += 1
+    return removed
+
+
 def context_cache_status() -> dict[str, int]:
     """Return content-free attachment-cache and degradation-state health."""
     with _CONTEXT_FILE_CACHE_LOCK:
@@ -9101,11 +9200,21 @@ def context_cache_status() -> dict[str, int]:
         }
 
 
-def upload_context_package_to_zai(state: HarState, context_text: str, filename: str | None = None, label: str = "") -> dict[str, Any]:
+def upload_context_package_to_zai(
+    state: HarState,
+    context_text: str,
+    filename: str | None = None,
+    label: str = "",
+    *,
+    reuse_cache: bool = True,
+    cache_hit_out: dict[str, bool] | None = None,
+) -> dict[str, Any]:
     """Upload one transcript file (history or tools) with an ephemeral name."""
     raw = context_text.encode("utf-8")
-    cached = _context_file_cache_lookup(state, context_text)
+    cached = _context_file_cache_lookup(state, context_text) if reuse_cache else None
     if cached is not None:
+        if cache_hit_out is not None:
+            cache_hit_out["hit"] = True
         log_event(
             "context_file_cache_hit",
             label=label,
@@ -9113,6 +9222,8 @@ def upload_context_package_to_zai(state: HarState, context_text: str, filename: 
             bytes=len(raw),
         )
         return cached
+    if cache_hit_out is not None:
+        cache_hit_out["hit"] = False
     if len(raw) > MAX_CONTEXT_FILE_BYTES:
         raise ValueError(f"context file exceeds {MAX_CONTEXT_FILE_BYTES} bytes")
     # 节流抖动 50-200ms：打破“上传即 completion”的固定时序（对齐 ds2api jitterSleep），
@@ -9175,12 +9286,12 @@ def apply_output_integrity_guard(
 
 def _context_file_trace_item(
     kind: str,
-    ref: dict[str, Any],
+    ref: dict[str, Any] | None,
     content: str,
     part: int = 1,
     parts: int = 1,
 ) -> dict[str, Any]:
-    metadata = history_files_snapshot([ref])
+    metadata = history_files_snapshot([ref]) if ref else []
     file_meta = metadata[0] if metadata else {}
     return {
         "kind": kind,
@@ -9193,12 +9304,282 @@ def _context_file_trace_item(
     }
 
 
+def plan_staged_context_files(
+    generated_files: list[dict[str, Any]],
+    generated_trace: list[dict[str, Any]],
+    user_files: list[dict[str, Any]],
+) -> tuple[list[tuple[list[dict[str, Any]], list[dict[str, Any]]]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Partition an oversized composer attachment set into preload and final waves.
+
+    Generated history/tool segments keep their semantic order. User-provided
+    attachments stay on the final message because that is the turn which
+    actually answers the caller. Each preload wave is as large as possible,
+    matching the ten-file first wave observed in the official client.
+    """
+    if len(generated_files) != len(generated_trace):
+        raise ValueError("generated context metadata is inconsistent")
+    if len(user_files) > ZAI_MAX_COMPLETION_FILES:
+        raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} user files per completion")
+    if len(generated_files) + len(user_files) <= ZAI_MAX_COMPLETION_FILES:
+        return [], list(generated_files) + list(user_files), list(generated_trace)
+
+    remaining = list(zip(generated_files, generated_trace))
+    preload: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+    while len(remaining) + len(user_files) > ZAI_MAX_COMPLETION_FILES:
+        take = min(ZAI_MAX_COMPLETION_FILES, len(remaining))
+        wave = remaining[:take]
+        remaining = remaining[take:]
+        preload.append(
+            (
+                [item[0] for item in wave],
+                [item[1] for item in wave],
+            )
+        )
+    final_generated = [item[0] for item in remaining]
+    final_trace = [item[1] for item in remaining]
+    return preload, final_generated + list(user_files), final_trace
+
+
+def context_preload_prompt(wave: int, waves: int, files: int) -> str:
+    """Explain an intentionally incomplete context-loading turn to GLM-5.3."""
+    return (
+        f"Context preload batch {wave}/{waves}: read all {files} attached text files and retain their contents. "
+        "When numbered segment headers are present, follow their numeric order. Do not answer the user's request "
+        "yet; begin reasoning about the loaded context and wait for the continuation message with the remaining "
+        "files and final instructions."
+    )
+
+
+def staged_context_final_prompt(prompt: str, preload_waves: int) -> str:
+    """Join stopped preload turns with the actual final execution prompt."""
+    return (
+        f"Continue from the {preload_waves} context preload turn(s) immediately before this message. Those turns "
+        "were intentionally stopped during reasoning after loading earlier numbered segments. Combine that retained "
+        "context with every attachment on this message, then execute the final instructions below.\n\n"
+        + str(prompt or "")
+    )
+
+
+def _context_trace_label(item: dict[str, Any]) -> str:
+    kind = str(item.get("kind") or "context")
+    part = max(1, int(item.get("part") or 1))
+    parts = max(1, int(item.get("parts") or 1))
+    return kind if parts == 1 else f"{kind}_{part}_of_{parts}"
+
+
+def _context_file_ids(files: Iterable[dict[str, Any]]) -> list[str]:
+    file_ids: list[str] = []
+    for ref in files:
+        file_obj = ref.get("file") if isinstance(ref.get("file"), dict) else ref
+        file_id = str(file_obj.get("id") or ref.get("id") or "").strip()
+        if file_id and file_id not in file_ids:
+            file_ids.append(file_id)
+    return file_ids
+
+
+def _update_context_trace_ref(item: dict[str, Any], ref: dict[str, Any]) -> None:
+    metadata = history_files_snapshot([ref])
+    file_meta = metadata[0] if metadata else {}
+    if file_meta.get("name"):
+        item["name"] = str(file_meta["name"])
+    if file_meta.get("size") is not None:
+        item["size"] = int(file_meta["size"])
+    if file_meta.get("content_type"):
+        item["content_type"] = str(file_meta["content_type"])
+
+
+def upload_context_trace_files(
+    state: HarState,
+    trace: list[dict[str, Any]],
+    *,
+    reuse_cache: bool,
+    owned_out: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Upload one generated context wave and bind its trace to actual files."""
+    uploaded: list[dict[str, Any]] = []
+    owned: list[dict[str, Any]] = []
+    try:
+        for item in trace:
+            cache_state: dict[str, bool] = {}
+            ref = upload_context_package_to_zai(
+                state,
+                str(item.get("content") or ""),
+                label=_context_trace_label(item),
+                reuse_cache=reuse_cache,
+                cache_hit_out=cache_state,
+            )
+            uploaded.append(ref)
+            if not cache_state.get("hit", False):
+                owned.append(ref)
+            _update_context_trace_ref(item, ref)
+        if owned_out is not None:
+            owned_out.extend(owned)
+        return uploaded
+    except Exception:
+        record_context_upload_failure(state.user_id)
+        _best_effort_delete_upstream_files(
+            state,
+            _context_file_ids(owned),
+            reason="context_wave_retry_upload_failed",
+            event_prefix="context_wave_file_cleanup",
+        )
+        raise
+
+
+def reupload_context_trace_files(state: HarState, trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Freshly upload one retry wave instead of reusing its prior file ids."""
+    return upload_context_trace_files(state, trace, reuse_cache=False)
+
+
+def preload_zai_context_waves(
+    state: HarState,
+    waves: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]],
+    options: ChatOptions,
+    *,
+    captcha_verify_param: str | None = None,
+    fresh_captcha_browser: bool = False,
+    chrome_path: str | None = None,
+    captcha_headless: bool = True,
+    captcha_timeout_ms: int = 75_000,
+    upstream_timeout_sec: int | None = None,
+    retry_wait_sec: float = DEFAULT_UPSTREAM_RETRY_WAIT_SEC,
+    retry_attempts: int = DEFAULT_UPSTREAM_RETRY_ATTEMPTS,
+    cancel_check: Callable[[], None] | None = None,
+    uploaded_out: list[dict[str, Any]] | None = None,
+    owned_out: list[dict[str, Any]] | None = None,
+) -> tuple[str, str]:
+    """Load oversized context through stopped thinking turns on one chat."""
+    if not waves:
+        return "", ""
+    chat_id = ""
+    parent_message_id = ""
+    preload_options = replace(
+        options,
+        enable_thinking=True,
+        reasoning_effort="max",
+        include_thinking=False,
+        delete_chat_after_completion=False,
+        mode="new",
+        chat_id="",
+        user_msg_id="",
+    )
+    total = len(waves)
+    try:
+        for index, (initial_files, trace) in enumerate(waves, start=1):
+            if cancel_check is not None:
+                cancel_check()
+            current_owned: list[dict[str, Any]] = []
+            if not initial_files:
+                initial_files = upload_context_trace_files(
+                    state,
+                    trace,
+                    reuse_cache=True,
+                    owned_out=current_owned,
+                )
+            if uploaded_out is not None:
+                uploaded_out.extend(initial_files)
+            if owned_out is not None:
+                owned_out.extend(current_owned)
+            prompt = context_preload_prompt(index, total, len(trace))
+            context: dict[str, Any] = {}
+            current_files = list(initial_files)
+
+            def retry_files(current_trace: list[dict[str, Any]] = trace) -> list[dict[str, Any]]:
+                nonlocal current_files, current_owned
+                refreshed_owned: list[dict[str, Any]] = []
+                refreshed = upload_context_trace_files(
+                    state,
+                    current_trace,
+                    reuse_cache=False,
+                    owned_out=refreshed_owned,
+                )
+                if uploaded_out is not None:
+                    uploaded_out.extend(refreshed)
+                if owned_out is not None:
+                    owned_out.extend(refreshed_owned)
+                _best_effort_delete_upstream_files(
+                    state,
+                    _context_file_ids(current_owned),
+                    reason="context_wave_retry_superseded",
+                    event_prefix="context_wave_file_cleanup",
+                )
+                current_files = refreshed
+                current_owned = refreshed_owned
+                return refreshed
+
+            events = stream_zai_completion(
+                state,
+                prompt,
+                create_chat=not bool(chat_id),
+                chat_id=chat_id or None,
+                parent_message_id=parent_message_id or None,
+                captcha_verify_param=captcha_verify_param,
+                fresh_captcha_browser=fresh_captcha_browser,
+                chrome_path=chrome_path,
+                captcha_headless=captcha_headless,
+                captcha_timeout_ms=captcha_timeout_ms,
+                upstream_timeout_sec=upstream_timeout_sec,
+                options=preload_options,
+                context_out=context,
+                files=initial_files,
+                retry_wait_sec=retry_wait_sec,
+                retry_attempts=retry_attempts,
+                cancel_check=cancel_check,
+                retry_reused_chat=bool(chat_id),
+                retry_files_factory=retry_files,
+                preserve_chat_on_generator_close=True,
+            )
+            thinking_started = False
+            phase_seen = ""
+            try:
+                for event in events:
+                    error = extract_error_from_event(event)
+                    if error:
+                        raise UpstreamRequestError(error)
+                    delta, phase = extract_delta_from_event(event)
+                    if not delta:
+                        continue
+                    phase_seen = phase.lower()
+                    thinking_started = phase_seen == "thinking"
+                    break
+                assistant_id = str(context.get("assistant_message_id") or "").strip()
+                active_chat_id = str(context.get("chat_id") or chat_id or "").strip()
+                if not assistant_id or not active_chat_id:
+                    raise UpstreamRequestError("context preload did not create a resumable chat turn")
+                stop_zai_task(state, assistant_id)
+                log_event(
+                    "context_preload_stopped",
+                    chat_id_fp=sha16(active_chat_id),
+                    assistant_id_fp=sha16(assistant_id),
+                    wave=index,
+                    waves=total,
+                    files=len(initial_files),
+                    phase=phase_seen or "none",
+                )
+                if not thinking_started:
+                    raise UpstreamRequestError("context preload did not enter the thinking phase")
+                chat_id = active_chat_id
+                parent_message_id = assistant_id
+            finally:
+                close = getattr(events, "close", None)
+                if callable(close):
+                    close()
+        return chat_id, parent_message_id
+    except Exception:
+        active_chat_id = str(locals().get("context", {}).get("chat_id") or chat_id or "").strip()
+        if active_chat_id:
+            _best_effort_delete_upstream_chat(state, active_chat_id, reason="context_preload_failed")
+        raise
+
+
 def prepare_protocol_upstream_request(
     state: HarState,
     request: ProtocolRequest,
     trace_out: dict[str, Any] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     files = list(request.files)
+    if len(files) > ZAI_MAX_COMPLETION_FILES:
+        raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} user files per completion")
     if trace_out is not None:
         trace_out.clear()
         trace_out.update(
@@ -9230,15 +9611,44 @@ def prepare_protocol_upstream_request(
                 history_parts=len(history_parts),
                 tools_parts=len(tools_parts),
             )
+        deferred_history_trace = [
+            _context_file_trace_item("history", None, part_text, index, len(history_parts))
+            for index, part_text in enumerate(history_parts, start=1)
+        ]
+        deferred_tools_trace = [
+            _context_file_trace_item("tools", None, part_text, index, len(tools_parts))
+            for index, part_text in enumerate(tools_parts, start=1)
+        ]
+        deferred_trace = deferred_history_trace + deferred_tools_trace
+        if len(deferred_trace) + len(files) > ZAI_MAX_COMPLETION_FILES:
+            if normalize_model(request.options.model) == DEFAULT_MODEL:
+                if trace_out is not None:
+                    trace_out["delivery_mode"] = "file"
+                    trace_out["context_files"] = deferred_trace
+                    trace_out["deferred_context_upload"] = True
+                # The caller uploads each wave immediately before it is sent.
+                # This avoids uploading the entire package up front and
+                # matches the official stop/continue ordering.
+                return apply_output_integrity_guard(request.execution_prompt, effective_tools, []), files
+            raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} files per completion")
         generated_files: list[dict[str, Any]] = []
+        owned_generated_files: list[dict[str, Any]] = []
         generated_trace: list[dict[str, Any]] = []
         try:
             tools_files: list[dict[str, Any]] = []
             tools_trace: list[dict[str, Any]] = []
             for index, part_text in enumerate(tools_parts, start=1):
                 label = "tools" if len(tools_parts) == 1 else f"tools_{index}_of_{len(tools_parts)}"
-                tools_file = upload_context_package_to_zai(state, part_text, label=label)
+                cache_state: dict[str, bool] = {}
+                tools_file = upload_context_package_to_zai(
+                    state,
+                    part_text,
+                    label=label,
+                    cache_hit_out=cache_state,
+                )
                 generated_files.append(tools_file)
+                if not cache_state.get("hit", False):
+                    owned_generated_files.append(tools_file)
                 tools_files.append(tools_file)
                 tools_trace.append(
                     _context_file_trace_item("tools", tools_file, part_text, index, len(tools_parts))
@@ -9247,8 +9657,16 @@ def prepare_protocol_upstream_request(
             history_trace: list[dict[str, Any]] = []
             for index, part_text in enumerate(history_parts, start=1):
                 label = "history" if len(history_parts) == 1 else f"history_{index}_of_{len(history_parts)}"
-                history_file = upload_context_package_to_zai(state, part_text, label=label)
+                cache_state = {}
+                history_file = upload_context_package_to_zai(
+                    state,
+                    part_text,
+                    label=label,
+                    cache_hit_out=cache_state,
+                )
                 generated_files.append(history_file)
+                if not cache_state.get("hit", False):
+                    owned_generated_files.append(history_file)
                 history_files.append(history_file)
                 history_trace.append(
                     _context_file_trace_item("history", history_file, part_text, index, len(history_parts))
@@ -9259,7 +9677,7 @@ def prepare_protocol_upstream_request(
             # 上传失败不阻断请求：记入降级计数并回退模式 A。
             log_event("context_file_upload_failed", error=str(exc)[:300], fallback="mode_a")
             orphan_ids: list[str] = []
-            for generated in generated_files:
+            for generated in owned_generated_files:
                 file_obj = generated.get("file") if isinstance(generated.get("file"), dict) else generated
                 file_id = str(file_obj.get("id") or generated.get("id") or "").strip()
                 if file_id:
@@ -10118,7 +10536,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
     ) -> tuple[str, bool, str]:
         """Best-effort cleanup after a successful response, never hiding its output."""
         chat_id = str(context.get("chat_id") or "").strip()
-        if not options.delete_chat_after_completion or not chat_id:
+        delete_required = options.delete_chat_after_completion or bool(context.get("_ephemeral_staged_chat"))
+        if not delete_required or not chat_id:
             return chat_id, False, ""
         try:
             delete_zai_chat(state, chat_id)
@@ -10139,7 +10558,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         （upstream_chat_deleted / auto_delete_failed），失败可在面板手动补删。
         """
         chat_id = str(context.get("chat_id") or "").strip()
-        if not options.delete_chat_after_completion or not chat_id:
+        delete_required = options.delete_chat_after_completion or bool(context.get("_ephemeral_staged_chat"))
+        if not delete_required or not chat_id:
             return chat_id, False, ""
         journal_id = pending_chat_delete_add(state, chat_id, "auto_delete")
         log_event("auto_delete_scheduled", chat_id_fp=sha16(chat_id))
@@ -10180,10 +10600,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
         cleanup must happen even when the normal success auto-delete toggle is
         disabled.
         """
+        if context.get("_staged_context_files") and not context.get("_failed_context_files_cleanup_scheduled"):
+            context["_failed_context_files_cleanup_scheduled"] = True
+            self._cleanup_failed_upstream_files(state, context.get("_staged_context_files"))
         if context.get("_stream_incomplete"):
             force = True
             reason = "stream_interrupted"
-        if not force and not options.delete_chat_after_completion:
+        if not force and not options.delete_chat_after_completion and not context.get("_ephemeral_staged_chat"):
             return False
         chat_id = str(context.get("chat_id") or "").strip()
         if not chat_id:
@@ -10333,6 +10756,157 @@ class ProxyHandler(BaseHTTPRequestHandler):
         delivery_trace: dict[str, Any] = {}
         prompt, files = prepare_protocol_upstream_request(state, request, trace_out=delivery_trace)
         create_chat = not (request.options.mode in {"continue", "edit", "reuse"} and request.options.chat_id)
+        staged_chat_id = ""
+        staged_parent_id = ""
+        staged_waves: list[tuple[list[dict[str, Any]], list[dict[str, Any]]]] = []
+        final_retry_files_factory: Callable[[], list[dict[str, Any]]] | None = None
+        context_trace = [
+            item for item in delivery_trace.get("context_files") or [] if isinstance(item, dict)
+        ]
+        owned_context_refs: list[dict[str, Any]] = []
+        history_record_prestarted = False
+        history_elapsed_offset_ms = 0
+        user_input = ""
+        for item in reversed(request.messages):
+            if str(item.get("role") or "").lower() == "user":
+                text = history_display_content(item.get("content")).strip()
+                if text:
+                    user_input = text[:HISTORY_PROMPT_CHARS]
+                    break
+        mirror_context = request.context_text
+        if delivery_trace.get("delivery_mode") == "file":
+            history_parts = [
+                item for item in context_trace if item.get("kind") == "history"
+            ]
+            history_parts.sort(key=lambda item: int(item.get("part") or 1))
+            mirror_context = "\n\n".join(str(item.get("content") or "") for item in history_parts)
+        if (
+            delivery_trace.get("deferred_context_upload") is True
+            and normalize_model(request.options.model) == DEFAULT_MODEL
+        ):
+            if not create_chat:
+                log_event(
+                    "context_staging_reuse_degraded",
+                    chat_id_fp=sha16(request.options.chat_id),
+                    reason="oversized_context_requires_ephemeral_chat",
+                )
+                # The complete normalized dialogue is already present in the
+                # generated transcript. A fresh ephemeral chat preserves that
+                # context without needing the unknown current parent of an
+                # existing upstream conversation.
+                create_chat = True
+            user_files = list(files)
+            staged_waves, _planned_final, final_trace = plan_staged_context_files(
+                [{} for _item in context_trace],
+                context_trace,
+                user_files,
+            )
+            staged_waves = [([], wave_trace) for _wave_files, wave_trace in staged_waves]
+            prompt = staged_context_final_prompt(prompt, len(staged_waves))
+            preload_files = sum(len(wave_trace) for _wave_files, wave_trace in staged_waves)
+            stage_started = time.monotonic()
+            if history_record_id:
+                restart_history_record(history_record_id, prompt)
+                history_record_prestarted = True
+            else:
+                history_record_id = start_history_record(
+                    surface=request.surface,
+                    model=request.options.model,
+                    stream=request.stream,
+                    user_input=user_input,
+                    messages=request.messages,
+                    files=user_files,
+                    context_text=mirror_context,
+                    final_prompt=prompt,
+                    delivery_mode="file",
+                    context_file_requested=True,
+                    context_file_fallback=str(delivery_trace.get("fallback_reason") or ""),
+                    context_files=context_trace,
+                    context_preload_waves=len(staged_waves),
+                    context_preload_files=preload_files,
+                    account=state.user_id or "",
+                )
+                history_record_prestarted = bool(history_record_id)
+            try:
+                staged_chat_id, staged_parent_id = preload_zai_context_waves(
+                    state,
+                    staged_waves,
+                    request.options,
+                    captcha_verify_param=self.captcha_verify_param,
+                    fresh_captcha_browser=self.fresh_captcha_browser,
+                    chrome_path=self.chrome_path,
+                    captcha_headless=self.captcha_headless,
+                    captcha_timeout_ms=self.captcha_timeout_ms,
+                    upstream_timeout_sec=self.upstream_timeout_sec,
+                    retry_wait_sec=self.upstream_retry_wait_sec,
+                    retry_attempts=self.upstream_retry_max_attempts,
+                    cancel_check=self._check_request_cancelled,
+                    owned_out=owned_context_refs,
+                )
+                # Match the official sequence: remaining generated files are
+                # uploaded only after the prior thinking turn was stopped.
+                current_final_owned: list[dict[str, Any]] = []
+                current_final_generated = upload_context_trace_files(
+                    state,
+                    final_trace,
+                    reuse_cache=True,
+                    owned_out=current_final_owned,
+                )
+                owned_context_refs.extend(current_final_owned)
+                final_files = current_final_generated + user_files
+                record_context_upload_success(state.user_id)
+            except Exception as exc:
+                if staged_chat_id:
+                    _best_effort_delete_upstream_chat(
+                        state,
+                        staged_chat_id,
+                        reason="context_preload_failed",
+                    )
+                self._cleanup_failed_upstream_files(state, owned_context_refs)
+                finish_history_record(
+                    history_record_id,
+                    status="error",
+                    error=client_error_message(exc),
+                    elapsed_ms=int((time.monotonic() - stage_started) * 1000),
+                    chat_id=staged_chat_id,
+                    status_code=exception_http_status(exc),
+                )
+                raise
+            files = final_files
+            create_chat = False
+            delivery_trace["staged_waves"] = len(staged_waves)
+            delivery_trace["staged_files"] = sum(len(wave_trace) for _wave_files, wave_trace in staged_waves)
+
+            def retry_final_files() -> list[dict[str, Any]]:
+                nonlocal current_final_owned
+                refreshed_owned: list[dict[str, Any]] = []
+                refreshed = upload_context_trace_files(
+                    state,
+                    final_trace,
+                    reuse_cache=False,
+                    owned_out=refreshed_owned,
+                )
+                owned_context_refs.extend(refreshed_owned)
+                _best_effort_delete_upstream_files(
+                    state,
+                    _context_file_ids(current_final_owned),
+                    reason="context_final_wave_retry_superseded",
+                    event_prefix="context_wave_file_cleanup",
+                )
+                current_final_owned = refreshed_owned
+                return refreshed + user_files
+
+            final_retry_files_factory = retry_final_files
+            refresh_history_record_delivery(
+                history_record_id,
+                final_prompt=prompt,
+                files=files,
+                context_files=context_trace,
+                chat_id=staged_chat_id,
+            )
+            history_elapsed_offset_ms = int((time.monotonic() - stage_started) * 1000)
+        elif len(files) > ZAI_MAX_COMPLETION_FILES:
+            raise ValueError(f"Z.ai allows at most {ZAI_MAX_COMPLETION_FILES} files per completion")
         log_event(
             "upstream_call_start",
             surface=request.surface,
@@ -10349,29 +10923,18 @@ class ProxyHandler(BaseHTTPRequestHandler):
             prompt_chars=len(prompt),
             files=len(files),
             reuse_chat=not create_chat,
-            delete_after=request.options.delete_chat_after_completion,
+            staged_waves=len(staged_waves),
+            staged_files=sum(len(wave_trace) for _wave_files, wave_trace in staged_waves),
+            delete_after=True if staged_waves else request.options.delete_chat_after_completion,
             user_id_fp=sha16(state.user_id) if state.user_id else "",
         )
         context: dict[str, Any] = {"profile_id": self._chat_profile_get() or ""}
-        user_input = ""
-        for item in reversed(request.messages):
-            if str(item.get("role") or "").lower() == "user":
-                text = history_display_content(item.get("content")).strip()
-                if text:
-                    user_input = text[:HISTORY_PROMPT_CHARS]
-                    break
+        if staged_waves:
+            context["_ephemeral_staged_chat"] = True
+            context["_staged_context_files"] = owned_context_refs
         # ds2api 同款请求镜像：完整出站消息 + 文件清单 + 上下文 + 最终 prompt + 账号。
         # 文件模式下 history_text 记实际第一个附件（纯对话 transcript），
         # 与"两个附件 + 一个聊天框"的实发结构一一对应；内联模式记整段上下文。
-        mirror_context = request.context_text
-        if delivery_trace.get("delivery_mode") == "file":
-            history_parts = [
-                item
-                for item in delivery_trace.get("context_files") or []
-                if isinstance(item, dict) and item.get("kind") == "history"
-            ]
-            history_parts.sort(key=lambda item: int(item.get("part") or 1))
-            mirror_context = "\n\n".join(str(item.get("content") or "") for item in history_parts)
         history_ctx = {
             "surface": request.surface,
             "stream": request.stream,
@@ -10382,16 +10945,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
             "context_file_requested": delivery_trace.get("requested_mode") == "file",
             "context_file_fallback": str(delivery_trace.get("fallback_reason") or ""),
             "context_files": delivery_trace.get("context_files") or [],
+            "context_preload_waves": len(staged_waves),
+            "context_preload_files": sum(len(wave_trace) for _wave_files, wave_trace in staged_waves),
+            "history_elapsed_offset_ms": history_elapsed_offset_ms,
             "account": state.user_id or "",
         }
         if history_record_id:
             history_ctx["_record_id"] = history_record_id
+        if history_record_prestarted:
+            history_ctx["_record_prestarted"] = True
         events = stream_zai_completion(
             state,
             prompt,
             create_chat=create_chat,
-            chat_id=request.options.chat_id or None,
+            chat_id=staged_chat_id or request.options.chat_id or None,
             user_msg_id=request.options.user_msg_id or None,
+            parent_message_id=staged_parent_id or None,
             captcha_verify_param=self.captcha_verify_param,
             fresh_captcha_browser=self.fresh_captcha_browser,
             chrome_path=self.chrome_path,
@@ -10405,6 +10974,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
             files=files,
             history_ctx=history_ctx,
             cancel_check=self._check_request_cancelled,
+            retry_reused_chat=bool(staged_waves),
+            retry_files_factory=final_retry_files_factory,
         )
         return events, context, state
 
@@ -11502,6 +12073,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
                     "context_cache": context_cache_status(),
                     "limits": {
                         "chat_file_upload_bytes": MAX_CHAT_FILE_UPLOAD_BYTES,
+                        "zai_completion_files": ZAI_MAX_COMPLETION_FILES,
                         "har_upload_bytes": MAX_HAR_UPLOAD_BYTES,
                         "legacy_json_har_bytes": MAX_LEGACY_JSON_HAR_BYTES,
                         "json_body_bytes": MAX_JSON_BODY_BYTES,

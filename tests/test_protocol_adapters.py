@@ -72,7 +72,13 @@ class ProtocolAdaptersTest(unittest.TestCase):
         app._CAPTCHA_PREFETCH_ENABLED = False
         app._CAPTCHA_POOL.clear()
 
-        def fake_upload(_state, context_text: str, filename: str | None = None, label: str = ""):
+        def fake_upload(
+            _state,
+            context_text: str,
+            filename: str | None = None,
+            label: str = "",
+            **_kwargs,
+        ):
             self.uploads.append((filename, context_text))
             resolved_name = filename or f"{label or 'context'}.txt"
             return {
@@ -1333,6 +1339,488 @@ class ProtocolAdaptersTest(unittest.TestCase):
             [(item["kind"], item["part"], item["parts"]) for item in persisted],
         )
 
+    def test_glm53_oversized_context_plan_uses_ten_file_preload_waves(self) -> None:
+        generated = [{"id": f"generated-{index}"} for index in range(25)]
+        trace = [
+            {"kind": "history", "part": index + 1, "parts": 25, "content": f"part-{index}"}
+            for index in range(25)
+        ]
+        preload, final_files, final_trace = app.plan_staged_context_files(generated, trace, [])
+
+        self.assertEqual([10, 10], [len(files) for files, _items in preload])
+        self.assertEqual([5], [len(final_files)])
+        self.assertEqual([20, 21, 22, 23, 24], [item["part"] - 1 for item in final_trace])
+
+        preload_with_user, final_with_user, final_trace_with_user = app.plan_staged_context_files(
+            generated[:11],
+            trace[:11],
+            [{"id": "user-file"}],
+        )
+        self.assertEqual([10], [len(files) for files, _items in preload_with_user])
+        self.assertEqual(["generated-10", "user-file"], [item["id"] for item in final_with_user])
+        self.assertEqual([11], [item["part"] for item in final_trace_with_user])
+
+        history_then_tool = trace[:10] + [
+            {"kind": "tools", "part": 1, "parts": 1, "content": "tool definitions"}
+        ]
+        preload_with_tool, final_with_tool, final_tool_trace = app.plan_staged_context_files(
+            generated[:11],
+            history_then_tool,
+            [],
+        )
+        self.assertEqual([10], [len(files) for files, _items in preload_with_tool])
+        self.assertEqual(["generated-10"], [item["id"] for item in final_with_tool])
+        self.assertEqual(["tools"], [item["kind"] for item in final_tool_trace])
+
+    def test_glm53_oversized_context_defers_all_generated_uploads(self) -> None:
+        request = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.3-forcehistory",
+                "messages": [{"role": "user", "content": "H" * 430_000}],
+            },
+            False,
+        )
+        trace: dict[str, object] = {}
+
+        prompt, files = app.prepare_protocol_upstream_request(fake_state(), request, trace_out=trace)
+
+        self.assertEqual([], files)
+        self.assertEqual([], self.uploads, "超限上下文不能在首个预载波次前上传全部分片")
+        self.assertTrue(trace["deferred_context_upload"])
+        self.assertGreater(len(trace["context_files"]), app.ZAI_MAX_COMPLETION_FILES)
+        self.assertIn("attached file holds the earlier conversation", prompt)
+
+    def test_completion_file_limit_is_rejected_before_upstream_generation(self) -> None:
+        user_files = [{"id": f"00000000-0000-0000-0000-{index:012d}"} for index in range(11)]
+        with self.assertRaisesRegex(ValueError, "at most 10 user files"):
+            app.normalize_openai_chat_request(
+                {
+                    "model": "glm-5.3",
+                    "messages": [{"role": "user", "content": "too many files"}],
+                    "files": user_files,
+                },
+                False,
+            )
+        with self.assertRaisesRegex(ValueError, "at most 10 files"):
+            app.completion_payload(
+                fake_state(),
+                "too many files",
+                "00000000-0000-0000-0000-000000000501",
+                "00000000-0000-0000-0000-000000000502",
+                files=user_files,
+            )
+
+        status, raw = self.request(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "model": "glm-5.2-forcehistory",
+                "messages": [{"role": "user", "content": "history plus ten user files"}],
+                "files": user_files[:10],
+                "stream": False,
+            },
+        )
+        self.assertEqual(400, status, raw[:500])
+        self.assertIn("at most 10 files", raw)
+        self.assertEqual(0, self.chat_sequence, "附件总数超限时不能创建上游 generation")
+        self.assertEqual([], self.uploads, "不可分批的超限请求必须在内部附件上传前拒绝")
+
+    def test_preload_stop_failure_does_not_poison_upload_health(self) -> None:
+        state = fake_state()
+        original_stop = app.stop_zai_task
+        original_cleanup = app._best_effort_delete_upstream_chat
+        app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
+        app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+        def thinking_stream(_state, _prompt, **kwargs):
+            kwargs["context_out"].update(
+                {
+                    "chat_id": "00000000-0000-0000-0000-000000000511",
+                    "assistant_message_id": "00000000-0000-0000-0000-000000000512",
+                }
+            )
+            yield 'data: {"data":{"delta_content":"thinking","phase":"thinking"}}'
+
+        app.stream_zai_completion = thinking_stream
+        app.stop_zai_task = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("stop failed"))
+        app._best_effort_delete_upstream_chat = lambda *_args, **_kwargs: True
+        poisoned_failure = False
+        poisoned_degraded = False
+        try:
+            with self.assertRaisesRegex(RuntimeError, "stop failed"):
+                app.preload_zai_context_waves(
+                    state,
+                    [([], [{"kind": "history", "part": 1, "parts": 1, "content": "context"}])],
+                    app.ChatOptions(model="glm-5.3"),
+                )
+            poisoned_failure = state.user_id in app._CONTEXT_UPLOAD_FAILURES
+            poisoned_degraded = state.user_id in app._CONTEXT_UPLOAD_DEGRADED_UNTIL
+        finally:
+            app.stop_zai_task = original_stop
+            app._best_effort_delete_upstream_chat = original_cleanup
+            app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+        self.assertFalse(poisoned_failure)
+        self.assertFalse(poisoned_degraded)
+
+    def test_context_preload_waves_stop_thinking_and_chain_parent(self) -> None:
+        original_stop = app.stop_zai_task
+        original_cleanup = app._best_effort_delete_upstream_files
+        calls: list[dict[str, object]] = []
+        stopped: list[str] = []
+        cleaned_files: list[list[str]] = []
+        chat_id = "00000000-0000-0000-0000-000000000321"
+
+        def preload_stream(_state, prompt, **kwargs):
+            index = len(calls) + 1
+            assistant_id = f"00000000-0000-0000-0000-{index:012d}"
+            context = kwargs["context_out"]
+            context.update({"chat_id": kwargs.get("chat_id") or chat_id, "assistant_message_id": assistant_id})
+            calls.append({"prompt": prompt, **kwargs})
+            if index == 1:
+                kwargs["retry_files_factory"]()
+            yield 'data: {"data":{"delta_content":"thinking","phase":"thinking"}}'
+            raise AssertionError("preload must close the stream after the first thinking delta")
+
+        app.stream_zai_completion = preload_stream
+        app.stop_zai_task = lambda _state, assistant_id: stopped.append(assistant_id) or {"status": True}
+        app._best_effort_delete_upstream_files = (
+            lambda _state, file_ids, **_kwargs: cleaned_files.append(list(file_ids)) or True
+        )
+        waves = [
+            ([], [{"kind": "history", "part": 1, "parts": 2, "content": "one"}]),
+            ([], [{"kind": "history", "part": 2, "parts": 2, "content": "two"}]),
+        ]
+        try:
+            result_chat, result_parent = app.preload_zai_context_waves(
+                fake_state(),
+                waves,
+                app.ChatOptions(model="glm-5.3"),
+                retry_wait_sec=0,
+                retry_attempts=2,
+            )
+        finally:
+            app.stop_zai_task = original_stop
+            app._best_effort_delete_upstream_files = original_cleanup
+
+        self.assertEqual(chat_id, result_chat)
+        self.assertEqual(stopped[-1], result_parent)
+        self.assertEqual(2, len(calls))
+        self.assertTrue(calls[0]["create_chat"])
+        self.assertFalse(calls[1]["create_chat"])
+        self.assertIsNone(calls[0]["parent_message_id"])
+        self.assertEqual(stopped[0], calls[1]["parent_message_id"])
+        self.assertTrue(all(call["preserve_chat_on_generator_close"] for call in calls))
+        self.assertEqual(3, len(self.uploads), "预载应逐波上传，繁忙重试应重新上传当前波")
+        self.assertTrue(all(len(call["files"]) == 1 for call in calls))
+        self.assertEqual([["file_history_1_of_2"]], cleaned_files, "重传后必须回收被替代的旧附件")
+        self.assertIn("Do not answer", calls[0]["prompt"])
+        self.assertEqual(2, len(stopped))
+
+    def test_har_aligned_preload_chain_retries_second_wave_on_same_parent(self) -> None:
+        state = fake_state()
+        chat_id = "00000000-0000-0000-0000-000000000431"
+        first_user_id = "00000000-0000-0000-0000-000000000432"
+        first_file_id = "00000000-0000-0000-0000-000000000433"
+        second_file_id = "00000000-0000-0000-0000-000000000434"
+        retried_file_id = "00000000-0000-0000-0000-000000000435"
+        original_new_chat = app.new_chat
+        original_urlopen = app.urlopen
+        original_stop = app.stop_zai_task
+        original_cleanup = app._best_effort_delete_upstream_files
+        original_upload = app.upload_context_package_to_zai
+        payloads: list[dict[str, object]] = []
+        stopped: list[str] = []
+        cleaned: list[list[str]] = []
+        new_chat_calls = 0
+
+        class FakeResp:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+            def close(self):
+                pass
+
+        busy = (
+            'data: {"data":{"done":true,"error":{"code":"MODEL_CONCURRENCY_LIMIT",'
+            '"detail":"当前模型使用人数较多"}},"type":"chat:completion"}\n\n'
+        ).encode("utf-8")
+        responses = [
+            FakeResp([b'data: {"data":{"delta_content":"first thinking","phase":"thinking"}}\n\n']),
+            FakeResp([busy]),
+            FakeResp([b'data: {"data":{"delta_content":"second thinking","phase":"thinking"}}\n\n']),
+        ]
+
+        def fake_new_chat(_state, _prompt, options=None):
+            nonlocal new_chat_calls
+            new_chat_calls += 1
+            return chat_id, first_user_id
+
+        def fake_urlopen(request, timeout=None):
+            payloads.append(json.loads(request.data.decode("utf-8")))
+            return responses[len(payloads) - 1]
+
+        upload_ids = iter((first_file_id, second_file_id, retried_file_id))
+
+        def fake_upload(_state, _text, filename=None, label="", *, reuse_cache=True, cache_hit_out=None):
+            if cache_hit_out is not None:
+                cache_hit_out["hit"] = False
+            file_id = next(upload_ids)
+            return {"id": file_id, "filename": filename or f"{label}.txt"}
+
+        app.new_chat = fake_new_chat
+        app.urlopen = fake_urlopen
+        app.stop_zai_task = lambda _state, assistant_id: stopped.append(assistant_id) or {"status": True}
+        app.upload_context_package_to_zai = fake_upload
+        app._best_effort_delete_upstream_files = (
+            lambda _state, file_ids, **_kwargs: cleaned.append(list(file_ids)) or True
+        )
+        app.stream_zai_completion = self.original_stream
+        try:
+            result_chat, result_parent = app.preload_zai_context_waves(
+                state,
+                [
+                    (
+                        [],
+                        [{"kind": "history", "part": 1, "parts": 2, "content": "first"}],
+                    ),
+                    (
+                        [],
+                        [{"kind": "history", "part": 2, "parts": 2, "content": "second"}],
+                    ),
+                ],
+                app.ChatOptions(model="glm-5.3"),
+                retry_wait_sec=0,
+                retry_attempts=2,
+            )
+        finally:
+            app.new_chat = original_new_chat
+            app.urlopen = original_urlopen
+            app.stop_zai_task = original_stop
+            app._best_effort_delete_upstream_files = original_cleanup
+            app.upload_context_package_to_zai = original_upload
+
+        self.assertEqual(chat_id, result_chat)
+        self.assertEqual(1, new_chat_calls)
+        self.assertEqual(3, len(payloads))
+        first_assistant = payloads[0]["id"]
+        self.assertEqual([None, first_assistant, first_assistant], [
+            payload["current_user_message_parent_id"] for payload in payloads
+        ])
+        self.assertEqual([chat_id, chat_id, chat_id], [payload["chat_id"] for payload in payloads])
+        self.assertNotEqual(payloads[1]["current_user_message_id"], payloads[2]["current_user_message_id"])
+        self.assertNotEqual(payloads[1]["id"], payloads[2]["id"])
+        self.assertEqual(second_file_id, payloads[1]["files"][0]["id"])
+        self.assertEqual(retried_file_id, payloads[2]["files"][0]["id"])
+        self.assertEqual([first_assistant, payloads[2]["id"]], stopped)
+        self.assertEqual(payloads[2]["id"], result_parent)
+        self.assertEqual([[second_file_id]], cleaned)
+
+    def test_preload_retry_never_deletes_shared_cache_hit(self) -> None:
+        original_upload = app.upload_context_package_to_zai
+        original_cleanup = app._best_effort_delete_upstream_files
+        original_stop = app.stop_zai_task
+        shared_id = "00000000-0000-0000-0000-000000000441"
+        refreshed_id = "00000000-0000-0000-0000-000000000442"
+        cleanup_calls: list[list[str]] = []
+        upload_calls = 0
+
+        def fake_upload(_state, _text, filename=None, label="", *, reuse_cache=True, cache_hit_out=None):
+            nonlocal upload_calls
+            upload_calls += 1
+            hit = upload_calls == 1
+            if cache_hit_out is not None:
+                cache_hit_out["hit"] = hit
+            return {"id": shared_id if hit else refreshed_id, "filename": f"{label}.txt"}
+
+        def retrying_stream(_state, _prompt, **kwargs):
+            refreshed = kwargs["retry_files_factory"]()
+            self.assertEqual(refreshed_id, refreshed[0]["id"])
+            kwargs["context_out"].update(
+                {
+                    "chat_id": "00000000-0000-0000-0000-000000000443",
+                    "assistant_message_id": "00000000-0000-0000-0000-000000000444",
+                }
+            )
+            yield 'data: {"data":{"delta_content":"thinking","phase":"thinking"}}'
+
+        app.upload_context_package_to_zai = fake_upload
+        app._best_effort_delete_upstream_files = (
+            lambda _state, file_ids, **_kwargs: cleanup_calls.append(list(file_ids)) or True
+        )
+        app.stop_zai_task = lambda *_args, **_kwargs: {"status": True}
+        app.stream_zai_completion = retrying_stream
+        try:
+            app.preload_zai_context_waves(
+                fake_state(),
+                [([], [{"kind": "history", "part": 1, "parts": 1, "content": "shared"}])],
+                app.ChatOptions(model="glm-5.3"),
+            )
+        finally:
+            app.upload_context_package_to_zai = original_upload
+            app._best_effort_delete_upstream_files = original_cleanup
+            app.stop_zai_task = original_stop
+
+        self.assertEqual([[]], cleanup_calls)
+        self.assertNotIn(shared_id, [file_id for batch in cleanup_calls for file_id in batch])
+
+    def test_context_wave_partial_upload_failure_deletes_only_owned_files(self) -> None:
+        original_upload = app.upload_context_package_to_zai
+        original_cleanup = app._best_effort_delete_upstream_files
+        state = fake_state()
+        shared_id = "00000000-0000-0000-0000-000000000445"
+        owned_id = "00000000-0000-0000-0000-000000000446"
+        cleanup_calls: list[list[str]] = []
+        upload_calls = 0
+
+        def fake_upload(_state, _text, filename=None, label="", *, reuse_cache=True, cache_hit_out=None):
+            nonlocal upload_calls
+            upload_calls += 1
+            if upload_calls == 3:
+                raise app.UpstreamRequestError("wave upload failed")
+            hit = upload_calls == 1
+            if cache_hit_out is not None:
+                cache_hit_out["hit"] = hit
+            return {
+                "id": shared_id if hit else owned_id,
+                "filename": filename or f"{label}.txt",
+            }
+
+        app.upload_context_package_to_zai = fake_upload
+        app._best_effort_delete_upstream_files = (
+            lambda _state, file_ids, **_kwargs: cleanup_calls.append(list(file_ids)) or True
+        )
+        owned: list[dict[str, object]] = []
+        try:
+            with self.assertRaisesRegex(app.UpstreamRequestError, "wave upload failed"):
+                app.upload_context_trace_files(
+                    state,
+                    [
+                        {"kind": "history", "part": 1, "parts": 3, "content": "shared"},
+                        {"kind": "history", "part": 2, "parts": 3, "content": "owned"},
+                        {"kind": "history", "part": 3, "parts": 3, "content": "failure"},
+                    ],
+                    reuse_cache=True,
+                    owned_out=owned,
+                )
+        finally:
+            app.upload_context_package_to_zai = original_upload
+            app._best_effort_delete_upstream_files = original_cleanup
+            app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+        self.assertEqual([], owned, "失败波次的所有权不应提交给外层并触发重复清理")
+        self.assertEqual([[owned_id]], cleanup_calls)
+        self.assertNotIn(shared_id, cleanup_calls[0])
+
+    def test_protocol_completion_stages_over_ten_files_and_forces_chat_cleanup(self) -> None:
+        original_preload = app.preload_zai_context_waves
+        staged_chat = "00000000-0000-0000-0000-000000000451"
+        staged_parent = "00000000-0000-0000-0000-000000000452"
+        previous_chat = "00000000-0000-0000-0000-000000000453"
+        preload_sizes: list[int] = []
+        final_calls: list[dict[str, object]] = []
+
+        def fake_preload(_state, waves, _options, **_kwargs):
+            preload_sizes.extend(len(trace) for _files, trace in waves)
+            return staged_chat, staged_parent
+
+        def final_stream(_state, prompt, **kwargs):
+            final_calls.append({"prompt": prompt, **kwargs})
+            context = kwargs["context_out"]
+            context["chat_id"] = kwargs["chat_id"]
+            yield 'data: {"data":{"delta_content":"STAGED_OK","phase":"answer"}}'
+
+        app.preload_zai_context_waves = fake_preload
+        app.stream_zai_completion = final_stream
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.3-forcehistory",
+                    "messages": [{"role": "user", "content": "H" * 430_000}],
+                    "stream": False,
+                    "delete_chat_after_completion": False,
+                    "mode": "continue",
+                    "chat_id": previous_chat,
+                },
+            )
+        finally:
+            app.preload_zai_context_waves = original_preload
+
+        self.assertEqual(200, status, raw[:500])
+        self.assertIn("STAGED_OK", raw)
+        self.assertEqual([10], preload_sizes)
+        self.assertEqual(1, len(final_calls))
+        final = final_calls[0]
+        self.assertFalse(final["create_chat"])
+        self.assertEqual(staged_chat, final["chat_id"])
+        self.assertNotEqual(previous_chat, final["chat_id"])
+        self.assertEqual(staged_parent, final["parent_message_id"])
+        self.assertTrue(final["retry_reused_chat"])
+        self.assertLessEqual(len(final["files"]), app.ZAI_MAX_COMPLETION_FILES)
+        self.assertIn("intentionally stopped during reasoning", final["prompt"])
+        self.assertEqual([staged_chat], self.deleted_chats, "分批上下文 chat 必须在最终响应后回收")
+        records = app.local_history_records()
+        self.assertEqual(1, len(records))
+        self.assertEqual(1, records[0]["context_preload_waves"])
+        self.assertEqual(10, records[0]["context_preload_files"])
+        self.assertEqual(0, records[0]["tool_retry_count"], "预载不能误计为工具格式重试")
+        metrics = app.local_history_metrics(24)
+        self.assertEqual(1, metrics["staged_context_requests"])
+        self.assertEqual(1, metrics["context_preload_waves"])
+        self.assertEqual(10, metrics["context_preload_files"])
+
+    def test_final_wave_upload_failure_records_error_and_deletes_preload_chat(self) -> None:
+        original_preload = app.preload_zai_context_waves
+        staged_chat = "00000000-0000-0000-0000-000000000461"
+        state = fake_state()
+        app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
+        app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+        app.preload_zai_context_waves = lambda *_args, **_kwargs: (
+            staged_chat,
+            "00000000-0000-0000-0000-000000000462",
+        )
+        app.upload_context_package_to_zai = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            app.UpstreamRequestError("final wave upload failed")
+        )
+        try:
+            status, raw = self.request(
+                "POST",
+                "/v1/chat/completions",
+                {
+                    "model": "glm-5.3-forcehistory",
+                    "messages": [{"role": "user", "content": "H" * 430_000}],
+                    "stream": False,
+                },
+            )
+        finally:
+            app.preload_zai_context_waves = original_preload
+            app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+        self.assertEqual(502, status, raw[:500])
+        self.assertIn("final wave upload failed", raw)
+        self.assertEqual([staged_chat], self.deleted_chats)
+        records = app.local_history_records()
+        self.assertEqual(1, len(records))
+        self.assertEqual("error", records[0]["status"])
+        self.assertEqual(1, records[0]["context_preload_waves"])
+        self.assertEqual(10, records[0]["context_preload_files"])
+        self.assertIn("final wave upload failed", records[0]["error"])
+
     def test_glm52_keeps_large_generated_context_as_single_files(self) -> None:
         request = app.normalize_openai_chat_request(
             {
@@ -2036,6 +2524,87 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertNotIn("MODEL_CONCURRENCY_LIMIT", joined, "繁忙错误不应透传")
         self.assertIn("HELLO", joined)
         self.assertEqual(new_chat_calls[1], context["chat_id"], "context_out 应指向最终 attempt 的会话")
+
+    def test_staged_final_wave_retries_same_parent_with_fresh_files(self) -> None:
+        state = fake_state()
+        chat_id = "00000000-0000-0000-0000-000000000410"
+        parent_id = "00000000-0000-0000-0000-000000000411"
+        payloads: list[dict[str, object]] = []
+        retry_uploads = 0
+        busy_event = (
+            'data: {"data":{"content":"","done":true,"error":{"code":"MODEL_CONCURRENCY_LIMIT",'
+            '"detail":"当前模型使用人数较多，请稍后再试或切换到其他模型。"}},'
+            '"type":"chat:completion"}\n\n'
+        )
+
+        class FakeResp:
+            def __init__(self, chunks):
+                self.chunks = chunks
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def __iter__(self):
+                return iter(self.chunks)
+
+            def close(self):
+                pass
+
+        responses = [
+            FakeResp([busy_event.encode("utf-8")]),
+            FakeResp(
+                [
+                    b'data: {"data":{"delta_content":"OK","phase":"answer"}}\n\n',
+                    b'data: {"data":"[DONE]"}\n\n',
+                ]
+            ),
+        ]
+
+        def fake_urlopen(request, timeout=None):
+            payloads.append(json.loads(request.data.decode("utf-8")))
+            return responses[len(payloads) - 1]
+
+        def fresh_files():
+            nonlocal retry_uploads
+            retry_uploads += 1
+            return [{"id": f"fresh-file-{retry_uploads}", "filename": "retry.txt"}]
+
+        original_urlopen = app.urlopen
+        app.urlopen = fake_urlopen
+        try:
+            context: dict[str, object] = {}
+            events = list(
+                self.original_stream(
+                    state,
+                    "continue loaded context",
+                    create_chat=False,
+                    chat_id=chat_id,
+                    parent_message_id=parent_id,
+                    options=app.ChatOptions(model="glm-5.3"),
+                    context_out=context,
+                    files=[{"id": "initial-file", "filename": "initial.txt"}],
+                    retry_wait_sec=0,
+                    retry_attempts=2,
+                    retry_reused_chat=True,
+                    retry_files_factory=fresh_files,
+                )
+            )
+        finally:
+            app.urlopen = original_urlopen
+
+        self.assertEqual(2, len(payloads))
+        self.assertEqual(1, retry_uploads)
+        self.assertEqual([chat_id, chat_id], [payload["chat_id"] for payload in payloads])
+        self.assertEqual([parent_id, parent_id], [payload["current_user_message_parent_id"] for payload in payloads])
+        self.assertNotEqual(payloads[0]["current_user_message_id"], payloads[1]["current_user_message_id"])
+        self.assertNotEqual(payloads[0]["id"], payloads[1]["id"])
+        self.assertEqual("initial-file", payloads[0]["files"][0]["id"])
+        self.assertEqual("fresh-file-1", payloads[1]["files"][0]["id"])
+        self.assertEqual([], self.deleted_chats, "同一 chat 的第二波繁忙重试不能删除承载前文的会话")
+        self.assertIn("OK", "".join(events))
 
     def test_upstream_sse_accepts_crlf_and_event_fields(self) -> None:
         state = fake_state()
@@ -7556,7 +8125,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         real_upload = app.upload_context_package_to_zai
         try:
             # 正常路径：Mode B 生效（桩上传），提示词为文件模式执行句，附件顺序 [历史, 工具]。
-            app.upload_context_package_to_zai = lambda _s, _text, filename=None, label="": {
+            app.upload_context_package_to_zai = lambda _s, _text, filename=None, label="", **_kwargs: {
                 "id": "fake-file-" + str(len(filename or "")),
                 "filename": filename or f"{label}.txt",
             }
@@ -7624,6 +8193,40 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app._CONTEXT_FILE_CACHE.clear()
             app._CONTEXT_FILE_CACHE.update(previous_cache)
 
+    def test_context_file_delete_journal_invalidates_cached_file_ref(self) -> None:
+        state = fake_state()
+        previous_cache = dict(app._CONTEXT_FILE_CACHE)
+        file_id = "00000000-0000-0000-0000-000000000521"
+        try:
+            app._CONTEXT_FILE_CACHE.clear()
+            app._context_file_cache_store(state, "cached context", {"id": file_id})
+            self.assertIsNotNone(app._context_file_cache_lookup(state, "cached context"))
+
+            removed = app.invalidate_context_file_cache_refs([file_id])
+
+            self.assertEqual(1, removed)
+            self.assertIsNone(app._context_file_cache_lookup(state, "cached context"))
+        finally:
+            app._CONTEXT_FILE_CACHE.clear()
+            app._CONTEXT_FILE_CACHE.update(previous_cache)
+
+    def test_history_context_manifest_retains_full_maximum_glm53_wave_set(self) -> None:
+        items = [
+            {
+                "kind": "history",
+                "name": f"{index}.txt",
+                "content": f"segment-{index}",
+                "part": index + 1,
+                "parts": 52,
+            }
+            for index in range(52)
+        ]
+
+        snapshot = app.history_context_files_snapshot(items)
+
+        self.assertEqual(52, len(snapshot))
+        self.assertGreaterEqual(app.HISTORY_CONTEXT_FILES_MAX, 52)
+
     def test_context_upload_state_is_bounded_and_expired_globally(self) -> None:
         previous_failures = dict(app._CONTEXT_UPLOAD_FAILURES)
         previous_degraded = dict(app._CONTEXT_UPLOAD_DEGRADED_UNTIL)
@@ -7670,7 +8273,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
         real_delete = app.delete_zai_file
         deleted: list[str] = []
 
-        def partial_upload(_state, text, filename=None, label=""):
+        def partial_upload(_state, text, filename=None, label="", **_kwargs):
             if label == "history":
                 raise RuntimeError("history upload failed")
             return {"id": "tools-partial", "filename": "tools-random.txt", "meta": {"size": len(text)}}
@@ -7692,6 +8295,47 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app.delete_zai_file = real_delete
             app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
             app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+    def test_context_upload_failure_does_not_delete_shared_cached_part(self) -> None:
+        request = app.normalize_openai_chat_request(
+            {
+                "model": "glm-5.2-forcehistory",
+                "messages": [{"role": "user", "content": "cached ownership"}],
+                "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            },
+            False,
+        )
+        state = fake_state()
+        shared_id = "00000000-0000-0000-0000-000000000531"
+        original_upload = app.upload_context_package_to_zai
+        original_cleanup = app._best_effort_delete_upstream_files
+        cleaned: list[list[str]] = []
+
+        def partial_cached_upload(_state, _text, filename=None, label="", *, cache_hit_out=None, **_kwargs):
+            if label == "tools":
+                if cache_hit_out is not None:
+                    cache_hit_out["hit"] = True
+                return {"id": shared_id, "filename": "shared.txt"}
+            raise app.UpstreamRequestError("history upload failed")
+
+        app.upload_context_package_to_zai = partial_cached_upload
+        app._best_effort_delete_upstream_files = (
+            lambda _state, file_ids, **_kwargs: cleaned.append(list(file_ids)) or True
+        )
+        try:
+            trace: dict[str, object] = {}
+            prompt, files = app.prepare_protocol_upstream_request(state, request, trace_out=trace)
+        finally:
+            app.upload_context_package_to_zai = original_upload
+            app._best_effort_delete_upstream_files = original_cleanup
+            app._CONTEXT_UPLOAD_FAILURES.pop(state.user_id, None)
+            app._CONTEXT_UPLOAD_DEGRADED_UNTIL.pop(state.user_id, None)
+
+        self.assertEqual([], files)
+        self.assertEqual("inline", trace["delivery_mode"])
+        self.assertEqual("upload_failed", trace["fallback_reason"])
+        self.assertNotIn(shared_id, [file_id for batch in cleaned for file_id in batch])
+        self.assertTrue(prompt.endswith(request.context_text))
 
     def test_per_model_reasoning_effort(self) -> None:
         # 2026-08 官方 UI：glm-5.3 / Flash 三挡（max/high/low），glm-5.2 两挡，
@@ -7773,8 +8417,14 @@ class ProtocolAdaptersTest(unittest.TestCase):
         self.assertIn("function renderRecordDeliveryDetail(r)", html)
         self.assertIn("只有输入框承载上下文", html)
         self.assertIn("function contextFileKindLabel(file)", html)
+        self.assertIn("function contextFileWaveLabel(info, index)", html)
+        self.assertIn("STAGED FILES", html)
+        self.assertIn("预载波次", html)
+        self.assertIn("const ZAI_MAX_COMPLETION_FILES = 10;", html)
+        self.assertIn("function appendSelectedFiles(files)", html)
+        self.assertIn("filesToSend.length > completionFileLimit()", html)
         self.assertIn("match(/\\bsegment\\s+(\\d+)\\/(\\d+)\\b/i)", html)
-        self.assertIn("附件 ${index + 1} · ${contextFileKindLabel(file)}", html)
+        self.assertIn("${contextFileWaveLabel(info, index)} · ${contextFileKindLabel(file)}", html)
         self.assertNotIn('id="record-history-card"', html)
         self.assertNotIn('id="record-merged-view"', html)
         self.assertIn('label.textContent = String(text ?? "");', html)
@@ -8045,6 +8695,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
                 app.MAX_LEGACY_JSON_HAR_BYTES,
                 payload["limits"]["legacy_json_har_bytes"],
             )
+            self.assertEqual(app.ZAI_MAX_COMPLETION_FILES, payload["limits"]["zai_completion_files"])
             self.assertEqual(
                 app.MAX_ACTIVE_CHAT_FILE_UPLOADS,
                 payload["limits"]["active_chat_file_uploads"],

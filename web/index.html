@@ -2211,6 +2211,7 @@
       pendingEdit: false,
       statusDefaultsApplied: false,
       maxChatFileUploadBytes: 128 * 1024 * 1024,
+      maxCompletionFiles: 10,
       activeRequest: null,
       selectedFiles: [],
       sessions: [],
@@ -2982,7 +2983,8 @@
       if (r.chat_id) lines.push(`- 上游会话: ${r.chat_id}`);
       if (usage.total_tokens) lines.push(`- Tokens(估): P ${usage.prompt_tokens || 0} · C ${usage.completion_tokens || 0} · R ${usage.reasoning_tokens || 0}`);
       const delivery = recordDeliveryInfo(r);
-      lines.push(`- 上游实发: ${delivery.mode === "file" ? "历史拆分（附件 + 输入框）" : (delivery.requested && delivery.fallback ? "历史拆分失败后降级直传" : "输入框直传")}`);
+      lines.push(`- 上游实发: ${delivery.mode === "file" ? (delivery.preloadWaves ? `多波次历史拆分（${delivery.preloadWaves} 个预载波次 + 最终波次）` : "历史拆分（附件 + 输入框）") : (delivery.requested && delivery.fallback ? "历史拆分失败后降级直传" : "输入框直传")}`);
+      if (delivery.preloadWaves) lines.push(`- 上下文预载: ${delivery.preloadFiles} 个附件 / ${delivery.preloadWaves} 波`);
       lines.push("");
       lines.push("## 对话");
       lines.push("");
@@ -3019,7 +3021,7 @@
         lines.push("## 内部附件");
         lines.push("");
         delivery.contextFiles.forEach((file, index) => {
-          lines.push(`### 附件 ${index + 1} · ${contextFileKindLabel(file)} · ${file.name || "未命名"}`);
+          lines.push(`### ${contextFileWaveLabel(delivery, index)} · ${contextFileKindLabel(file)} · ${file.name || "未命名"}`);
           lines.push("");
           lines.push("```");
           lines.push(String(file.content || ""));
@@ -3120,7 +3122,7 @@
           <div class="history-item-preview">${escapeHtml(r.preview || "")}</div>
           <div class="history-item-meta">
             <span style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(bits.join(" · "))}</span>
-            <span class="history-badge">${r.delivery_mode === "file" ? `拆分${r.context_files || ""}` : (r.context_file_fallback ? "降级直传" : "直传")}</span>
+            <span class="history-badge">${r.delivery_mode === "file" ? (Number(r.context_preload_waves) > 0 ? `分批${Number(r.context_preload_waves) + 1}波` : `拆分${r.context_files || ""}`) : (r.context_file_fallback ? "降级直传" : "直传")}</span>
             ${r.files ? `<span class="history-badge">📎${r.files}</span>` : ""}
           </div>
         `;
@@ -3359,6 +3361,8 @@
       const userFiles = legacy
         ? []
         : allFiles.filter((f) => !internalNames.has(String(f.name || "")));
+      const preloadWaves = Math.max(0, Number(r.context_preload_waves) || 0);
+      const preloadFiles = Math.max(0, Math.min(contextFiles.length, Number(r.context_preload_files) || 0));
       return {
         mode,
         requested: Boolean(r.context_file_requested) || mode === "file",
@@ -3367,8 +3371,18 @@
         contextFiles,
         userFiles,
         allFiles,
-        legacy
+        legacy,
+        preloadWaves,
+        preloadFiles
       };
+    }
+
+    function contextFileWaveLabel(info, index) {
+      if (!info.preloadWaves) return `附件 ${index + 1}`;
+      if (index < info.preloadFiles) {
+        return `预载波次 ${Math.min(info.preloadWaves, Math.floor(index / 10) + 1)}/${info.preloadWaves}`;
+      }
+      return "最终波次";
     }
 
     function manifestRowsHtml(files, kindResolver) {
@@ -3390,9 +3404,13 @@
       let copy = "历史未拆分；下方输入框文本就是实际发送给上游的提示词。";
       let chip = "INLINE";
       if (info.mode === "file") {
-        title = `历史拆分 · ${info.contextFiles.length} 个内部附件 + 输入框`;
-        copy = "内部附件和输入框分别展示；实发详情可核对每个文件的名称与正文。";
-        chip = "FILES + PROMPT";
+        title = info.preloadWaves
+          ? `多波次历史拆分 · ${info.preloadWaves} 个预载波次 + 最终波次`
+          : `历史拆分 · ${info.contextFiles.length} 个内部附件 + 输入框`;
+        copy = info.preloadWaves
+          ? `${info.preloadFiles} 个附件先分批读取并在 thinking 阶段停止，其余附件与输入框在同一 chat 的最终波次发送。`
+          : "内部附件和输入框分别展示；实发详情可核对每个文件的名称与正文。";
+        chip = info.preloadWaves ? "STAGED FILES" : "FILES + PROMPT";
       } else if (info.requested && info.fallback) {
         cls = "fallback";
         title = "历史拆分已回退为直传";
@@ -3421,15 +3439,15 @@
       if (info.mode === "file") {
         route.innerHTML = `
           <div class="rec-send-node">
-            <div class="rec-send-node-label">Attachments</div>
-            <div class="rec-send-node-title">${info.contextFiles.length} 个内部附件${info.userFiles.length ? ` + ${info.userFiles.length} 个用户附件` : ""}</div>
-            <div class="rec-send-node-meta">附件先上传，再随 completion 请求一并引用。</div>
+            <div class="rec-send-node-label">${info.preloadWaves ? "Context preload" : "Attachments"}</div>
+            <div class="rec-send-node-title">${info.preloadWaves ? `${info.preloadWaves} 波 · ${info.preloadFiles} 个预载附件` : `${info.contextFiles.length} 个内部附件${info.userFiles.length ? ` + ${info.userFiles.length} 个用户附件` : ""}`}</div>
+            <div class="rec-send-node-meta">${info.preloadWaves ? "每波进入 thinking 后停止，并由 assistant parent 接续。" : "附件先上传，再随 completion 请求一并引用。"}</div>
           </div>
           <div class="rec-send-arrow">→</div>
           <div class="rec-send-node primary">
-            <div class="rec-send-node-label">Web input</div>
-            <div class="rec-send-node-title">输入框文本</div>
-            <div class="rec-send-node-meta">${info.finalPrompt.length.toLocaleString()} 字符 · 与附件共同发送</div>
+            <div class="rec-send-node-label">${info.preloadWaves ? "Final wave" : "Web input"}</div>
+            <div class="rec-send-node-title">输入框文本${info.preloadWaves ? ` + ${info.contextFiles.length - info.preloadFiles} 个内部附件${info.userFiles.length ? ` + ${info.userFiles.length} 个用户附件` : ""}` : ""}</div>
+            <div class="rec-send-node-meta">${info.finalPrompt.length.toLocaleString()} 字符 · ${info.preloadWaves ? "复用同一 chat 完成回答" : "与附件共同发送"}</div>
           </div>
         `;
       } else {
@@ -3475,7 +3493,7 @@
       }
       if (info.mode === "file") {
         info.contextFiles.forEach((file, index) => {
-          const label = `附件 ${index + 1} · ${contextFileKindLabel(file)} · ${file.name || "未命名"}${file.truncated ? " · 镜像已截断" : ""}`;
+          const label = `${contextFileWaveLabel(info, index)} · ${contextFileKindLabel(file)} · ${file.name || "未命名"}${file.truncated ? " · 镜像已截断" : ""}`;
           stack.appendChild(renderTextCard(
             label,
             file.content || "",
@@ -3529,7 +3547,7 @@
       $("record-meta-grid").innerHTML = [
         metaCard("接口面", surfaceLabel(r.surface)),
         metaCard("模型", r.model || ""),
-        metaCard("上游实发", delivery.mode === "file" ? "附件 + 输入框" : (delivery.requested && delivery.fallback ? "降级直传" : "输入框直传")),
+        metaCard("上游实发", delivery.mode === "file" ? (delivery.preloadWaves ? `${delivery.preloadWaves + 1} 波分批` : "附件 + 输入框") : (delivery.requested && delivery.fallback ? "降级直传" : "输入框直传")),
         metaCard("耗时", formatElapsed(r.elapsed_ms)),
         metaCard("状态码", r.status_code ? String(r.status_code) : ""),
         metaCard("调用模式", r.stream ? "流式" : "非流式"),
@@ -3540,7 +3558,7 @@
         metaCard("Tokens（估）", usage.total_tokens ? `P ${usage.prompt_tokens || 0} · C ${usage.completion_tokens || 0} · R ${usage.reasoning_tokens || 0}` : "")
       ].join("");
       $("record-tokens").textContent = delivery.mode === "file"
-        ? `内部附件 ${delivery.contextFiles.length} · 用户附件 ${delivery.userFiles.length} · 输入框 ${delivery.finalPrompt.length.toLocaleString()} 字符`
+        ? `内部附件 ${delivery.contextFiles.length} · 用户附件 ${delivery.userFiles.length}${delivery.preloadWaves ? ` · 预载 ${delivery.preloadWaves} 波/${delivery.preloadFiles} 文件` : ""} · 输入框 ${delivery.finalPrompt.length.toLocaleString()} 字符`
         : `输入框 ${delivery.finalPrompt.length.toLocaleString()} 字符${delivery.userFiles.length ? ` · 用户附件 ${delivery.userFiles.length}` : ""}`;
       renderDeliveryBanner(r);
       renderRecordChatView(r);
@@ -3987,6 +4005,33 @@
     }
 
     // Attachments File Input Handlers
+    const ZAI_MAX_COMPLETION_FILES = 10;
+
+    function completionFileLimit() {
+      return Math.max(1, Number(state.maxCompletionFiles) || ZAI_MAX_COMPLETION_FILES);
+    }
+
+    function appendSelectedFiles(files) {
+      const incoming = Array.from(files || []);
+      const maxFiles = completionFileLimit();
+      const existingKeys = new Set(state.selectedFiles.map(f => `${f.name}:${f.size}:${f.lastModified}`));
+      const unique = incoming.filter(f => {
+        const key = `${f.name}:${f.size}:${f.lastModified}`;
+        if (existingKeys.has(key)) return false;
+        existingKeys.add(key);
+        return true;
+      });
+      const available = Math.max(0, maxFiles - state.selectedFiles.length);
+      const accepted = unique.slice(0, available);
+      const overflow = unique.length - accepted.length;
+      state.selectedFiles = [...state.selectedFiles, ...accepted];
+      updateFilePreview();
+      if (overflow) {
+        window.showToast(`Z.ai 单次最多 ${maxFiles} 个附件，已忽略 ${overflow} 个`, "error");
+      }
+      return { accepted: accepted.length, duplicates: Math.max(0, incoming.length - unique.length), overflow };
+    }
+
     function updateFilePreview() {
       attachedFilesBar.innerHTML = "";
       if (!state.selectedFiles.length) {
@@ -3998,7 +4043,7 @@
       const totalSize = state.selectedFiles.reduce((acc, f) => acc + f.size, 0);
       const limit = Number(state.maxChatFileUploadBytes) || 0;
       const oversized = limit > 0 ? state.selectedFiles.filter(f => f.size > limit) : [];
-      let hint = `已选择 ${state.selectedFiles.length} 个文件 (${formatBytes(totalSize)})`;
+      let hint = `已选择 ${state.selectedFiles.length}/${completionFileLimit()} 个文件 (${formatBytes(totalSize)})`;
       if (oversized.length) {
         hint += `，${oversized.length} 个超过单文件上限 ${formatBytes(limit)}，发送前请移除`;
       }
@@ -4027,9 +4072,8 @@
 
     chatFileInput.addEventListener("change", (e) => {
       const files = Array.from(e.target.files || []);
-      state.selectedFiles = [...state.selectedFiles, ...files];
+      appendSelectedFiles(files);
       chatFileInput.value = "";
-      updateFilePreview();
     });
 
     // Drag & Drop files onto composer
@@ -4044,8 +4088,7 @@
       e.preventDefault();
       composerForm.style.borderColor = "var(--border-medium)";
       if (e.dataTransfer.files && e.dataTransfer.files.length) {
-        state.selectedFiles = [...state.selectedFiles, ...Array.from(e.dataTransfer.files)];
-        updateFilePreview();
+        appendSelectedFiles(Array.from(e.dataTransfer.files));
       }
     });
 
@@ -4217,6 +4260,10 @@
     }
 
     async function executeSend(text, filesToSend = []) {
+      if (filesToSend.length > completionFileLimit()) {
+        window.showToast(`Z.ai 单次最多 ${completionFileLimit()} 个附件`, "error");
+        return;
+      }
       const deleteChat = autoDeleteToggle.checked;
       const mode = deleteChat
         ? "new"
@@ -4594,6 +4641,10 @@
       const text = promptInput.value.trim();
       const files = [...state.selectedFiles];
       if (!text && !files.length) return;
+      if (files.length > completionFileLimit()) {
+        window.showToast(`Z.ai 单次最多 ${completionFileLimit()} 个附件`, "error");
+        return;
+      }
       promptInput.value = "";
       promptInput.style.height = "auto";
       promptInput.style.height = `${Math.min(promptInput.scrollHeight, 220)}px`;
@@ -4624,15 +4675,12 @@
       }
       if (!pasted.length) return;
       e.preventDefault();
-      const existingKeys = new Set(state.selectedFiles.map(f => `${f.name}:${f.size}:${f.lastModified}`));
-      const unique = pasted.filter(f => !existingKeys.has(`${f.name}:${f.size}:${f.lastModified}`));
-      if (!unique.length) {
+      const result = appendSelectedFiles(pasted);
+      if (!result.accepted && result.duplicates && !result.overflow) {
         window.showToast("剪贴板中的文件已在附件列表中", "standby");
         return;
       }
-      state.selectedFiles = [...state.selectedFiles, ...unique];
-      updateFilePreview();
-      window.showToast(`已粘贴 ${unique.length} 个文件到附件`);
+      if (result.accepted) window.showToast(`已粘贴 ${result.accepted} 个文件到附件`);
     });
 
     // Button Stop Active
@@ -5869,6 +5917,9 @@
 
         if (data.limits?.chat_file_upload_bytes) {
           state.maxChatFileUploadBytes = Number(data.limits.chat_file_upload_bytes);
+        }
+        if (data.limits?.zai_completion_files) {
+          state.maxCompletionFiles = Number(data.limits.zai_completion_files);
         }
 
         if (data.auth_ready) {

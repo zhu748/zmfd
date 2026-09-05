@@ -85,6 +85,8 @@ HTTP 管理查询统一经有界解析：最多 32 个字段，字段名最多 1
 
 可以通过 `context_as_file`、`current_input_file`、`history_as_file` 或 `forcehistory` 明确开关；模型名含 `-forcehistory` 时总是封装。该后缀可与 `-nothinking` 叠加，且只会在模型 ID 结尾生效。2026-08-30 使用现有上游账号做位置标记实测：GLM-5.3 对单个 48 KiB 文本能看到末尾，50/52/256 KiB 均停在约 49 KiB；GLM-5.2 对 256 KiB 可看到最终标记。因此 `glm-5.3` 的历史和工具转写按不超过 40 KiB/片上传，每片带 `segment X/Y` 内容头，输入框要求按该编号（而非随机文件名）读取全部分片；160 KiB 五片复测能看到第 160 KiB 和最终标记。其他模型保留单文件策略，单个生成文件的上传保护上限为 4 MiB。历史与工具定义使用随机短数字文件名（`111.txt` 风格）；同账号同分片内容 10 分钟内复用已上传的 file id。生成文件只在本地临时目录存活到上游上传结束，随后立即删除；任一分片失败时整包回退直传，不会发送半包。
 
+2026-09-05 的官网 HAR 进一步确认单条 completion 最多携带 10 个附件，也确认了可复用的续传状态机：首条消息进入 thinking 后以顶层 assistant `id` 调用 `/api/tasks/stop/{id}`，下一条 completion 复用同一 `chat_id`，并把被停止的 assistant `id` 填入 `current_user_message_parent_id`。因此 GLM-5.3 生成分片与用户附件总数超过 10 时，代理把前部历史/工具分片按每波最多 10 个预载；每波在发送前才即时上传，输入框只要求读取、思考并等待续传，收到第一个 thinking delta 后立刻停止。最终波在上一波停止成功后才上传剩余生成分片、保留用户附件并发送带接续说明的真实执行提示。后续波次若在零语义输出时收到 `MODEL_CONCURRENCY_LIMIT`，保持同一 chat/parent，换新 user/assistant message ID，并重新上传当前波附件后按全局繁忙 attempt 上限重试；只有本请求实际新建且被替代的旧附件才会进入删除 journal 并从上下文附件缓存失效，缓存命中的共享 file ID 不会被并发请求误删，首波繁忙则沿用原有“回收旧 chat、创建新 chat”策略。预载 chat 始终是临时资源，最终响应结束或任一阶段失败/中断后都会强制写入删除 journal，不受普通保留会话开关影响。若调用方要求复用现有 chat，完整历史转写允许代理降级为新的临时 chat，避免在未知 current parent 上追加预载波次。历史镜像在预载开始前建立，记录 `context_preload_waves` / `context_preload_files`，预载或最终上传失败也保留 error 记录；上下文附件清单最多保留 64 个分片，覆盖 2 MiB 请求预算，聚合指标提供 staged request、预载波次和文件计数。不能使用该 GLM-5.3 分批协议的路径如果附件总数超过 10，会在创建上游 generation 前以 400 拒绝。
+
 输入中的图像和标准 `input_file` 内容块会写入可读说明，因此文本历史不会丢失；代理不会替客户端从 OpenAI/Anthropic 文件服务下载二进制数据。若要上传真正的上游附件，请先调用既有的 `POST /api/files/upload`，然后在协议请求的 `files` 或 `attachments` 中传入返回的 Z.ai 文件对象。
 
 ## 函数工具
