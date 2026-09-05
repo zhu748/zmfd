@@ -477,6 +477,77 @@ class WebAndCompatibilityCases:
         self.assertIn("captcha solver: happy-dom (no browser worker required)", script)
         self.assertIn("'--fresh-captcha', '--captcha-mode', $CaptchaMode", script)
         self.assertNotIn("'--fresh-captcha-browser', '--open-web'", script)
+        self.assertIn("scripts\\startup_helpers.ps1", script)
+        self.assertNotIn("& $node.Source -e", script)
+        self.assertIn("scripts\\check_happydom.mjs", script)
+
+    def test_windows_powershell_native_probe_returns_exit_code_without_terminating(self) -> None:
+        if sys.platform != "win32":
+            self.skipTest("Windows PowerShell regression")
+        powershell = Path(app.os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+        if not powershell.is_file():
+            self.skipTest("Windows PowerShell 5 is unavailable")
+        helper = PROJECT_ROOT / "scripts" / "startup_helpers.ps1"
+        quote = lambda value: str(value).replace("'", "''")
+        with tempfile.TemporaryDirectory() as tmp:
+            failure_program = Path(tmp) / "native-failure.py"
+            failure_program.write_text(
+                'import sys\nsys.stderr.write("expected stderr\\n")\nraise SystemExit(7)\n',
+                encoding="utf-8",
+            )
+            node_check = ""
+            node = app.shutil.which("node")
+            if node:
+                missing_module_probe = Path(tmp) / "missing-module.mjs"
+                missing_module_probe.write_text(
+                    'import "glm2api-definitely-missing-module";\n',
+                    encoding="utf-8",
+                )
+                node_check = (
+                    f"$nodeFailure = Invoke-NativeCommand -FilePath '{quote(node)}' "
+                    f"-ArgumentList @('{quote(missing_module_probe)}') -Quiet\n"
+                    "if ($nodeFailure -eq 0) { exit 14 }\n"
+                    "if ($ErrorActionPreference -ne 'Stop') { exit 15 }\n"
+                )
+            probe = Path(tmp) / "native-probe.ps1"
+            probe_source = (
+                "$ErrorActionPreference = 'Stop'\n"
+                f". '{quote(helper)}'\n"
+                f"$failure = Invoke-NativeCommand -FilePath '{quote(sys.executable)}' "
+                f"-ArgumentList @('{quote(failure_program)}') -Quiet\n"
+                "if ($failure -ne 7) { exit 11 }\n"
+                "if ($ErrorActionPreference -ne 'Stop') { exit 12 }\n"
+                f"$success = Invoke-NativeCommand -FilePath '{quote(sys.executable)}' "
+                "-ArgumentList @('-c', 'import sys;sys.exit(0)') -Quiet\n"
+                "if ($success -ne 0) { exit 13 }\n"
+            )
+            probe_source += node_check
+            probe_source += "Write-Output 'probe_ok'\n"
+            probe.write_text(
+                probe_source,
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    str(powershell),
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    str(probe),
+                ],
+                cwd=PROJECT_ROOT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                capture_output=True,
+                timeout=30,
+                check=False,
+            )
+        self.assertEqual(0, completed.returncode, completed.stdout + completed.stderr)
+        self.assertIn("probe_ok", completed.stdout)
+        self.assertNotIn("NativeCommandError", completed.stdout + completed.stderr)
 
     def test_public_release_check_passes_project_tree(self) -> None:
         if not (PROJECT_ROOT / ".git").exists():

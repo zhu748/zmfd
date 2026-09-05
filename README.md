@@ -347,6 +347,8 @@ python .\glm2api.py --har ..\chat.z.ai.har --prompt "只输出 OK" --model glm-5
 
 一键启动会先验证 happy-dom（`captcha_happy.mjs`，同目录需有 `node` 与 `node_modules`）；可用时明确传入 `--captcha-mode happydom`，不会检查、安装或启动 Playwright。只有 happy-dom/Node 不可用时才准备 Playwright 并切换到 `browser` 回退模式。每次请求内建两次尝试（间隔 20 秒）；`--captcha-timeout-ms` 默认 75 秒。`/api/status` 会返回 `captcha_strategy`、`captcha_fresh_enabled`、`captcha_solver`、`captcha_happydom_available`、`captcha_browser_fallback_enabled` 和 `legacy_browser_captcha_refresh_enabled`，面板显示实际生效的求解链路；旧 `captcha_mode=browser_fresh` 值继续保留兼容。隐藏的旧版 `/api/auth/captcha-refresh` 仅在 `auto/browser + --fresh-captcha` 时可用；`happydom` 模式会直接返回 409，不会拉起 Playwright。
 
+启动器使用独立 `scripts/check_happydom.mjs` 探测 Node 依赖，并通过 `scripts/startup_helpers.ps1` 读取原生命令退出码。Windows PowerShell 5 不会再把依赖尚未安装时的 Node stderr 当作终止性 `NativeCommandError`；探测失败会继续进入 npm 自动安装或 Playwright 回退。
+
 上游流式响应有“无数据间隔”超时（默认 300 秒）：深度思考时上游可能长时间不吐数据，超时会被视为中断。可在面板“模型与推理控制 → 上游响应超时（秒）”调整并保存，立即生效；也可用 `--upstream-timeout-sec <60-3600>` 在启动时锁定，此时面板不可覆盖。`--quiet` 可关闭逐请求访问日志。
 
 `POST /api/chat` 和 `POST /v1/chat/completions` 可传这些扩展字段：

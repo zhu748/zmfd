@@ -2,6 +2,7 @@ $ErrorActionPreference = 'Stop'
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location -LiteralPath $Root
+. (Join-Path -Path $Root -ChildPath 'scripts\startup_helpers.ps1')
 
 function Find-Python {
     $python = Get-Command python -ErrorAction SilentlyContinue
@@ -37,26 +38,33 @@ function Ensure-Playwright {
         [string] $PythonExe
     )
 
-    & $PythonExe -c 'import playwright' 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $probeExit = Invoke-NativeCommand -FilePath $PythonExe -ArgumentList @('-c', 'import playwright') -Quiet
+    if ($probeExit -eq 0) {
         return
     }
 
     Write-Host '[glm2api] playwright was not found; installing requirements...' -ForegroundColor Yellow
-    & $PythonExe -m pip install -r requirements.txt
-    if ($LASTEXITCODE -ne 0) {
+    $installExit = Invoke-NativeCommand -FilePath $PythonExe -ArgumentList @('-m', 'pip', 'install', '-r', 'requirements.txt')
+    if ($installExit -ne 0) {
         throw 'Failed to install playwright. Try manually: python -m pip install -r requirements.txt'
     }
 }
 
 function Test-HappyDom {
     $node = Get-Command node -ErrorAction SilentlyContinue
-    if (-not $node -or -not (Test-Path -LiteralPath (Join-Path $Root 'captcha_happy.mjs'))) {
+    $probeScript = Join-Path -Path $Root -ChildPath 'scripts\check_happydom.mjs'
+    if (-not $node) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $Root 'captcha_happy.mjs'))) {
+        return $false
+    }
+    if (-not (Test-Path -LiteralPath $probeScript)) {
         return $false
     }
 
-    & $node.Source -e 'import("happy-dom").then(() => process.exit(0)).catch(() => process.exit(1))' *> $null
-    return $LASTEXITCODE -eq 0
+    $probeExit = Invoke-NativeCommand -FilePath $node.Source -ArgumentList @($probeScript) -Quiet
+    return $probeExit -eq 0
 }
 
 function Ensure-HappyDom {
@@ -71,8 +79,14 @@ function Ensure-HappyDom {
     }
 
     Write-Host '[glm2api] happy-dom solver was not found; installing the local Node dependency...' -ForegroundColor Yellow
-    & $npm.Source install --omit=dev --no-audit --no-fund --no-package-lock | Out-Host
-    if ($LASTEXITCODE -ne 0) {
+    $installExit = Invoke-NativeCommand -FilePath $npm.Source -ArgumentList @(
+        'install',
+        '--omit=dev',
+        '--no-audit',
+        '--no-fund',
+        '--no-package-lock'
+    )
+    if ($installExit -ne 0) {
         return $false
     }
 
