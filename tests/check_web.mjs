@@ -5,12 +5,21 @@ import { fileURLToPath } from "node:url";
 
 const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const html = fs.readFileSync(path.join(projectRoot, "web", "index.html"), "utf8");
+const styles = fs.readFileSync(path.join(projectRoot, "web", "styles.css"), "utf8");
+const expectedScripts = ["core.js", "history.js", "chat.js", "admin.js"];
+const scriptUrls = [...html.matchAll(/<script src="\/assets\/([^"]+)" defer><\/script>/g)]
+  .map((match) => match[1]);
+const scriptSources = expectedScripts.map((name) => fs.readFileSync(path.join(projectRoot, "web", name), "utf8"));
+const appSource = scriptSources.join("\n");
 
-const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/gi)].map((match) => match[1]);
-assert.ok(scripts.length > 0, "web/index.html must contain at least one inline script");
-scripts.forEach((source, index) => {
-  assert.doesNotThrow(() => new Function(source), `inline script ${index} must parse`);
+assert.match(html, /<link rel="stylesheet" href="\/assets\/styles\.css">/,
+  "web/index.html must load the extracted stylesheet");
+assert.deepEqual(scriptUrls, expectedScripts, "web/index.html must load application scripts in dependency order");
+assert.ok(styles.includes(":root"), "web/styles.css must contain the console theme");
+scriptSources.forEach((source, index) => {
+  assert.doesNotThrow(() => new Function(source), `web/${expectedScripts[index]} must parse`);
 });
+assert.doesNotThrow(() => new Function(appSource), "ordered application scripts must parse as one bundle");
 
 const duplicateValues = (values) => {
   const seen = new Set();
@@ -26,34 +35,34 @@ const ids = [...html.matchAll(/\bid=["']([^"']+)["']/g)].map((match) => match[1]
 assert.deepEqual(duplicateValues(ids), [], "HTML ids must be unique");
 
 const idSet = new Set(ids);
-const staticIdRefs = [...html.matchAll(/\$\(["']([^"']+)["']\)/g)].map((match) => match[1]);
+const staticIdRefs = [...appSource.matchAll(/\$\(["']([^"']+)["']\)/g)].map((match) => match[1]);
 const missingIds = [...new Set(staticIdRefs.filter((id) => !idSet.has(id)))].sort();
 assert.deepEqual(missingIds, [], "static $(id) references must resolve to an element");
 
-assert.match(html, /function showProfileMutationResult\(data, fallbackMessage\)/,
+assert.match(appSource, /function showProfileMutationResult\(data, fallbackMessage\)/,
   "profile mutation feedback must share persistence-aware rendering");
-assert.match(html, /store\.persisted === false \|\| store\.error/,
+assert.match(appSource, /store\.persisted === false \|\| store\.error/,
   "profile store failures must be visible in the account status banner");
-assert.doesNotMatch(html, /window\.showToast\(`HAR 解析成功并保存登录态:/,
+assert.doesNotMatch(appSource, /window\.showToast\(`HAR 解析成功并保存登录态:/,
   "HAR upload must not claim persistence unconditionally");
-assert.match(html, /function renderSettingsStoreStatus\(store\)/,
+assert.match(appSource, /function renderSettingsStoreStatus\(store\)/,
   "settings storage failures must have a dedicated status renderer");
-assert.match(html, /renderSettingsStoreStatus\(data\.settings_store\)/,
+assert.match(appSource, /renderSettingsStoreStatus\(data\.settings_store\)/,
   "settings storage health must update with the server status snapshot");
-assert.match(html, /function renderHistoryStoreStatus\(store\)/,
+assert.match(appSource, /function renderHistoryStoreStatus\(store\)/,
   "history persistence failures must have a dedicated status renderer");
-assert.match(html, /showHistoryMutationResult\(data, "已删除记录"\)/,
+assert.match(appSource, /showHistoryMutationResult\(data, "已删除记录"\)/,
   "history deletion feedback must distinguish in-memory removal from persistence");
 
-const functionNames = [...html.matchAll(/^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)]
+const functionNames = [...appSource.matchAll(/^\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/gm)]
   .map((match) => match[1]);
 assert.deepEqual(duplicateValues(functionNames), [], "named inline functions must not be duplicated");
 
-const timeoutHelpersStart = html.indexOf("const MANAGEMENT_FETCH_TIMEOUT_MS = 10000;");
-const timeoutHelpersEnd = html.indexOf("function profileHeaders", timeoutHelpersStart);
+const timeoutHelpersStart = appSource.indexOf("const MANAGEMENT_FETCH_TIMEOUT_MS = 10000;");
+const timeoutHelpersEnd = appSource.indexOf("function profileHeaders", timeoutHelpersStart);
 assert.ok(timeoutHelpersStart >= 0 && timeoutHelpersEnd > timeoutHelpersStart,
   "bounded fetch helper block must exist");
-const timeoutHelpersSource = html.slice(timeoutHelpersStart, timeoutHelpersEnd);
+const timeoutHelpersSource = appSource.slice(timeoutHelpersStart, timeoutHelpersEnd);
 const buildTimeoutHarness = (fetchImpl, setTimeoutImpl, clearTimeoutImpl) => new Function(
   "fetch",
   "setTimeout",
@@ -108,22 +117,22 @@ await assert.rejects(
   "caller cancellation must stay distinguishable from a timeout",
 );
 
-const directApiFetches = [...html.matchAll(/\bfetch\(\s*([`"'])(\/api\/[^`"']*)\1/g)]
+const directApiFetches = [...appSource.matchAll(/\bfetch\(\s*([`"'])(\/api\/[^`"']*)\1/g)]
   .map((match) => match[2]);
 assert.deepEqual(directApiFetches, ["/api/chat"],
   "only the long-lived chat SSE may bypass the bounded fetch helper");
-assert.match(html, /uploadAllFiles\([\s\S]{0,160}requestState\.controller\.signal/,
+assert.match(appSource, /uploadAllFiles\([\s\S]{0,160}requestState\.controller\.signal/,
   "attachment uploads must share the active request cancellation signal");
-assert.match(html, /if \(!loginPolling \|\| loginPollBusy\) return;/,
+assert.match(appSource, /if \(!loginPolling \|\| loginPollBusy\) return;/,
   "browser-login status polling must be single-flight");
-assert.match(html, /if \(loginPolling && data && data\.stage\)/,
+assert.match(appSource, /if \(loginPolling && data && data\.stage\)/,
   "a late browser-login poll must not overwrite terminal feedback");
 
-const markdownStart = html.indexOf("function escapeHtml(text)");
-const markdownEnd = html.indexOf("window.copyCodeFromBlock", markdownStart);
+const markdownStart = appSource.indexOf("function escapeHtml(text)");
+const markdownEnd = appSource.indexOf("window.copyCodeFromBlock", markdownStart);
 assert.ok(markdownStart >= 0 && markdownEnd > markdownStart, "markdown renderer block must exist");
 const renderMarkdown = new Function(
-  `${html.slice(markdownStart, markdownEnd)}\nreturn renderMarkdown;`,
+  `${appSource.slice(markdownStart, markdownEnd)}\nreturn renderMarkdown;`,
 )();
 const hostileMarkdown = renderMarkdown('<img src=x onerror="globalThis.pwned=1">');
 assert.doesNotMatch(hostileMarkdown, /<img\b/i, "raw model HTML must not create elements");
@@ -133,15 +142,15 @@ const collisionOutput = renderMarkdown(`${collidingMarker}\n\n\`\`\`js\nconst sa
 assert.match(collisionOutput, new RegExp(collidingMarker), "literal marker-like text must be preserved");
 assert.equal((collisionOutput.match(/code-block-wrapper/g) || []).length, 1,
   "one fenced block must render exactly once despite a marker collision");
-assert.match(html, /\$\{escapeHtml\(s\.time \|\| ""\)\}/,
+assert.match(appSource, /\$\{escapeHtml\(s\.time \|\| ""\)\}/,
   "local-session metadata must be escaped before innerHTML insertion");
 
 // Execute the actual local-session helpers from the page instead of copying
 // their behavior into a second test-only implementation.
-const sessionHelpersStart = html.indexOf("const LOCAL_SESSION_MAX_TOTAL = 120;");
-const sessionHelpersEnd = html.indexOf("// Per-model effort memory", sessionHelpersStart);
+const sessionHelpersStart = appSource.indexOf("const LOCAL_SESSION_MAX_TOTAL = 120;");
+const sessionHelpersEnd = appSource.indexOf("// Per-model effort memory", sessionHelpersStart);
 assert.ok(sessionHelpersStart >= 0 && sessionHelpersEnd > sessionHelpersStart, "local-session helper block must exist");
-const sessionHelpersSource = html.slice(sessionHelpersStart, sessionHelpersEnd);
+const sessionHelpersSource = appSource.slice(sessionHelpersStart, sessionHelpersEnd);
 const memoryStorage = {
   value: null,
   getItem() { return this.value; },
@@ -200,6 +209,6 @@ sessionHelpers.loadLocalSessions();
 assert.deepEqual(harnessState.sessions, [], "invalid stored root must recover to an empty session list");
 
 console.log(
-  `web checks passed: ${scripts.length} script, ${ids.length} ids, `
+  `web checks passed: ${expectedScripts.length + 1} assets, ${ids.length} ids, `
   + `${staticIdRefs.length} static id refs, ${functionNames.length} functions`,
 );

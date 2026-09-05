@@ -56,6 +56,24 @@ Playwright 现在是可选的浏览器登录/验证码回退组件：一键启�
 - 找不到时使用上一级目录的 `chat.z.ai.har`
 - 都找不到也会正常启动为无账号模式
 
+## 源码布局
+
+为避免把结构、样式、交互和全部回归用例堆在单文件中，Web 控制台和协议测试按职责拆分：
+
+- `web/index.html`：只保留页面语义结构；
+- `web/styles.css`：控制台主题和组件样式；
+- `web/core.js`：共享状态、本地会话、Markdown 渲染和页面路由；
+- `web/history.js`：请求镜像列表、详情和导出；
+- `web/chat.js`：聊天会话、附件上传、SSE 和停止/删除操作；
+- `web/admin.js`：统计、日志、设置、API Key 和账号管理；
+- `tests/test_protocol_adapters.py`：`unittest` 可发现的聚合入口；
+- `tests/protocol_cases/support.py`：共享服务 fixture 与辅助函数；
+- `tests/protocol_cases/*_cases.py`：按工具与上下文、流式与验证码、历史与清理、服务运行时、Web 与兼容性分组的用例。
+
+前端仍是无构建步骤的原生 HTML/CSS/JavaScript。服务端只暴露上述静态资源的固定 allowlist，`/assets/` 不会映射任意磁盘路径。
+
+拆分依据、后端剩余热点及后续提取顺序见 [维护布局说明](docs/maintenance-layout.md)。
+
 ## 面板结构
 
 Web UI 是控制台式布局：左侧导航 + 顶栏状态，共八页——「概览」（请求信号轨/状态磁贴/快捷操作/最近日志）、「统计」（请求趋势、Token 构成、模型与入口分布、运行态）、「对话」（可收起会话抽屉 + 紧凑控制条 + 输入框）、「历史」（请求级镜像记录：思维链/流式输出/最终提示词）、「日志」（结构化实时事件流）、「账号」（登录态管理）、「设置」（默认行为与上游参数）、「接口」（API Key/端点/示例）。

@@ -577,7 +577,22 @@ DEFAULT_USER_AGENT = (
 # it mirrors the site banner (GLM-5.3-Flash branding) regardless of routed model.
 PAGE_TITLE = "Z.ai - Advanced AI Chatbot & Agent powered by GLM-5.3-Flash"
 REGION = "overseas"
-WEB_INDEX_PATH = Path(__file__).with_name("web") / "index.html"
+WEB_ROOT_PATH = Path(__file__).with_name("web")
+WEB_INDEX_PATH = WEB_ROOT_PATH / "index.html"
+WEB_STYLE_PATH = WEB_ROOT_PATH / "styles.css"
+WEB_SCRIPT_PATHS = (
+    WEB_ROOT_PATH / "core.js",
+    WEB_ROOT_PATH / "history.js",
+    WEB_ROOT_PATH / "chat.js",
+    WEB_ROOT_PATH / "admin.js",
+)
+WEB_ASSET_PATHS = {
+    "/assets/styles.css": (WEB_STYLE_PATH, "text/css; charset=utf-8"),
+    **{
+        f"/assets/{path.name}": (path, "text/javascript; charset=utf-8")
+        for path in WEB_SCRIPT_PATHS
+    },
+}
 PROFILE_STORE_PATH = Path(__file__).with_name("profiles.local.json")
 SETTINGS_STORE_PATH = Path(__file__).with_name("settings.local.json")
 DEFAULT_AUTO_WEB_SEARCH = False
@@ -10031,6 +10046,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     cors_origins: tuple[str, ...] = ()
     web_index_cache: str = ""
     web_index_cache_mtime_ns: int = 0
+    web_asset_cache: dict[str, tuple[int, bytes]] = {}
     response_store: dict[str, StoredResponse] = {}
     response_store_lock = threading.RLock()
     chat_inflight: dict[str, int] = {}
@@ -11523,7 +11539,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
         self.send_header(
             "Content-Security-Policy",
-            "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; "
             "frame-ancestors 'none'; form-action 'self'",
         )
@@ -11918,6 +11934,28 @@ class ProxyHandler(BaseHTTPRequestHandler):
             return html
         return "<!doctype html><meta charset='utf-8'><title>Z.ai GLM-5.2 Proxy</title><p>web/index.html missing</p>"
 
+    def _serve_web_asset(self, request_path: str) -> bool:
+        """Serve only the explicit UI asset allowlist; never expose arbitrary files."""
+        asset = WEB_ASSET_PATHS.get(request_path)
+        if asset is None:
+            return False
+        path, content_type = asset
+        if not path.is_file():
+            self._send_bytes(
+                404,
+                b"web asset missing",
+                "text/plain; charset=utf-8",
+                {"Cache-Control": "no-store"},
+            )
+            return True
+        mtime_ns = path.stat().st_mtime_ns
+        cached = self.web_asset_cache.get(request_path)
+        if cached is None or cached[0] != mtime_ns:
+            cached = (mtime_ns, read_file_bytes_limited(path, 4 * 1024 * 1024, label="web asset"))
+            self.__class__.web_asset_cache[request_path] = cached
+        self._send_bytes(200, cached[1], content_type, {"Cache-Control": "no-cache"})
+        return True
+
     def do_OPTIONS(self) -> None:
         if self.headers.get("Origin") and not self._cors_origin():
             self._json_response(403, {"error": {"message": "origin is not allowed"}})
@@ -11940,6 +11978,8 @@ class ProxyHandler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path in {"/", "/index.html"}:
             self._html_response(200, self._web_index())
+            return
+        if self._serve_web_asset(path):
             return
         if path == "/favicon.ico":
             self.send_response(204)

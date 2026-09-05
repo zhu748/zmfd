@@ -1,0 +1,1 @@
+"""Protocol adapter test groups."""
