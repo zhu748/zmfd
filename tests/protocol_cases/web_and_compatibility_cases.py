@@ -17,9 +17,10 @@ class WebAndCompatibilityCases:
         instructions = app.build_tool_instruction(tools, auto)
         self.assertIn("When you choose to invoke a function", instructions)
         self.assertIn("Rules:\n1)", instructions)
-        self.assertIn("Incorrect 1 — text trailing the block", instructions)
-        self.assertIn("Incorrect 5 — invocation rendered as JSON or Markdown", instructions)
-        self.assertIn('Valid example:\n<|DSML|tool_calls>\n  <|DSML|invoke name="read_file"', instructions)
+        self.assertNotIn("Incorrect", instructions)
+        self.assertNotIn("Steer clear", instructions)
+        self.assertIn('Valid example (copy this tag structure exactly):\n<|DSML|tool_calls>\n  <|DSML|invoke name="read_file"', instructions)
+        self.assertIn("Construct and emit one complete block once", instructions)
         self.assertIn("Read-style cache guard", instructions)
         self.assertIn("decide for yourself whether a function is necessary", instructions)
         self.assertIn("a progress update or a plan for later work is not a completed answer", instructions)
@@ -32,6 +33,8 @@ class WebAndCompatibilityCases:
         self.assertIn("Do not issue any other tool call", forced)
         self.assertNotIn("read_file", forced)
         self.assertNotIn("Read-style cache guard", forced)
+        self.assertIn('<|DSML|invoke name="get_weather"></|DSML|invoke>', forced)
+        self.assertNotIn('parameter name="input"', forced)
 
         transcript = app.build_history_transcript(
             [
@@ -64,14 +67,19 @@ class WebAndCompatibilityCases:
         self.assertIn("name: get_weather", forced_tools_text)
 
         prompt = app.file_mode_execution_prompt(tools, auto)
-        self.assertIn("The attached file holds the earlier conversation. Read it and respond to the most recent user request directly.", prompt)
+        self.assertIn("The attached file holds the earlier conversation. Read it through to its end", prompt)
         self.assertIn("The other attached file or files enumerate the available function definitions", prompt)
-        self.assertIn("read every segment in numeric header order", prompt)
+        self.assertIn("read every numbered segment through its end before deciding or invoking", prompt)
+        self.assertIn("Never issue a call with guessed or missing required values", prompt)
         self.assertIn(app.MODE_B_TOOL_GUIDANCE, prompt)
         self.assertTrue(prompt.startswith(app.MODE_B_TOOL_GUIDANCE))
         self.assertTrue(prompt.endswith(app.current_input_file_prompt(True)))
         self.assertNotIn("The second attachment", prompt)
         self.assertNotIn("Mandatory call:", prompt)
+
+        preload_prompt = app.context_preload_prompt(1, 2, 10)
+        self.assertIn("read every attached file through its end", preload_prompt)
+        self.assertIn("Do not answer the user's request or invoke a function yet", preload_prompt)
 
         no_tools_prompt = app.file_mode_execution_prompt([], auto)
         self.assertEqual(app.current_input_file_prompt(False), no_tools_prompt)
@@ -79,10 +87,26 @@ class WebAndCompatibilityCases:
 
         package = app.build_context_package("openai_chat", [{"role": "user", "content": "hi"}], tools, auto)
         self.assertIn("The dialogue up to this point. Pick up from the most recent user message.", package)
-        self.assertIn("Valid example:", package)
+        self.assertIn("Valid example (copy this tag structure exactly):", package)
         self.assertIn("name: get_weather\ndescription: 天气\nschema: ", package)
-        self.assertLess(package.index(app.TOOLS_TRANSCRIPT_INTRO), package.index("Valid example:"))
-        self.assertLess(package.index("Valid example:"), package.index(app.HISTORY_TRANSCRIPT_INTRO))
+        self.assertLess(package.index(app.TOOLS_TRANSCRIPT_INTRO), package.index("Valid example"))
+        self.assertLess(package.index("Valid example"), package.index(app.HISTORY_TRANSCRIPT_INTRO))
+
+        schema_example = app.build_tool_instruction(
+            [
+                {
+                    "name": "custom_lookup",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}},
+                        "required": ["query", "limit"],
+                    },
+                }
+            ],
+            app.ToolChoice(mode="forced", forced_name="custom_lookup"),
+        )
+        self.assertIn('parameter name="query"><![CDATA[example]]>', schema_example)
+        self.assertIn('parameter name="limit">1</|DSML|parameter>', schema_example)
 
     def test_reference_history_normalization_preserves_role_reasoning_and_tool_name(self) -> None:
         messages = app.normalize_openai_messages_for_protocol(

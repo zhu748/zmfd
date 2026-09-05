@@ -402,6 +402,18 @@ class ToolAndContextCases:
         self.assertEqual([], turn.tool_calls)
         self.assertEqual("接下来读取核心文件。", turn.text)
 
+        focused_retry = app.protocol_request_with_tool_retry_hint(
+            request,
+            "malformed wrapper",
+            '<tool_call>Read\nfile_path="README.md"\n</invoke>',
+        )
+        self.assertIn("appeared to target the declared tool Read", focused_retry.execution_prompt)
+        self.assertIn(
+            'Fresh serialization example:\n<|DSML|tool_calls>\n  <|DSML|invoke name="Read"',
+            focused_retry.execution_prompt,
+        )
+        self.assertEqual("auto", focused_retry.tool_choice.mode)
+
     def test_auto_retry_does_not_execute_instruction_examples_from_thinking(self) -> None:
         tools = [{"name": "Bash", "description": "Run command", "parameters": {"type": "object"}}]
         request = app.ProtocolRequest(
@@ -1103,6 +1115,22 @@ class ToolAndContextCases:
             history_parts[-1]["content"],
         )
         self.assertIn("function definitions segment 1/", tools_parts[0]["content"])
+
+        moderate_tools = [
+            {
+                "name": f"moderate_tool_{index:02d}",
+                "description": "Synthetic definition." + (" neutral schema padding" * 140),
+                "parameters": {"type": "object", "properties": {"input": {"type": "string"}}},
+            }
+            for index in range(16)
+        ]
+        moderate_text = app.build_tools_transcript(moderate_tools, app.ToolChoice(mode="auto"))
+        moderate_parts = app.split_generated_context_text(moderate_text, "tools", "glm-5.3")
+        self.assertGreater(len(moderate_text.encode("utf-8")), app.GLM53_CONTEXT_FILE_PART_BYTES)
+        self.assertEqual(2, len(moderate_parts), "48 KiB edge should keep this tool package to two files")
+        self.assertTrue(
+            all(len(part.encode("utf-8")) <= app.GLM53_CONTEXT_FILE_PART_BYTES for part in moderate_parts)
+        )
         persisted = app.history_context_files_snapshot(context_files)
         self.assertEqual(
             [(item["kind"], item["part"], item["parts"]) for item in context_files],
@@ -1146,7 +1174,7 @@ class ToolAndContextCases:
         request = app.normalize_openai_chat_request(
             {
                 "model": "glm-5.3-forcehistory",
-                "messages": [{"role": "user", "content": "H" * 430_000}],
+                "messages": [{"role": "user", "content": "H" * 600_000}],
             },
             False,
         )
@@ -1519,7 +1547,7 @@ class ToolAndContextCases:
                 "/v1/chat/completions",
                 {
                     "model": "glm-5.3-forcehistory",
-                    "messages": [{"role": "user", "content": "H" * 430_000}],
+                    "messages": [{"role": "user", "content": "H" * 600_000}],
                     "stream": False,
                     "delete_chat_after_completion": False,
                     "mode": "continue",
@@ -1572,7 +1600,7 @@ class ToolAndContextCases:
                 "/v1/chat/completions",
                 {
                     "model": "glm-5.3-forcehistory",
-                    "messages": [{"role": "user", "content": "H" * 430_000}],
+                    "messages": [{"role": "user", "content": "H" * 600_000}],
                     "stream": False,
                 },
             )

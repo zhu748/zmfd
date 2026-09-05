@@ -911,11 +911,11 @@ _SSE_HEARTBEATS_SENT_TOTAL = 0
 _SSE_HEARTBEAT_ERRORS_TOTAL = 0
 UPLOAD_STREAM_CHUNK_BYTES = 1024 * 1024
 MAX_CONTEXT_FILE_BYTES = 4 * 1024 * 1024
-# Empirical 2026-08-30 boundary probe: GLM-5.3 reads a 48 KiB text
-# attachment through its final marker, while 50/52/256 KiB files stop at
-# OFFSET_KIB=49. GLM-5.2 reads the full 256 KiB control. Keep generated 5.3
-# context segments below that hard edge, including the multipart header.
-GLM53_CONTEXT_FILE_PART_BYTES = 40 * 1024
+# Empirical 2026-08-30/2026-09-05 boundary probes: GLM-5.3 reads a 48.5 KiB
+# text attachment through its final marker, while a 49 KiB file stops inside
+# the eighth definition. Keep generated segments at the verified 49 KiB-minus-
+# 512-byte edge; the 512-byte header reserve keeps each payload near 48 KiB.
+GLM53_CONTEXT_FILE_PART_BYTES = 49 * 1024 - 512
 CONTEXT_FILE_PART_HEADER_RESERVE_BYTES = 512
 # The official composer accepts at most ten attachments on one completion
 # message. Larger GLM-5.3 context packages are loaded through one or more
@@ -3783,7 +3783,7 @@ HISTORY_PROMPT_CHARS = 8_000
 HISTORY_MSG_CHARS = 6_000
 HISTORY_MESSAGES_MAX = 30
 HISTORY_CONTEXT_CHARS = 16_000
-# A 2 MiB protocol request can produce slightly above fifty 40 KiB GLM-5.3
+# A 2 MiB protocol request can produce slightly above forty 48 KiB GLM-5.3
 # segments after transcript headers/tool guidance are added. Keep the complete
 # delivery manifest while remaining well below the 16 MiB detail-file budget.
 HISTORY_CONTEXT_FILES_MAX = 64
@@ -7817,53 +7817,12 @@ def _prompt_cdata(text: str) -> str:
     return "<![CDATA[" + text + "]]>"
 
 
-def _wrap_parameter(name: str, inner: str) -> str:
-    return f'<|DSML|parameter name="{name}">{inner}</|DSML|parameter>'
-
-
 def _xml_escape_attr(text: str) -> str:
     return text.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _xml_escape_text(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def _example_basic_params(name: str) -> tuple[str, bool]:
-    params = {
-        "Read": [_wrap_parameter("file_path", _prompt_cdata("README.md"))],
-        "Glob": [_wrap_parameter("pattern", _prompt_cdata("**/*.go")), _wrap_parameter("path", _prompt_cdata("."))],
-        "read_file": [_wrap_parameter("path", _prompt_cdata("src/main.go"))],
-        "list_files": [_wrap_parameter("path", _prompt_cdata("."))],
-        "search_files": [_wrap_parameter("query", _prompt_cdata("function-call parser"))],
-        "Bash": [_wrap_parameter("command", _prompt_cdata("pwd"))],
-        "execute_command": [_wrap_parameter("command", _prompt_cdata("pwd"))],
-        "exec_command": [_wrap_parameter("cmd", _prompt_cdata("pwd"))],
-        "Write": [_wrap_parameter("file_path", _prompt_cdata("notes.txt")), _wrap_parameter("content", _prompt_cdata("Hello world"))],
-        "write_to_file": [_wrap_parameter("path", _prompt_cdata("notes.txt")), _wrap_parameter("content", _prompt_cdata("Hello world"))],
-        "Edit": [
-            _wrap_parameter("file_path", _prompt_cdata("README.md")),
-            _wrap_parameter("old_string", _prompt_cdata("foo")),
-            _wrap_parameter("new_string", _prompt_cdata("bar")),
-        ],
-        "MultiEdit": [
-            _wrap_parameter("file_path", _prompt_cdata("README.md")),
-            '<|DSML|parameter name="edits"><item><old_string><![CDATA[foo]]></old_string>'
-            "<new_string><![CDATA[bar]]></new_string></item></|DSML|parameter>",
-        ],
-    }.get(name)
-    if params is None:
-        return "", False
-    return "\n".join(params), True
-
-
-def _pick_example_tool_name(names: list[str]) -> str:
-    for name in names:
-        if _example_basic_params(name)[1]:
-            return name
-    if names:
-        return names[0]
-    return "FUNCTION_NAME"
 
 
 def _indent_prompt_parameters(body: str, indent: str) -> str:
@@ -7873,25 +7832,63 @@ def _indent_prompt_parameters(body: str, indent: str) -> str:
 
 
 def _render_tool_example_block(name: str, params: str) -> str:
-    return "\n".join(
-        [
-            "<|DSML|tool_calls>",
-            f'  <|DSML|invoke name="{_xml_escape_attr(name)}">',
-            _indent_prompt_parameters(params, "    "),
-            "  </|DSML|invoke>",
-            "</|DSML|tool_calls>",
-        ]
-    )
+    lines = ["<|DSML|tool_calls>"]
+    if params.strip():
+        lines.extend(
+            [
+                f'  <|DSML|invoke name="{_xml_escape_attr(name)}">',
+                _indent_prompt_parameters(params, "    "),
+                "  </|DSML|invoke>",
+            ]
+        )
+    else:
+        lines.append(f'  <|DSML|invoke name="{_xml_escape_attr(name)}"></|DSML|invoke>')
+    lines.append("</|DSML|tool_calls>")
+    return "\n".join(lines)
 
 
-def _first_basic_example(names: list[str]) -> tuple[str, str] | None:
-    for name in names:
-        params, ok = _example_basic_params(name)
-        if ok:
-            return name, params
-    if names:
-        return names[0], _wrap_parameter("input", _prompt_cdata("..."))
-    return None
+def _tool_schema_example_value(schema: Any, depth: int = 0) -> Any:
+    """Build a small value that follows the declared JSON Schema for prompt examples."""
+    if not isinstance(schema, dict) or depth >= 4:
+        return "example"
+    if isinstance(schema.get("const"), (str, bool, int, float)):
+        return schema["const"]
+    enum = schema.get("enum")
+    if isinstance(enum, list) and enum:
+        return enum[0]
+    declared = schema.get("type")
+    if isinstance(declared, list):
+        declared = next((item for item in declared if item != "null"), declared[0] if declared else "string")
+    if declared == "object" or isinstance(schema.get("properties"), dict):
+        properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+        required = [str(name) for name in schema.get("required") or [] if str(name) in properties]
+        selected = required or list(properties)[:1]
+        return {name: _tool_schema_example_value(properties[name], depth + 1) for name in selected}
+    if declared == "array":
+        return [_tool_schema_example_value(schema.get("items"), depth + 1)]
+    if declared in {"integer", "number"}:
+        return 1
+    if declared == "boolean":
+        return True
+    if declared == "null":
+        return None
+    return "example"
+
+
+def _first_tool_example(tools: list[dict[str, Any]]) -> tuple[str, str] | None:
+    candidates: list[tuple[int, int, int, str, str]] = []
+    for index, tool in enumerate(tools):
+        name = str(tool.get("name") or "").strip()
+        schema = tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {}
+        arguments = _tool_schema_example_value(schema)
+        if not isinstance(arguments, dict):
+            arguments = {}
+        params = render_tool_call_parameters(arguments, "") if arguments else ""
+        candidates.append((0 if params else 1, len(params), index, name, params))
+    if not candidates:
+        return None
+    _empty_rank, _length, _index, name, params = min(candidates)
+    return name, params
 
 
 def _has_read_like_tool(names: list[str]) -> bool:
@@ -7914,12 +7911,7 @@ def tools_allowed_by_policy(tools: list[dict[str, Any]], policy: ToolChoice | No
 
 
 def build_tool_instruction(tools: list[dict[str, Any]], policy: ToolChoice) -> str:
-    """English DSML contract ported from the dkceshi reference project.
-
-    The block shape and the seven rules are copied verbatim; the counter
-    examples use a tool name picked from the current request, and a valid
-    example is generated from the same preset library as the reference.
-    """
+    """Build a compact, positive-only DSML contract from the real tool schema."""
     tools = tools_allowed_by_policy(tools, policy)
     if not tools:
         return ""
@@ -7930,46 +7922,21 @@ def build_tool_instruction(tools: list[dict[str, Any]], policy: ToolChoice) -> s
         if name and name not in seen:
             seen.add(name)
             names.append(name)
-    example_tool_name = _pick_example_tool_name(names)
-
-    instructions = (
-        "When you choose to invoke a function, end your response with the following XML block:\n\n"
-        "<|DSML|tool_calls>\n"
-        '  <|DSML|invoke name="FUNCTION_NAME">\n'
-        '    <|DSML|parameter name="ARG_NAME"><![CDATA[VALUE]]></|DSML|parameter>\n'
-        "  </|DSML|invoke>\n"
-        "</|DSML|tool_calls>\n\n"
-        "Rules:\n"
-        "1) You may include explanatory text before the block, but the block must be the final element of your response. Do not append any text, explanation, or greeting after </|DSML|tool_calls>.\n"
-        "2) The block itself must be raw XML. Do NOT enclose it in markdown fences, HTML, JSON, or any other code-block wrapper. The first non-whitespace characters of the block must be exactly <|DSML|tool_calls>.\n"
-        "3) Strings go inside <![CDATA[...]]>; numbers, booleans, and null remain as plain text. Every string parameter must be wrapped, even short ones.\n"
-        "4) Objects use nested XML elements within the parameter body; arrays repeat <item> children.\n"
-        "5) Use only parameter names declared in the function schema. Do not fabricate fields, and never emit empty or whitespace-only parameter values. If a required value is unknown, ask the user instead.\n"
-        "6) Never emit tool calls as JSON, Markdown, or prose. The only accepted form is the raw DSML XML block above.\n"
-        "7) If you are not invoking a function, answer the user normally without emitting any DSML tags.\n\n"
-        "Steer clear of the following incorrect patterns:\n\n"
-        "Incorrect 1 — text trailing the block:\n"
-        "  <|DSML|tool_calls>...</|DSML|tool_calls> I hope this helps.\n"
-        "Incorrect 2 — enclosed within markdown fences:\n"
-        "```xml\n"
-        "  <|DSML|tool_calls>...</|DSML|tool_calls>\n"
-        "```\n"
-        "Incorrect 3 — opening tag omitted:\n"
-        '  <|DSML|invoke name="FUNCTION_NAME">...</|DSML|invoke>\n'
-        "  </|DSML|tool_calls>\n"
-        "Incorrect 4 — parameter value left empty:\n"
-        "  <|DSML|tool_calls>\n"
-        f'    <|DSML|invoke name="{example_tool_name}">\n'
-        '      <|DSML|parameter name="input"></|DSML|parameter>\n'
-        "    </|DSML|invoke>\n"
-        "  </|DSML|tool_calls>\n"
-        "Incorrect 5 — invocation rendered as JSON or Markdown rather than DSML:\n"
-        f"  **Calling:** {example_tool_name}\n"
-        '  {"input": "..."}\n\n'
-    )
-    example = _first_basic_example(names)
+    example = _first_tool_example(tools)
+    instructions = "When you choose to invoke a function, emit exactly one raw DSML tool-call block.\n\n"
     if example:
-        instructions += "Valid example:\n" + _render_tool_example_block(example[0], example[1]) + "\n"
+        instructions += "Valid example (copy this tag structure exactly):\n" + _render_tool_example_block(example[0], example[1]) + "\n\n"
+    instructions += (
+        "Rules:\n"
+        "1) Copy the example's wrapper, invoke, parameter, and closing tag spellings exactly; every opening tag must have its matching closing tag.\n"
+        "2) Put every invocation inside the single outer tool_calls wrapper. Multiple calls use multiple sibling invoke elements inside that wrapper.\n"
+        "3) Use only declared function and parameter names. Never fabricate fields or emit empty required values; ask the user when a required value is unknown.\n"
+        "4) Wrap every string value in CDATA. Keep numbers, booleans, and null as plain text. Objects use nested XML elements and arrays repeat item children.\n"
+        "5) Emit the block as raw text, never inside a Markdown fence and never as JSON, HTML, prose, or another tool-call syntax.\n"
+        "6) The complete block must be the final element of the visible answer. Any explanation must come before it; append nothing after its closing tag.\n"
+        "7) Do not narrate, repair, or restart a partially written call. Construct and emit one complete block once.\n"
+        "8) If you are not invoking a function, answer normally without emitting any DSML tags."
+    )
     if _has_read_like_tool(names):
         instructions += (
             "\n\nRead-style cache guard: when a Read/read_file-style tool result reports the file is unchanged, "
@@ -7985,10 +7952,10 @@ def build_tool_instruction(tools: list[dict[str, Any]], policy: ToolChoice) -> s
         "task is actually complete, finish normally without calling a function merely to satisfy this guard."
     )
     if policy.mode == "required":
-        instructions += "\n7) For this response, you MUST issue at least one call to a tool from the permitted list."
+        instructions += "\n\nTurn policy: For this response, you MUST issue at least one call to a tool from the permitted list."
     elif policy.mode == "forced":
-        instructions += "\n7) For this response, you MUST issue exactly one call to the tool named: " + str(policy.forced_name or "")
-        instructions += "\n8) Do not issue any other tool call."
+        instructions += "\n\nTurn policy: For this response, you MUST issue exactly one call to the tool named: " + str(policy.forced_name or "")
+        instructions += " Do not issue any other tool call."
     return instructions
 
 
@@ -8019,7 +7986,7 @@ def _render_prompt_tool_xml_node(name: str, value: Any, indent: str) -> tuple[st
     if not re.match(r"^[A-Za-z_][A-Za-z0-9_.:-]*$", name):
         return "", False
     if value is None:
-        return f"{indent}<{name}></{name}>", True
+        return f"{indent}<{name}>null</{name}>", True
     if isinstance(value, dict):
         inner, ok = _render_prompt_tool_xml_map(value, indent + "  ")
         if not ok:
@@ -8040,7 +8007,7 @@ def _render_prompt_tool_xml_node(name: str, value: Any, indent: str) -> tuple[st
     if isinstance(value, str):
         return f"{indent}<{name}>{_prompt_cdata(value)}</{name}>", True
     if isinstance(value, (bool, int, float)):
-        return f"{indent}<{name}>{_xml_escape_text(str(value))}</{name}>", True
+        return f"{indent}<{name}>{_xml_escape_text(compact_json(value))}</{name}>", True
     return f"{indent}<{name}>{_prompt_cdata(str(value))}</{name}>", True
 
 
@@ -8070,7 +8037,7 @@ def _render_prompt_tool_xml_array(items: list[Any], indent: str) -> tuple[str, b
 
 def _render_prompt_tool_xml_body(value: Any, indent: str) -> tuple[str, bool]:
     if value is None:
-        return "", True
+        return f"{indent}<value>null</value>", True
     if isinstance(value, dict):
         return _render_prompt_tool_xml_map(value, indent)
     if isinstance(value, list):
@@ -8078,7 +8045,7 @@ def _render_prompt_tool_xml_body(value: Any, indent: str) -> tuple[str, bool]:
     if isinstance(value, str):
         return f"{indent}<content>{_prompt_cdata(value)}</content>", True
     if isinstance(value, (bool, int, float)):
-        return f"{indent}<value>{_xml_escape_text(str(value))}</value>", True
+        return f"{indent}<value>{_xml_escape_text(compact_json(value))}</value>", True
     return f"{indent}<value>{_prompt_cdata(str(value))}</value>", True
 
 
@@ -8087,7 +8054,7 @@ def _render_prompt_parameter_node(name: str, value: Any, indent: str) -> tuple[s
     if not name:
         return "", False
     if value is None:
-        return f'{indent}<|DSML|parameter name="{_xml_escape_attr(name)}"></|DSML|parameter>', True
+        return f'{indent}<|DSML|parameter name="{_xml_escape_attr(name)}">null</|DSML|parameter>', True
     if isinstance(value, dict):
         body, ok = _render_prompt_tool_xml_body(value, indent + "  ")
         if not ok:
@@ -8104,6 +8071,8 @@ def _render_prompt_parameter_node(name: str, value: Any, indent: str) -> tuple[s
         return f'{indent}<|DSML|parameter name="{_xml_escape_attr(name)}">\n{body}\n{indent}</|DSML|parameter>', True
     if isinstance(value, str):
         return f'{indent}<|DSML|parameter name="{_xml_escape_attr(name)}">{_prompt_cdata(value)}</|DSML|parameter>', True
+    if isinstance(value, (bool, int, float)):
+        return f'{indent}<|DSML|parameter name="{_xml_escape_attr(name)}">{_xml_escape_text(compact_json(value))}</|DSML|parameter>', True
     return f'{indent}<|DSML|parameter name="{_xml_escape_attr(name)}">{_prompt_cdata(str(value))}</|DSML|parameter>', True
 
 
@@ -8319,15 +8288,17 @@ def split_generated_context_text(text: str, kind: str, model: str) -> list[str]:
 
 
 def current_input_file_prompt(has_tools_file: bool) -> str:
-    prompt = "The attached file holds the earlier conversation. Read it and respond to the most recent user request directly."
+    prompt = "The attached file holds the earlier conversation. Read it through to its end and respond to the most recent user request directly."
     prompt += (
         " The conversation may be split across multiple attachments; when segment headers are present, read every "
-        "segment in numeric header order before answering."
+        "segment in numeric header order through its end before answering."
     )
     if has_tools_file:
         prompt += (
             " The other attached file or files enumerate the available function definitions and parameter contracts; "
-            "read every numbered segment, use only those tools, and adhere to the function-call contract described below."
+            "read every numbered segment through its end before deciding or invoking any function, use only those "
+            "tools, and adhere to the function-call contract described below. Never issue a call with guessed or "
+            "missing required values just because an earlier segment is visible."
         )
     return prompt
 
@@ -8996,16 +8967,51 @@ class ToolCallFormatError(RuntimeError):
     """The upstream attempted or was required to emit a call, but none converted."""
 
 
-def protocol_request_with_tool_retry_hint(request: ProtocolRequest, error: str) -> ProtocolRequest:
-    allowed_names = [tool["name"] for tool in tools_allowed_by_policy(request.tools, request.tool_choice)]
+def _attempted_tool_name(text: str, allowed_names: list[str]) -> str:
+    """Recover only a declared name from malformed markup to focus the retry example."""
+    allowed = set(allowed_names)
+    patterns = (
+        r"<\s*(?:\|{0,3}DSML\|{0,3}\s*)?invoke\s+name\s*=\s*[\"']([^\"']+)",
+        r"<\s*tool_call(?:\s+name\s*=\s*[\"']([^\"']+)[\"']\s*>|\s*>\s*([A-Za-z_][A-Za-z0-9_.:-]*))",
+        r"(?:^|\n)\s*Tool:\s*([A-Za-z_][A-Za-z0-9_.:-]*)",
+        r"\*\*Calling:\*\*\s*([A-Za-z_][A-Za-z0-9_.:-]*)",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, str(text or ""), re.IGNORECASE):
+            name = next((group for group in match.groups() if group), "")
+            if name in allowed:
+                return name
+    return ""
+
+
+def protocol_request_with_tool_retry_hint(
+    request: ProtocolRequest,
+    error: str,
+    failed_output: str = "",
+    attempted_name: str = "",
+) -> ProtocolRequest:
+    allowed_tools = tools_allowed_by_policy(request.tools, request.tool_choice)
+    allowed_names = [tool["name"] for tool in allowed_tools]
+    if attempted_name not in set(allowed_names):
+        attempted_name = _attempted_tool_name(failed_output, allowed_names)
+    example_tools = [tool for tool in allowed_tools if tool["name"] == attempted_name] or allowed_tools
+    example = _first_tool_example(example_tools)
     hint = (
         "Tool-call correction: the previous attempt could not be converted by the client "
-        f"({error[:180]}). Decide again for yourself whether a tool is needed. If it is, put one complete raw "
-        f"DSML tool_calls block in the visible final answer using only these names: {', '.join(allowed_names)}. "
-        "Do not leave the executable block only in reasoning/thinking, and do not end with a status update or a "
-        "plan for future tool use. Follow the declared parameter schema exactly. If no tool is needed, return the "
-        "complete answer rather than discussing this correction. A completed task should end with its normal final "
-        "answer and does not need a ceremonial tool call."
+        f"({error[:180]}). Discard that malformed serialization and construct a fresh answer. "
+    )
+    if attempted_name:
+        hint += f"The attempted call appeared to target the declared tool {attempted_name}. "
+    hint += (
+        f"Decide again whether a tool is needed. Use only these names: {', '.join(allowed_names)}. "
+        "If needed, put one complete raw DSML block in the visible final answer, follow the declared schema exactly, "
+        "and leave no executable call only in reasoning/thinking."
+    )
+    if example:
+        hint += "\n\nFresh serialization example:\n" + _render_tool_example_block(example[0], example[1])
+    hint += (
+        "\n\nDo not discuss this correction or end with a plan. If no tool is needed, return the complete answer. "
+        "A completed task should end normally without a ceremonial tool call."
     )
     return replace(
         request,
@@ -9359,9 +9365,9 @@ def context_preload_prompt(wave: int, waves: int, files: int) -> str:
     """Explain an intentionally incomplete context-loading turn to GLM-5.3."""
     return (
         f"Context preload batch {wave}/{waves}: read all {files} attached text files and retain their contents. "
-        "When numbered segment headers are present, follow their numeric order. Do not answer the user's request "
-        "yet; begin reasoning about the loaded context and wait for the continuation message with the remaining "
-        "files and final instructions."
+        "When numbered segment headers are present, follow their numeric order and read every attached file through "
+        "its end. Do not answer the user's request or invoke a function yet; begin reasoning about the loaded context "
+        "and wait for the continuation message with the remaining files and final instructions."
     )
 
 
@@ -11091,6 +11097,13 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 update_history_protocol_result(record_id, error=str(exc))
                 raise
             retry_reason = str(exc)
+            allowed_names = [
+                tool["name"] for tool in tools_allowed_by_policy(request.tools, request.tool_choice)
+            ]
+            attempted_name = _attempted_tool_name(text, allowed_names) or _attempted_tool_name(
+                thinking,
+                allowed_names,
+            )
         released_chars = len(text) + len(thinking)
         if release_initial_output is not None:
             try:
@@ -11107,7 +11120,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         text = ""
         thinking = ""
         self._cleanup_failed_upstream_chat(state, context, request.options)
-        retry_request = protocol_request_with_tool_retry_hint(request, retry_reason)
+        retry_request = protocol_request_with_tool_retry_hint(
+            request,
+            retry_reason,
+            attempted_name=attempted_name,
+        )
         log_event(
             "tool_call_format_retry",
             surface=request.surface,

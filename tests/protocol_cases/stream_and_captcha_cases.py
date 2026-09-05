@@ -668,6 +668,8 @@ class StreamAndCaptchaCases:
 
         def regenerate(retry_request):
             self.assertTrue(released, "第二轮开始前必须先释放首轮输出缓冲")
+            self.assertIn("appeared to target the declared tool Read", retry_request.execution_prompt)
+            self.assertIn('Fresh serialization example:\n<|DSML|tool_calls>\n  <|DSML|invoke name="Read"', retry_request.execution_prompt)
             app.restart_history_record(record_id, retry_request.execution_prompt)
             return (
                 malformed,
