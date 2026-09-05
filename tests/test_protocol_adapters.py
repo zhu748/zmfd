@@ -9150,9 +9150,12 @@ class ProtocolAdaptersTest(unittest.TestCase):
         original_mode = app._CAPTCHA_MODE
         original_backoff = app.CAPTCHA_RETRY_BACKOFF_SECONDS
         real_solver = app.get_happydom_captcha
+        real_available = app.happydom_captcha_available
         try:
             app._CAPTCHA_MODE = "auto"
             app.CAPTCHA_RETRY_BACKOFF_SECONDS = 0
+            # This routing unit test must not depend on local node_modules.
+            app.happydom_captcha_available = lambda: True
             app._set_captcha_degraded(1800)  # 无存储验证码时冷却必须自愈，不能裸发
             app.get_happydom_captcha = lambda *_a, **_k: "hd-captcha"
             self.assertEqual(
@@ -9169,6 +9172,7 @@ class ProtocolAdaptersTest(unittest.TestCase):
             app._CAPTCHA_MODE = original_mode
             app.CAPTCHA_RETRY_BACKOFF_SECONDS = original_backoff
             app.get_happydom_captcha = real_solver
+            app.happydom_captcha_available = real_available
             app._set_captcha_degraded(-3600)
 
     def test_web_chat_non_stream_roundtrip(self) -> None:
